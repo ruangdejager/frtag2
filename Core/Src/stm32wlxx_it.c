@@ -1,178 +1,107 @@
-/* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * @file    stm32wlxx_it.c
-  * @brief   Interrupt Service Routines.
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
-/* USER CODE END Header */
+/*
+ * stm32wlxx_it.c
+ *
+ * Interrupt Service Routines for frtag2.
+ */
 
-/* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "stm32wlxx_it.h"
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-/* USER CODE END Includes */
+#include "hal_uart.h"
+#include "hal_adc.h"
+#include "hal_bsp.h"
 
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN TD */
+extern ADC_HandleTypeDef       hadc;
+extern RTC_HandleTypeDef       hrtc;
+extern SUBGHZ_HandleTypeDef    hsubghz;
+extern TIM_HandleTypeDef       htim2;
+extern TIM_HandleTypeDef       htim16;
 
-/* USER CODE END TD */
-
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
-
-/* USER CODE END PD */
-
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
-
-/* Private variables ---------------------------------------------------------*/
-/* USER CODE BEGIN PV */
-
-/* USER CODE END PV */
-
-/* Private function prototypes -----------------------------------------------*/
-/* USER CODE BEGIN PFP */
-
-/* USER CODE END PFP */
-
-/* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
-
-/* USER CODE END 0 */
-
-/* External variables --------------------------------------------------------*/
-extern TIM_HandleTypeDef htim16;
-
-/* USER CODE BEGIN EV */
-
-/* USER CODE END EV */
-
-/******************************************************************************/
-/*           Cortex Processor Interruption and Exception Handlers          */
-/******************************************************************************/
-/**
-  * @brief This function handles Non maskable interrupt.
-  */
 void NMI_Handler(void)
 {
-  /* USER CODE BEGIN NonMaskableInt_IRQn 0 */
-
-  /* USER CODE END NonMaskableInt_IRQn 0 */
-  /* USER CODE BEGIN NonMaskableInt_IRQn 1 */
-   while (1)
-  {
-  }
-  /* USER CODE END NonMaskableInt_IRQn 1 */
+    while (1) { }
 }
 
-/**
-  * @brief This function handles Hard fault interrupt.
-  */
 void HardFault_Handler(void)
 {
-  /* USER CODE BEGIN HardFault_IRQn 0 */
+    volatile uint32_t cfsr     = SCB->CFSR;
+    volatile uint32_t hfsr     = SCB->HFSR;
+    volatile uint32_t mmfar    = SCB->MMFAR;
+    volatile uint32_t bfar     = SCB->BFAR;
+    volatile uint32_t flash_sr = FLASH->SR;
+    volatile uint32_t flash_cr = FLASH->CR;
 
-  /* USER CODE END HardFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_HardFault_IRQn 0 */
-    /* USER CODE END W1_HardFault_IRQn 0 */
-  }
+    (void)cfsr; (void)hfsr; (void)mmfar; (void)bfar;
+    (void)flash_sr; (void)flash_cr;
+
+    __BKPT(0);
+    while (1) { }
 }
 
-/**
-  * @brief This function handles Memory management fault.
-  */
 void MemManage_Handler(void)
 {
-  /* USER CODE BEGIN MemoryManagement_IRQn 0 */
-
-  /* USER CODE END MemoryManagement_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_MemoryManagement_IRQn 0 */
-    /* USER CODE END W1_MemoryManagement_IRQn 0 */
-  }
+    while (1) { }
 }
 
-/**
-  * @brief This function handles Prefetch fault, memory access fault.
-  */
 void BusFault_Handler(void)
 {
-  /* USER CODE BEGIN BusFault_IRQn 0 */
+    volatile uint32_t cfsr     = SCB->CFSR;
+    volatile uint32_t hfsr     = SCB->HFSR;
+    volatile uint32_t bfar     = SCB->BFAR;
+    volatile uint32_t flash_sr = FLASH->SR;
+    volatile uint32_t flash_cr = FLASH->CR;
 
-  /* USER CODE END BusFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_BusFault_IRQn 0 */
-    /* USER CODE END W1_BusFault_IRQn 0 */
-  }
+    (void)cfsr; (void)hfsr; (void)bfar;
+    (void)flash_sr; (void)flash_cr;
+
+    __BKPT(0);
+    while (1) { }
 }
 
-/**
-  * @brief This function handles Undefined instruction or illegal state.
-  */
 void UsageFault_Handler(void)
 {
-  /* USER CODE BEGIN UsageFault_IRQn 0 */
-
-  /* USER CODE END UsageFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_UsageFault_IRQn 0 */
-    /* USER CODE END W1_UsageFault_IRQn 0 */
-  }
+    while (1) { }
 }
 
-/**
-  * @brief This function handles Debug monitor.
-  */
-void DebugMon_Handler(void)
+void DebugMon_Handler(void) { }
+
+void RTC_WKUP_IRQHandler(void)
 {
-  /* USER CODE BEGIN DebugMonitor_IRQn 0 */
-
-  /* USER CODE END DebugMonitor_IRQn 0 */
-  /* USER CODE BEGIN DebugMonitor_IRQn 1 */
-
-  /* USER CODE END DebugMonitor_IRQn 1 */
+    HAL_RTCEx_WakeUpTimerIRQHandler(&hrtc);
 }
 
-/******************************************************************************/
-/* STM32WLxx Peripheral Interrupt Handlers                                    */
-/* Add here the Interrupt Handlers for the used peripherals.                  */
-/* For the available peripheral interrupt handler names,                      */
-/* please refer to the startup file (startup_stm32wlxx.s).                    */
-/******************************************************************************/
+void RTC_Alarm_IRQHandler(void)
+{
+    HAL_RTC_AlarmIRQHandler(&hrtc);
+}
 
-/**
-  * @brief This function handles TIM16 Global Interrupt.
-  */
+void ADC_IRQHandler(void)
+{
+    HAL_ADC_IRQHandler(&hadc);
+}
+
+void TIM2_IRQHandler(void)
+{
+    HAL_TIM_IRQHandler(&htim2);
+}
+
 void TIM16_IRQHandler(void)
 {
-  /* USER CODE BEGIN TIM16_IRQn 0 */
-
-  /* USER CODE END TIM16_IRQn 0 */
-  HAL_TIM_IRQHandler(&htim16);
-  /* USER CODE BEGIN TIM16_IRQn 1 */
-
-  /* USER CODE END TIM16_IRQn 1 */
+    HAL_TIM_IRQHandler(&htim16);
 }
 
-/* USER CODE BEGIN 1 */
+/** USART1 — GPS / Farmranger UART (mutually exclusive by device role) */
+void USART1_IRQHandler(void)
+{
+    HAL_UART_vInterrupt(USART1);
+}
 
-/* USER CODE END 1 */
+/** USART2 — Debug UART */
+void USART2_IRQHandler(void)
+{
+    HAL_UART_vInterrupt(USART2);
+}
+
+void SUBGHZ_Radio_IRQHandler(void)
+{
+    HAL_SUBGHZ_IRQHandler(&hsubghz);
+}
