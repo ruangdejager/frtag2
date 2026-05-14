@@ -104,6 +104,7 @@ void INIT_vInitialization(void *parameters)
 
     if (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY)
     {
+        SOLAR_vInit();
 #ifdef ENABLE_MOVE
         HAL_SPI_vInit();
         ACC_vInit();
@@ -123,7 +124,6 @@ void INIT_vInitialization(void *parameters)
 
     TIME_vInit();
     BAT_vInit();
-    SOLAR_vInit();
     POWER_vInit();
 
     BSP_LED_Off(LED_YELLOW);

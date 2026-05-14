@@ -373,8 +373,8 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
         /* Block until the platform heartbeat fires (any flag) */
         osThreadFlagsWait(0x7FFFFFFFU, osFlagsWaitAny, osWaitForever);
 
-        /* ---- ProductionSleep: skip normal schedule; check solar activation ---- */
-        if (eProductionState == PRODUCTION_SLEEP)
+        /* ---- ProductionSleep: secondary only — primary has no solar panel ---- */
+        if (eDeviceRole == DEVICE_ROLE_SECONDARY && eProductionState == PRODUCTION_SLEEP)
         {
             if (SOLAR_u32GetPowerMW() >= SOLAR_ACTIVATION_POWER_MW)
             {
@@ -450,6 +450,11 @@ osThreadId_t DEVICE_DISCOVERY_xGetTaskHandle(void)
  * -------------------------------------------------------------------------- */
 void DEVICE_DISCOVERY_vEnterProductionSleep(void)
 {
+    if (eDeviceRole != DEVICE_ROLE_SECONDARY)
+    {
+        DBG("DeviceDiscovery: ProductionSleep not applicable on primary device\r\n");
+        return;
+    }
     eProductionState = PRODUCTION_SLEEP;
     DBG("DeviceDiscovery: Entering ProductionSleep\r\n");
 }
