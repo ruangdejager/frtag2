@@ -32,6 +32,8 @@
 #include "Power.h"
 #include "flashLog.h"
 #include "GPS.h"
+#include "SolarPower.h"
+#include "SolarPower_Config.h"
 
 /* ---- Private defines ---- */
 #define APP_TASK_STACK_SIZE     (configMINIMAL_STACK_SIZE * 10)
@@ -42,8 +44,9 @@ static osThreadId_t      DeviceDiscoveryAppTask_handle;
 static osThreadId_t      DeviceDiscoveryWakeupTask_handle;
 
 /* ---- Device state ---- */
-DeviceRole_e eDeviceRole;
-uint32_t     u32DreqId;
+DeviceRole_e              eDeviceRole;
+uint32_t                  u32DreqId;
+static volatile ProductionState_e eProductionState = PRODUCTION_READY;
 
 /* ---- Forward declarations ---- */
 static void DEVICE_DISCOVERY_vRecoveryMode(void);
@@ -370,6 +373,20 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
         /* Block until the platform heartbeat fires (any flag) */
         osThreadFlagsWait(0x7FFFFFFFU, osFlagsWaitAny, osWaitForever);
 
+        /* ---- ProductionSleep: skip normal schedule; check solar activation ---- */
+        if (eProductionState == PRODUCTION_SLEEP)
+        {
+            if (SOLAR_u32GetPowerMW() >= SOLAR_ACTIVATION_POWER_MW)
+            {
+                eProductionState = PRODUCTION_ACTIVE;
+                DBG("DeviceDiscovery: Solar activation (%lu mW) — exiting ProductionSleep\r\n",
+                    SOLAR_u32GetPowerMW());
+                SYSTEM_vDeactivateDeepSleep();
+                osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_WAKEUP_BIT);
+            }
+            continue;
+        }
+
         if (RTC_u64GetUTC() % ((uint64_t)MESHNETWORK_u8GetWakeupInterval() * 60) == 0)
         {
             if (POWER_tGetState() & POWER_CLASS_NORMAL)
@@ -426,6 +443,23 @@ DeviceRole_e DEVICE_DISCOVERY_eGetDeviceRole(void)
 osThreadId_t DEVICE_DISCOVERY_xGetTaskHandle(void)
 {
     return DeviceDiscoveryAppTask_handle;
+}
+
+/* --------------------------------------------------------------------------
+ * DEVICE_DISCOVERY_vEnterProductionSleep
+ * -------------------------------------------------------------------------- */
+void DEVICE_DISCOVERY_vEnterProductionSleep(void)
+{
+    eProductionState = PRODUCTION_SLEEP;
+    DBG("DeviceDiscovery: Entering ProductionSleep\r\n");
+}
+
+/* --------------------------------------------------------------------------
+ * DEVICE_DISCOVERY_eGetProductionState
+ * -------------------------------------------------------------------------- */
+ProductionState_e DEVICE_DISCOVERY_eGetProductionState(void)
+{
+    return eProductionState;
 }
 
 /* --------------------------------------------------------------------------

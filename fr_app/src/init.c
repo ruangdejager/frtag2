@@ -43,6 +43,7 @@
 #  include "RadioTest.h"
 #endif
 #include "Battery.h"
+#include "SolarPower.h"
 #include "Power.h"
 
 #include "flashLog.h"
@@ -122,6 +123,7 @@ void INIT_vInitialization(void *parameters)
 
     TIME_vInit();
     BAT_vInit();
+    SOLAR_vInit();
     POWER_vInit();
 
     BSP_LED_Off(LED_YELLOW);

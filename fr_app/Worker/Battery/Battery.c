@@ -20,6 +20,7 @@
 
 #include "Battery.h"
 #include "hal_bsp.h"
+#include "hal_adc.h"
 #include "hal_system.h"
 #include "Battery_Driver.h"
 #include "Battery_Config.h"
@@ -107,6 +108,7 @@ static void BAT_vSampleTask(void *pvParameters)
             osFlagsWaitAny,
             osWaitForever);
 
+        HAL_ADC_vLock();
         SYSTEM_vSleepLockAcquire();
 
         bDeltaLimit = (ulNotifiedValue & BAT_NOTIFY_DELTA_LIMIT)   != 0;
@@ -139,6 +141,9 @@ static void BAT_vSampleTask(void *pvParameters)
         BAT_DRIVER_vDisable();
         BAT_DRIVER_vDisableBiasCircuit();
 
+        SYSTEM_vSleepLockRelease();
+        HAL_ADC_vUnlock();
+
         if (u8DelayMs != 0)
         {
             au16BatAvgBuf[u8BatAvgIdx] = u16AdcResult;
@@ -167,8 +172,6 @@ static void BAT_vSampleTask(void *pvParameters)
             else
                 DBG("bat: purge notify — no purge handle");
         }
-
-        SYSTEM_vSleepLockRelease();
     }
 }
 

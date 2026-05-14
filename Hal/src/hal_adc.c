@@ -1,16 +1,21 @@
 /*
  * hal_adc.c
  *
- * ADC driver for battery voltage measurement.
- * Channel 8 (PA12) is the battery measurement input.
+ * ADC driver — battery (PA12/IN8), VSOLAR (PB3/IN2), RSENSE (PB4/IN3).
+ *
+ * The peripheral is shared. Use HAL_ADC_vLock / HAL_ADC_vUnlock around
+ * each full enable → convert → disable sequence.
  */
 
 #include "hal_adc.h"
 #include "hal_bsp.h"
 #include "stm32wlxx.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
-static volatile bool adc_flag;
-static uint16_t      adc_value;
+static volatile bool   adc_flag;
+static uint16_t        adc_value;
+static osMutexId_t     adc_mutex;
 
 ADC_HandleTypeDef hadc;
 
@@ -38,6 +43,9 @@ void HAL_ADC_vInit(void)
 
     if (HAL_ADC_Init(&hadc) != HAL_OK)
         Error_Handler();
+
+    adc_mutex = osMutexNew(NULL);
+    configASSERT(adc_mutex != NULL);
 }
 
 void HAL_ADC_MspInit(ADC_HandleTypeDef *adcHandle)
@@ -53,6 +61,14 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef *adcHandle)
         GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
         GPIO_InitStruct.Pull = GPIO_NOPULL;
         HAL_GPIO_Init(BSP_BAT_MEAS_VOLT_PORT, &GPIO_InitStruct);
+
+        __HAL_RCC_GPIOB_CLK_ENABLE();
+
+        GPIO_InitStruct.Pin  = BSP_VSOLAR_MEAS_PIN;
+        HAL_GPIO_Init(BSP_VSOLAR_MEAS_PORT, &GPIO_InitStruct);
+
+        GPIO_InitStruct.Pin  = BSP_RSENSE_MEAS_PIN;
+        HAL_GPIO_Init(BSP_RSENSE_MEAS_PORT, &GPIO_InitStruct);
 
         HAL_NVIC_SetPriority(ADC_IRQn, 5, 0);
         HAL_NVIC_EnableIRQ(ADC_IRQn);
@@ -83,6 +99,12 @@ void HAL_ADC_vSelectChannel(hal_adc_channel_t channel)
         case BAT_VOLTAGE_CHANNEL:
             sConfig.Channel = BSP_BAT_ADC_VOLTAGE_CHANNEL;
             break;
+        case VSOLAR_VOLTAGE_CHANNEL:
+            sConfig.Channel = BSP_VSOLAR_ADC_CHANNEL;
+            break;
+        case RSENSE_VOLTAGE_CHANNEL:
+            sConfig.Channel = BSP_RSENSE_ADC_CHANNEL;
+            break;
         default:
             break;
     }
@@ -109,3 +131,6 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *my_hadc)
     adc_flag  = true;
     adc_value = (uint16_t)HAL_ADC_GetValue(&hadc);
 }
+
+void HAL_ADC_vLock(void)   { osMutexAcquire(adc_mutex, osWaitForever); }
+void HAL_ADC_vUnlock(void) { osMutexRelease(adc_mutex); }

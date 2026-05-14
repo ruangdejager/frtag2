@@ -35,11 +35,21 @@
 #define DEVICE_DISCOVERY_DRIVER_u8RequestInterval()          FARMRANGER_u8RequestInterval()
 #define DEVICE_DISCOVERY_bSendDiscoveryData(items, size)     FARMRANGER_bLogData(items, size)
 
+/* ---- Production sleep state ---- */
+typedef enum {
+    PRODUCTION_READY  = 0,  /* initial state — normal operation (dev/test) */
+    PRODUCTION_SLEEP  = 1,  /* super deep sleep, waiting for solar activation */
+    PRODUCTION_ACTIVE = 2,  /* solar-activated, full discovery running */
+} ProductionState_e;
+
 /* ---- Public API ---- */
-void          DEVICE_DISCOVERY_vInit(void);
-void          DEVICE_DISCOVERY_vAppTask(void *pvParameters);
-void          DEVICE_DISCOVERY_vConfigDeviceRole(void);
-DeviceRole_e  DEVICE_DISCOVERY_eGetDeviceRole(void);
-osThreadId_t  DEVICE_DISCOVERY_xGetTaskHandle(void);
+void               DEVICE_DISCOVERY_vInit(void);
+void               DEVICE_DISCOVERY_vAppTask(void *pvParameters);
+void               DEVICE_DISCOVERY_vConfigDeviceRole(void);
+DeviceRole_e       DEVICE_DISCOVERY_eGetDeviceRole(void);
+osThreadId_t       DEVICE_DISCOVERY_xGetTaskHandle(void);
+
+void               DEVICE_DISCOVERY_vEnterProductionSleep(void);
+ProductionState_e  DEVICE_DISCOVERY_eGetProductionState(void);
 
 #endif /* TASKS_DEVICEDISCOVERY_DEVICEDISCOVERY_H_ */
