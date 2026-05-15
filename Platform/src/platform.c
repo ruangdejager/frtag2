@@ -24,7 +24,6 @@
 #include "LoraRadio.h"
 #include "MeshNetwork.h"
 #include "DeviceDiscovery.h"
-#include "Movement.h"
 #include "radio_driver.h"
 #include "LoraRadio_Driver.h"
 
@@ -80,12 +79,6 @@ void PLATFORM_vHeartbeatDispatchTask(void *parameters)
 
         /* Housekeeping ---------------------------------------------------- */
         TIME_vTick();
-        if (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY)
-        {
-#ifdef ENABLE_MOVE
-            MOVE_bTick();
-#endif
-        }
         /* ------------------------------------------------------------------ */
 
         /* Notify all enabled subscribers ----------------------------------- */

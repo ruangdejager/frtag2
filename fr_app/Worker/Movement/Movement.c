@@ -1,8 +1,9 @@
 /*
  * Movement.c
  *
- * Movement alarm algorithm — sensor sampling, HPF, alarm windows.
- * Pure algorithm layer — no RTOS dependencies.
+ * Movement worker — sensor sampling, HPF, MOVING/STILL state, gravity
+ * sequence detector.  Runs as an RTOS task subscribed to the 1 Hz
+ * platform heartbeat.
  */
 
 #include <stdbool.h>
@@ -14,105 +15,66 @@
 #include "Movement_Driver.h"
 
 #include "platform.h"
+#include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 #include "dbg_log.h"
 #include "math_func.h"
+#include "Acc.h"
+#include "DeviceDiscovery.h"
 
-
-//! Movement algorithm axis info
-typedef struct move_alg_axis_t {
-	int8_t ai8DcBuf[MOVE_ALG_DC_BUF_SIZE];
-	uint8_t u8DcBufIdx;
-	int8_t i8DcLevel;
+/* --------------------------------------------------------------------------
+ * Internal types
+ * -------------------------------------------------------------------------- */
+typedef struct {
+    int8_t  ai8DcBuf[MOVE_ALG_DC_BUF_SIZE];
+    uint8_t u8DcBufIdx;
+    int8_t  i8DcLevel;
 } move_alg_axis_t;
 
-typedef struct acc_t
-{
-	move_alg_axis_t X;
-	move_alg_axis_t Y;
-	move_alg_axis_t Z;
-	uint8_t au8EnvBuf[MOVE_ALG_ENV_BUF_SIZE];
-	uint8_t u8EnvBufIdx;
-	uint8_t u8EnvLevel;
+typedef struct {
+    move_alg_axis_t X;
+    move_alg_axis_t Y;
+    move_alg_axis_t Z;
+    uint8_t au8EnvBuf[MOVE_ALG_ENV_BUF_SIZE];
+    uint8_t u8EnvBufIdx;
+    uint8_t u8EnvLevel;
 } move_alg_t;
-move_alg_t MoveAlg;
-
-//! Scratchpad variables
-uint8_t u8MoveTemp;
-int16_t i16MoveTemp;
-
-typedef enum _move_alarm_state_t {
-	MOVE_ALARM_STATE_IDLE     = 0,
-	MOVE_ALARM_STATE_WINDOW_A = 1,
-	MOVE_ALARM_STATE_WINDOW_B = 2
-} move_alarm_state_t;
-
-static uint8_t u8MoveSensorHealthErrorCnt;
-static uint8_t u8MoveSensorHealthAlertCnt;
 
 typedef struct {
-	uint16_t u16TmrHwm;
-	uint8_t  u8HoldBackCnt;
-	uint8_t  u8TriggerCnt;
-} move_window_a_t;
-move_window_a_t MoveWinA;
-
-#define MOVE_HOLDBACK_BUF_SIZE 16
-typedef struct _move_holdback {
-	uint8_t u8Idx;
-	move_holdback_event_t Events[MOVE_HOLDBACK_BUF_SIZE];
-} move_holdback_t;
-move_holdback_t MoveHoldback;
-
-uint16_t u16MoveMaxLevelWindowTmr;
-uint32_t u32MoveMinLevelWindowTmr;
-
-uint8_t u8MoveHighActivityAlarmCnt;
-uint8_t u8MoveHighActAlarmSuccessCnt;
-uint8_t u8MoveNotActiveAlarmCnt;
-
-#define MOVE_ALARM_TIME_OF_DAY_ACT_IDX(DayOfWeek, TimeOfDay)  ((4*(DayOfWeek))+(TimeOfDay))
-
-time_of_day_t tTimeOfDayPrev;
-
-#define MOVE_NOT_ALARM_FIFO_SIZE 4
-typedef struct _move_not_alarm_fifo_t {
-	move_not_alarm_t Buf[MOVE_NOT_ALARM_FIFO_SIZE];
-	uint8_t u8Head;
-	uint8_t u8Tail;
-} move_not_alarm_fifo_t;
-
-move_not_alarm_fifo_t MoveNotAlarmFifo;
-
-uint8_t  u8MoveTemp;
-uint32_t u32MoveTemp;
-
-ccrContext ccrMoveTestTask;
-
-typedef struct _acc_health_t {
-	uint8_t       u8DevIdErrorSeqCnt;
-	uint16_t      u16SampleDeltaErrorCnt;
-	uint8_t       u8NoSampleErrorCnt;
-	acc_t         AccPrevSample;
-	bool          bErrorFlag;
-	uint8_t       u8AlertCnt;
-	time_of_day_t tAlertTimeOfDayPrev;
-	bool          bAlertFlag;
+    uint8_t  u8DevIdErrorSeqCnt;
+    uint16_t u16SampleDeltaErrorCnt;
+    uint8_t  u8NoSampleErrorCnt;
+    acc_t    AccPrevSample;
+    bool     bErrorFlag;
 } acc_health_t;
-acc_health_t AccHealth;
 
-const char acMoveNoActAlarmStateIdle []      = "IDLE";
-const char acMoveNoActAlarmStateTriggered [] = "TRIGGERED";
-const char acMoveNoActAlarmStateCancelled [] = "CLEARED";
-const char * const acMoveNoActAlarmState [] = {
-    acMoveNoActAlarmStateIdle,
-    acMoveNoActAlarmStateTriggered,
-    acMoveNoActAlarmStateCancelled
-};
+/* --------------------------------------------------------------------------
+ * Module state
+ * -------------------------------------------------------------------------- */
+static move_alg_t  MoveAlg;
+static acc_health_t AccHealth;
 
-bool MOVE_bUpdateMovementLevel(uint8_t *pu8Level);
-void MOVE_vEvalMovementLevel(void);
-void MOVE_vWindowATick(void);
+static uint8_t  u8MoveTemp;
+static int16_t  i16MoveTemp;
+
+static MoveState_e eState        = MOVE_STATE_MOVING;
+static uint32_t    u32StillTicks = 0U;
+
+/* Gravity sequence detector */
+static uint8_t u8SeqStep     = 0U;
+static uint8_t u8HoldCounter = 0U;
+
+/* --------------------------------------------------------------------------
+ * Forward declarations
+ * -------------------------------------------------------------------------- */
+static bool MOVE_bUpdateMovementLevel(uint8_t *pu8Level);
+static void MOVE_vEvalMovementLevel(void);
+static void MOVE_vUpdateState(void);
+static bool MOVE_bCheckPosition(uint8_t step);
+static void MOVE_vSequenceTick(void);
+static void MOVE_vTask(void *arg);
 
 /* --------------------------------------------------------------------------
  * MOVE_vInit
@@ -124,130 +86,166 @@ void MOVE_vInit(void)
     MoveAlg.Z.u8DcBufIdx = 0;
     MoveAlg.u8EnvBufIdx  = 0;
 
-    ccrMoveTestTask = 0;
-
-    MoveNotAlarmFifo.u8Head = 0;
-    MoveNotAlarmFifo.u8Tail = 0;
-
-    u16MoveMaxLevelWindowTmr = 0;
-#ifndef SWITCH_POSITION_LOGGER
-    u32MoveMinLevelWindowTmr = 60 * 25 * (uint32_t)MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_MIN_WINDOW);
-#else
-    u32MoveMinLevelWindowTmr = 60 * 25 * 60;
-#endif
-
-    u8MoveHighActivityAlarmCnt   = 0;
-    u8MoveHighActAlarmSuccessCnt = 0;
-    u8MoveNotActiveAlarmCnt      = 0;
-
-    memset(&MoveWinA, 0, sizeof(move_window_a_t));
-
-    tTimeOfDayPrev = TIME_tGetDayTimeZoneNow();
-
-    u8MoveSensorHealthErrorCnt = 0;
-    u8MoveSensorHealthAlertCnt = 0;
-
     memset(&AccHealth, 0, sizeof(acc_health_t));
-    AccHealth.tAlertTimeOfDayPrev = TIME_tGetDayTimeZoneNow();
+
+    eState        = MOVE_STATE_MOVING;
+    u32StillTicks = 0U;
+    u8SeqStep     = 0U;
+    u8HoldCounter = 0U;
+
+    static const osThreadAttr_t attr = {
+        .name       = "Movement",
+        .stack_size = configMINIMAL_STACK_SIZE * 4U,
+        .priority   = osPriorityLow,
+    };
+    osThreadNew(MOVE_vTask, NULL, &attr);
 }
 
 /* --------------------------------------------------------------------------
- * MOVE_bTick — main module tick
+ * MOVE_eGetState
  * -------------------------------------------------------------------------- */
-bool MOVE_bTick(void)
+MoveState_e MOVE_eGetState(void) { return eState; }
+
+/* --------------------------------------------------------------------------
+ * MOVE_vTask — 1 Hz heartbeat-driven task
+ * -------------------------------------------------------------------------- */
+static void MOVE_vTask(void *arg)
 {
-    bool bBusy = false;
+    (void)arg;
+    PLATFORM_bSubscribeToHeartbeat(osThreadGetId(), HB_ALLOW_IN_RECOVERY);
 
-    MOVE_vEvalMovementLevel();
-    MOVE_vWindowATick();
-
-    /* Sensor health check #1: device ID */
-    if (AccHealth.u8DevIdErrorSeqCnt < MOVE_SENSOR_ID_ERR_CNT_ALERT)
+    for (;;)
     {
-        if (MOVE_DRIVER_u8GetAccelDeviceId() != ACC_WHO_AM_I_VALUE)
+        osThreadFlagsWait(0x0001U, osFlagsWaitAny, osWaitForever);
+        MOVE_vEvalMovementLevel();
+        MOVE_vUpdateState();
+        MOVE_vSequenceTick();
+
+        /* Sensor health check #1: device ID */
+        if (AccHealth.u8DevIdErrorSeqCnt < MOVE_SENSOR_ID_ERR_CNT_ALERT)
         {
-            AccHealth.u8DevIdErrorSeqCnt++;
-            if (AccHealth.u8DevIdErrorSeqCnt == MOVE_SENSOR_ID_ERR_CNT_ALERT &&
+            if (MOVE_DRIVER_u8GetAccelDeviceId() != ACC_WHO_AM_I_VALUE)
+            {
+                AccHealth.u8DevIdErrorSeqCnt++;
+                if (AccHealth.u8DevIdErrorSeqCnt == MOVE_SENSOR_ID_ERR_CNT_ALERT &&
+                    !AccHealth.bErrorFlag)
+                {
+                    AccHealth.bErrorFlag = true;
+                    DBG("+++ MOVE SENSOR ERROR (DEVICE_ID) +++");
+                }
+            }
+            else
+            {
+                AccHealth.u8DevIdErrorSeqCnt = 0;
+            }
+        }
+
+        /* Sensor health check #2: no sample */
+        if (AccHealth.u8NoSampleErrorCnt < MOVE_SENSOR_SAMPLE_ERR_CNT_ALERT)
+        {
+            AccHealth.u8NoSampleErrorCnt++;
+            if (AccHealth.u8NoSampleErrorCnt == MOVE_SENSOR_SAMPLE_ERR_CNT_RESET)
+            {
+                ACC_vInit();
+                DBG("+++ MOVE SENSOR ERROR (NO_SAMPLE) - reset +++");
+            }
+            if (AccHealth.u8NoSampleErrorCnt == MOVE_SENSOR_SAMPLE_ERR_CNT_ALERT &&
                 !AccHealth.bErrorFlag)
             {
                 AccHealth.bErrorFlag = true;
-                DBG("+++ MOVE SENSOR ERROR (DEVICE_ID) - alert +++");
+                DBG("+++ MOVE SENSOR ERROR (NO_SAMPLE) - alert +++");
             }
         }
-        else
-        {
-            AccHealth.u8DevIdErrorSeqCnt = 0;
-        }
     }
-
-    /* Sensor health check #2: no sample */
-    if (AccHealth.u8NoSampleErrorCnt < MOVE_SENSOR_SAMPLE_ERR_CNT_ALERT)
-    {
-        AccHealth.u8NoSampleErrorCnt++;
-        if (AccHealth.u8NoSampleErrorCnt == MOVE_SENSOR_SAMPLE_ERR_CNT_RESET)
-        {
-            ACC_vInit();
-            DBG("+++ MOVE SENSOR ERROR (NO_SAMPLE) - reset +++");
-        }
-        if (AccHealth.u8NoSampleErrorCnt == MOVE_SENSOR_SAMPLE_ERR_CNT_ALERT &&
-            !AccHealth.bErrorFlag)
-        {
-            AccHealth.bErrorFlag = true;
-            DBG("+++ MOVE SENSOR ERROR (NO_SAMPLE) - alert +++");
-        }
-    }
-
-    /* Sensor health alerts */
-    if ((AccHealth.bErrorFlag && AccHealth.u8AlertCnt == 0) ||
-        (AccHealth.u8AlertCnt > 0 &&
-         TIME_tGetDayTimeZoneNow() == TIME_OF_DAY_MIDDAY &&
-         AccHealth.tAlertTimeOfDayPrev == TIME_OF_DAY_MORNING &&
-         AccHealth.u8AlertCnt < MOVE_SENSOR_ALERT_COUNT_MAX))
-    {
-        AccHealth.u8AlertCnt++;
-        AccHealth.bAlertFlag = true;
-        DBG("+++ MOVE SENSOR HEALTH ALARM (%u of %u) +++",
-            AccHealth.u8AlertCnt, MOVE_SENSOR_ALERT_COUNT_MAX);
-    }
-
-    AccHealth.tAlertTimeOfDayPrev = TIME_tGetDayTimeZoneNow();
-
-    /* Check for time-of-day change → reset no-movement window */
-    if (tTimeOfDayPrev != TIME_tGetDayTimeZoneNow())
-    {
-        if (u32MoveMinLevelWindowTmr)
-        {
-#ifndef SWITCH_POSITION_LOGGER
-            u32MoveMinLevelWindowTmr = 60 * 25 *
-                (uint32_t)MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_MIN_WINDOW);
-#else
-            u32MoveMinLevelWindowTmr = 60 * 25 * 60;
-#endif
-        }
-        tTimeOfDayPrev = TIME_tGetDayTimeZoneNow();
-    }
-
-    return bBusy;
 }
 
 /* --------------------------------------------------------------------------
- * Sensor health peek / pull
+ * MOVE_vUpdateState — MOVING / STILL bookkeeping
  * -------------------------------------------------------------------------- */
-bool MOVE_bSensorHealthAlertPeek(void)  { return AccHealth.bAlertFlag; }
-
-bool MOVE_bSensorHealthAlertPull(void)
+static void MOVE_vUpdateState(void)
 {
-    bool bTemp = AccHealth.bAlertFlag;
-    AccHealth.bAlertFlag = false;
-    return bTemp;
+    if (MoveAlg.u8EnvLevel > MOVE_STILL_ENV_THRESHOLD)
+    {
+        eState        = MOVE_STATE_MOVING;
+        u32StillTicks = 0U;
+    }
+    else
+    {
+        if (u32StillTicks < MOVE_STILL_TIMEOUT_S)
+            u32StillTicks++;
+        if (u32StillTicks >= MOVE_STILL_TIMEOUT_S)
+            eState = MOVE_STATE_STILL;
+    }
 }
 
-bool MOVE_bSensorHealthOk(void) { return !AccHealth.bErrorFlag; }
+/* --------------------------------------------------------------------------
+ * MOVE_bCheckPosition — is the device in the given sequence position?
+ * -------------------------------------------------------------------------- */
+static bool MOVE_bCheckPosition(uint8_t step)
+{
+    int8_t x = MoveAlg.X.i8DcLevel;
+    int8_t y = MoveAlg.Y.i8DcLevel;
+    int8_t z = MoveAlg.Z.i8DcLevel;
+
+    switch (step)
+    {
+        case 0: return (z < -MOVE_SEQ_GRAV_TH) &&
+                       (x > -MOVE_SEQ_GRAV_NULL && x < MOVE_SEQ_GRAV_NULL) &&
+                       (y > -MOVE_SEQ_GRAV_NULL && y < MOVE_SEQ_GRAV_NULL);
+        case 1: return (z > +MOVE_SEQ_GRAV_TH);
+        case 2: return ((x > MOVE_SEQ_GRAV_TH || x < -MOVE_SEQ_GRAV_TH)) &&
+                       (z > -MOVE_SEQ_GRAV_NULL && z < MOVE_SEQ_GRAV_NULL);
+        case 3: return (z > +MOVE_SEQ_GRAV_TH);
+        case 4: return ((y > MOVE_SEQ_GRAV_TH || y < -MOVE_SEQ_GRAV_TH)) &&
+                       (z > -MOVE_SEQ_GRAV_NULL && z < MOVE_SEQ_GRAV_NULL);
+        case 5: return (z > +MOVE_SEQ_GRAV_TH);
+        default: return false;
+    }
+}
 
 /* --------------------------------------------------------------------------
- * MOVE_bUpdateMovementLevel — sample ACC FIFO, run HPF
+ * MOVE_vSequenceTick — gravity orientation sequence detector
  * -------------------------------------------------------------------------- */
-bool MOVE_bUpdateMovementLevel(uint8_t *pu8Level)
+static void MOVE_vSequenceTick(void)
+{
+    if (MOVE_bCheckPosition(u8SeqStep))
+    {
+        u8HoldCounter++;
+        if (u8HoldCounter >= MOVE_SEQ_HOLD_TICKS)
+        {
+            MOVE_DRIVER_vLedOn();
+            osDelay(100);
+            MOVE_DRIVER_vLedOff();
+
+            u8SeqStep++;
+            u8HoldCounter = 0U;
+
+            if (u8SeqStep >= 6U)
+            {
+                /* Sequence complete — flash 5 times then trigger kernel wakeup */
+                for (uint8_t i = 0U; i < 5U; i++)
+                {
+                    MOVE_DRIVER_vLedOn();
+                    osDelay(200);
+                    MOVE_DRIVER_vLedOff();
+                    osDelay(200);
+                }
+                u8SeqStep = 0U;
+                DEVICE_DISCOVERY_vTriggerKernelWakeup();
+            }
+        }
+    }
+    else
+    {
+        u8SeqStep     = 0U;
+        u8HoldCounter = 0U;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * MOVE_bUpdateMovementLevel — drain one sample from ACC FIFO, run HPF
+ * -------------------------------------------------------------------------- */
+static bool MOVE_bUpdateMovementLevel(uint8_t *pu8Level)
 {
     uint8_t u8;
     acc_t   AccMoveDev;
@@ -337,246 +335,18 @@ bool MOVE_bUpdateMovementLevel(uint8_t *pu8Level)
     return false;
 }
 
+/* --------------------------------------------------------------------------
+ * MOVE_vEvalMovementLevel — drain full ACC FIFO
+ * -------------------------------------------------------------------------- */
+static void MOVE_vEvalMovementLevel(void)
+{
+    uint8_t u8Level;
+    while (MOVE_bUpdateMovementLevel(&u8Level))
+        ;
+}
+
 #ifdef SWITCH_MOVE_SENSOR_DATA
 int8_t MOVE_i8SensorDataX(void) { return (int8_t)AccHealth.AccPrevSample.i16.i16OutX; }
 int8_t MOVE_i8SensorDataY(void) { return (int8_t)AccHealth.AccPrevSample.i16.i16OutY; }
 int8_t MOVE_i8SensorDataZ(void) { return (int8_t)AccHealth.AccPrevSample.i16.i16OutZ; }
 #endif
-
-bool MOVE_bSetSensorAxis(uint8_t u8AxisMask)
-{
-    if (u8AxisMask & 0x07)
-    {
-        SETTINGS_vSetByte(movementAlarm.accelerometerAxes, u8AxisMask);
-        return true;
-    }
-    return false;
-}
-
-uint8_t MOVE_u8HighActivityAlarmCnt(void)     { return u8MoveHighActivityAlarmCnt; }
-uint8_t MOVE_u8HighActAlarmSuccessCnt(void)   { return u8MoveHighActAlarmSuccessCnt; }
-void    MOVE_vHighActAlarmSuccessIncr(void)   { u8MoveHighActAlarmSuccessCnt++; }
-uint8_t MOVE_u8NotActiveAlarmCnt(void)        { return u8MoveNotActiveAlarmCnt; }
-
-/* --------------------------------------------------------------------------
- * MOVE_vEvalMovementLevel — sample & process movement, queue alarms
- * -------------------------------------------------------------------------- */
-void MOVE_vEvalMovementLevel(void)
-{
-    uint8_t u8Level;
-
-    while (MOVE_bUpdateMovementLevel(&u8Level))
-    {
-        if (u8Level >= MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_MAX_LEVEL))
-        {
-            if (MOVE_bIsAlarmActiveNow())
-            {
-                u16MoveMaxLevelWindowTmr++;
-                MoveWinA.u16TmrHwm = max(MoveWinA.u16TmrHwm, u16MoveMaxLevelWindowTmr);
-
-                if (u16MoveMaxLevelWindowTmr >=
-                    (25 * (uint16_t)MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_MAX_WINDOW)))
-                {
-                    u16MoveMaxLevelWindowTmr = 0;
-                    MoveWinA.u16TmrHwm       = 0;
-                    MoveWinA.u8TriggerCnt++;
-                    MoveWinA.u8HoldBackCnt = (bool)MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_FIRST_HOLD) +
-                                             (bool)MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_SECOND_HOLD);
-
-                    if (((MoveWinA.u8TriggerCnt == 1) &&
-                         (bool)MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_FIRST_HOLD)) ||
-                        ((MoveWinA.u8TriggerCnt == 2) &&
-                         (bool)MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_SECOND_HOLD)))
-                    {
-                        DBG("--- high act alarm | hold (%u/%u) ---",
-                            MoveWinA.u8TriggerCnt, MoveWinA.u8HoldBackCnt);
-
-                        if (MoveHoldback.u8Idx < MOVE_HOLDBACK_BUF_SIZE &&
-                            MoveWinA.u8TriggerCnt == 1)
-                        {
-                            MoveHoldback.Events[MoveHoldback.u8Idx].u32Ts = RTC_u64GetUTC();
-                        }
-                    }
-                    else
-                    {
-                        u8MoveHighActivityAlarmCnt++;
-                    }
-                }
-            }
-        }
-        else
-        {
-            MOVE_DRIVER_vLedOff();
-            if (u16MoveMaxLevelWindowTmr) u16MoveMaxLevelWindowTmr--;
-        }
-
-        if (u8Level < MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_MIN_LEVEL))
-        {
-            if (u32MoveMinLevelWindowTmr)
-            {
-                u32MoveMinLevelWindowTmr--;
-                if (u32MoveMinLevelWindowTmr == 0)
-                {
-                    MOVE_bNoActAlertPush(MOVE_NOT_ALARM_STATE_TRIGGERED);
-                    u8MoveNotActiveAlarmCnt++;
-                }
-            }
-        }
-        else
-        {
-            if (u32MoveMinLevelWindowTmr == 0 && u8Level >= 5)
-                MOVE_bNoActAlertPush(MOVE_NOT_ALARM_STATE_CANCELLED);
-
-            if (u32MoveMinLevelWindowTmr || (u32MoveMinLevelWindowTmr == 0 && u8Level >= 5))
-            {
-#ifndef SWITCH_POSITION_LOGGER
-                u32MoveMinLevelWindowTmr = 60 * 25 *
-                    (uint32_t)MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_MIN_WINDOW);
-#else
-                u32MoveMinLevelWindowTmr = 60 * 25 * 60;
-#endif
-            }
-        }
-    }
-}
-
-/* --------------------------------------------------------------------------
- * MOVE_vWindowATick — window A state machine
- * -------------------------------------------------------------------------- */
-void MOVE_vWindowATick(void)
-{
-    if (MoveWinA.u8TriggerCnt)
-    {
-        if (MoveWinA.u8TriggerCnt <= MoveWinA.u8HoldBackCnt)
-        {
-            DBG("--- high act alarm | cancel (hold=%u/%u, hwm=%u/%us) ---",
-                MoveWinA.u8TriggerCnt, MoveWinA.u8HoldBackCnt,
-                MoveWinA.u16TmrHwm / 25,
-                MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_MAX_WINDOW));
-
-            if (MoveHoldback.u8Idx < MOVE_HOLDBACK_BUF_SIZE)
-            {
-                MoveHoldback.Events[MoveHoldback.u8Idx].u8TrigCnt = MoveWinA.u8TriggerCnt;
-                MoveHoldback.Events[MoveHoldback.u8Idx].u8HoldCnt = MoveWinA.u8HoldBackCnt;
-                MoveHoldback.Events[MoveHoldback.u8Idx].u8WinHwm  = MoveWinA.u16TmrHwm / 25;
-                MoveHoldback.Events[MoveHoldback.u8Idx].u8WinLen  =
-                    MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_MAX_WINDOW);
-                MoveHoldback.u8Idx++;
-            }
-        }
-        else
-        {
-            DBG("--- high act alarm | done (trig=%u, hold=%u) ---",
-                MoveWinA.u8TriggerCnt, MoveWinA.u8HoldBackCnt);
-        }
-        memset(&MoveWinA, 0, sizeof(move_window_a_t));
-    }
-}
-
-/* --------------------------------------------------------------------------
- * MOVE_u8GetAlarmSettingNow
- * -------------------------------------------------------------------------- */
-uint8_t MOVE_u8GetAlarmSettingNow(move_alarm_setting_t tMoveAlarmSetting)
-{
-    if (TIME_tGetDayTimeZoneNow() == TIME_OF_DAY_MORNING)
-    {
-        switch (tMoveAlarmSetting)
-        {
-            case MOVE_ALARM_SETTING_MAX_LEVEL:   return SETTINGS_u8GetByte(movementAlarm.morningZoneLevels.maxLevel);
-            case MOVE_ALARM_SETTING_MAX_WINDOW:  return SETTINGS_u8GetByte(movementAlarm.morningZoneLevels.maxWindow);
-            case MOVE_ALARM_SETTING_FIRST_HOLD:  return SETTINGS_u8GetByte(movementAlarm.morningZoneLevels.holdFirst);
-            case MOVE_ALARM_SETTING_SECOND_HOLD: return SETTINGS_u8GetByte(movementAlarm.morningZoneLevels.holdSecond);
-            case MOVE_ALARM_SETTING_MIN_LEVEL:   return SETTINGS_u8GetByte(movementAlarm.morningZoneLevels.minLevel);
-            case MOVE_ALARM_SETTING_MIN_WINDOW:  return SETTINGS_u8GetByte(movementAlarm.morningZoneLevels.minWindow);
-        }
-    }
-    if (TIME_tGetDayTimeZoneNow() == TIME_OF_DAY_MIDDAY)
-    {
-        switch (tMoveAlarmSetting)
-        {
-            case MOVE_ALARM_SETTING_MAX_LEVEL:   return SETTINGS_u8GetByte(movementAlarm.middayZoneLevels.maxLevel);
-            case MOVE_ALARM_SETTING_MAX_WINDOW:  return SETTINGS_u8GetByte(movementAlarm.middayZoneLevels.maxWindow);
-            case MOVE_ALARM_SETTING_FIRST_HOLD:  return SETTINGS_u8GetByte(movementAlarm.middayZoneLevels.holdFirst);
-            case MOVE_ALARM_SETTING_SECOND_HOLD: return SETTINGS_u8GetByte(movementAlarm.middayZoneLevels.holdSecond);
-            case MOVE_ALARM_SETTING_MIN_LEVEL:   return SETTINGS_u8GetByte(movementAlarm.middayZoneLevels.minLevel);
-            case MOVE_ALARM_SETTING_MIN_WINDOW:  return SETTINGS_u8GetByte(movementAlarm.middayZoneLevels.minWindow);
-        }
-    }
-    if (TIME_tGetDayTimeZoneNow() == TIME_OF_DAY_AFTERNOON)
-    {
-        switch (tMoveAlarmSetting)
-        {
-            case MOVE_ALARM_SETTING_MAX_LEVEL:   return SETTINGS_u8GetByte(movementAlarm.afternoonZoneLevels.maxLevel);
-            case MOVE_ALARM_SETTING_MAX_WINDOW:  return SETTINGS_u8GetByte(movementAlarm.afternoonZoneLevels.maxWindow);
-            case MOVE_ALARM_SETTING_FIRST_HOLD:  return SETTINGS_u8GetByte(movementAlarm.afternoonZoneLevels.holdFirst);
-            case MOVE_ALARM_SETTING_SECOND_HOLD: return SETTINGS_u8GetByte(movementAlarm.afternoonZoneLevels.holdSecond);
-            case MOVE_ALARM_SETTING_MIN_LEVEL:   return SETTINGS_u8GetByte(movementAlarm.afternoonZoneLevels.minLevel);
-            case MOVE_ALARM_SETTING_MIN_WINDOW:  return SETTINGS_u8GetByte(movementAlarm.afternoonZoneLevels.minWindow);
-        }
-    }
-    if (TIME_tGetDayTimeZoneNow() == TIME_OF_DAY_NIGHT)
-    {
-        switch (tMoveAlarmSetting)
-        {
-            case MOVE_ALARM_SETTING_MAX_LEVEL:   return SETTINGS_u8GetByte(movementAlarm.nightZoneLevels.maxLevel);
-            case MOVE_ALARM_SETTING_MAX_WINDOW:  return SETTINGS_u8GetByte(movementAlarm.nightZoneLevels.maxWindow);
-            case MOVE_ALARM_SETTING_FIRST_HOLD:  return SETTINGS_u8GetByte(movementAlarm.nightZoneLevels.holdFirst);
-            case MOVE_ALARM_SETTING_SECOND_HOLD: return SETTINGS_u8GetByte(movementAlarm.middayZoneLevels.holdSecond);
-            case MOVE_ALARM_SETTING_MIN_LEVEL:   return SETTINGS_u8GetByte(movementAlarm.nightZoneLevels.minLevel);
-            case MOVE_ALARM_SETTING_MIN_WINDOW:  return SETTINGS_u8GetByte(movementAlarm.nightZoneLevels.minWindow);
-        }
-    }
-    return 0;
-}
-
-bool MOVE_bIsAlarmActiveNow(void)
-{
-    return (bool)(SETTINGS_u32GetWord(movementAlarm.dayTimeActive) &
-                  ((uint32_t)1 << (TIME_u8GetDayOfWeek() * 4 + TIME_tGetDayTimeZoneNow())));
-}
-
-bool MOVE_bIsActive(void) { return u32MoveMinLevelWindowTmr != 0; }
-
-/* --------------------------------------------------------------------------
- * No-movement alarm FIFO
- * -------------------------------------------------------------------------- */
-bool MOVE_bNoActAlertPush(move_not_alarm_state_t tState)
-{
-    uint8_t u8 = ((MoveNotAlarmFifo.u8Head + 1) % MOVE_NOT_ALARM_FIFO_SIZE);
-    if (u8 != MoveNotAlarmFifo.u8Tail)
-    {
-        MoveNotAlarmFifo.Buf[MoveNotAlarmFifo.u8Head].tState = tState;
-        MoveNotAlarmFifo.u8Head = u8;
-        DBG("+++ NO ACTIVITY ALARM (%s) +++", (char *)acMoveNoActAlarmState[tState]);
-        return true;
-    }
-    DBG("*** no activity alarm buffer ERROR ***");
-    return false;
-}
-
-move_not_alarm_t *MOVE_pNoActAlertPeek(void)
-{
-    if (MoveNotAlarmFifo.u8Head != MoveNotAlarmFifo.u8Tail)
-        return &MoveNotAlarmFifo.Buf[MoveNotAlarmFifo.u8Tail];
-    return NULL;
-}
-
-bool MOVE_bNoActAlertPull(move_not_alarm_t *pMoveNotAlarm)
-{
-    if (MoveNotAlarmFifo.u8Head != MoveNotAlarmFifo.u8Tail)
-    {
-        if (pMoveNotAlarm)
-            memcpy(pMoveNotAlarm, &MoveNotAlarmFifo.Buf[MoveNotAlarmFifo.u8Tail],
-                   sizeof(move_not_alarm_t));
-        MoveNotAlarmFifo.u8Tail = (MoveNotAlarmFifo.u8Tail + 1) % MOVE_NOT_ALARM_FIFO_SIZE;
-        return true;
-    }
-    return false;
-}
-
-/* --------------------------------------------------------------------------
- * Hold-back buffer
- * -------------------------------------------------------------------------- */
-uint8_t               MOVE_u8HoldbackBufLen(void)      { return MoveHoldback.u8Idx; }
-move_holdback_event_t *MOVE_pGetHoldbackBuf(void)      { return MoveHoldback.Events; }
-void                  MOVE_vClearHoldbackBuf(void)     { memset(&MoveHoldback, 0, sizeof(move_holdback_t)); }

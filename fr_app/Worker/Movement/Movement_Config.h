@@ -108,9 +108,13 @@
 #define MOVE_MIN_WINDOW_DTZ3_DEF                60
 #define MOVE_MIN_WINDOW_MAX                     254
 
-/* Tracking times */
-#define MOVE_TRACKING_TIME_NIGHT                UINT16_C(15 * 60)
-#define MOVE_TRACKING_TIME_DAY                  UINT16_C(5  * 60)
-#define MOVE_TRACKING_TIME_MARGIN               15
+/* RTOS state machine — STILL detection */
+#define MOVE_STILL_TIMEOUT_S        300U   /* 5 min of envelope ≤ threshold → STILL */
+#define MOVE_STILL_ENV_THRESHOLD      3U   /* envelope ≤ this counts as no motion   */
+
+/* Gravity sequence detector */
+#define MOVE_SEQ_GRAV_TH              7    /* |dcLevel| > this → axis carries gravity  */
+#define MOVE_SEQ_GRAV_NULL            4    /* |dcLevel| < this → axis is free          */
+#define MOVE_SEQ_HOLD_TICKS           2U   /* consecutive 1 Hz ticks to accept a step  */
 
 #endif /* WORKER_MOVEMENT_MOVEMENT_CONFIG_H_ */

@@ -99,13 +99,18 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
     for (;;)
     {
         /* ----------------------------------------------------------------
-         * Wait for synchronized wake-up signal from wakeup-schedule task
+         * Wait for wake-up: scheduled discovery or kernel wakeup (shake)
          * ---------------------------------------------------------------- */
-        osEventFlagsWait(xDiscoveryEventFlags,
-                         DISCOVERY_WAKEUP_BIT,
-                         osFlagsWaitAny,   /* auto-clears the bit */
-                         osWaitForever);
+        uint32_t u32Flags = osEventFlagsWait(xDiscoveryEventFlags,
+                                             DISCOVERY_WAKEUP_BIT | DISCOVERY_KERNEL_BIT,
+                                             osFlagsWaitAny,
+                                             osWaitForever);
 
+        bool bKernelWakeup = ((u32Flags & osFlagsError) == 0U) &&
+                             ((u32Flags & DISCOVERY_KERNEL_BIT) != 0U);
+
+        if (!bKernelWakeup)
+        {
 
 #ifdef ENABLE_GPS
         /* ---- GPS fix ---- */
@@ -340,6 +345,8 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         }
 #endif /* LISTENER_MODE */
 
+        } /* end if (!bKernelWakeup) */
+
         /* ---- Deep sleep ---- */
         MESHNETWORK_vResetNodeRole();
 
@@ -399,6 +406,17 @@ static void DEVICE_DISCOVERY_vSendTS(void)
 {
     DBG("\r\n--- START TIMESYNC ---\r\n");
     MESHNETWORK_vSendTimeSync(RTC_u64GetUTC(), MESHNETWORK_tGetWakeupInterval());
+}
+
+/* --------------------------------------------------------------------------
+ * DEVICE_DISCOVERY_vTriggerKernelWakeup
+ * -------------------------------------------------------------------------- */
+void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
+{
+    SYSTEM_vDeactivateDeepSleep();
+    LORARADIO_vWakeUp();
+    DBG("\r\n--- KERNEL WAKEUP ---\r\n");
+    osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
 }
 
 /* --------------------------------------------------------------------------

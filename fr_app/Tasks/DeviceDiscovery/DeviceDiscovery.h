@@ -25,6 +25,9 @@
 /* osEventFlags bit — set by wakeup-schedule task to start a campaign */
 #define DISCOVERY_WAKEUP_BIT                (1UL << 0)
 
+/* osEventFlags bit — set by Movement to bypass deep sleep into FrKernel */
+#define DISCOVERY_KERNEL_BIT                (1UL << 1)
+
 /* Thread flag bit — set by MeshNetwork when a TimeSync packet is received */
 #define DEVICE_DISCOVERY_NOTIFY_TIMESYNC    (1UL << 0)
 
@@ -41,5 +44,6 @@ void          DEVICE_DISCOVERY_vAppTask(void *pvParameters);
 void          DEVICE_DISCOVERY_vConfigDeviceRole(void);
 DeviceRole_e  DEVICE_DISCOVERY_eGetDeviceRole(void);
 osThreadId_t  DEVICE_DISCOVERY_xGetTaskHandle(void);
+void          DEVICE_DISCOVERY_vTriggerKernelWakeup(void);
 
 #endif /* TASKS_DEVICEDISCOVERY_DEVICEDISCOVERY_H_ */
