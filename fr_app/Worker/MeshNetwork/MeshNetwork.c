@@ -83,7 +83,8 @@ static const char * const MeshPktTypeStr[] = {
     [MeshPktType_DReq]     = "DReq",
     [MeshPktType_DBeacon]  = "DBeacon",
     [MeshPktType_DAck]     = "DAck",
-    [MeshPktType_TimeSync] = "TimeSync"
+    [MeshPktType_TimeSync] = "TimeSync",
+    [MeshPktType_FrKernel] = "FrKernel"
 };
 
 /* ---- Misc state ---- */
@@ -613,6 +614,9 @@ void MESHNETWORK_vParserTask(void *pvParameters)
             case MeshPktType_TimeSync:
                 MESHNETWORK_vHandleTimeSync(tRx.buffer, tRx.length, tRx.rssi);
                 break;
+            case MeshPktType_FrKernel:
+                MESHNETWORK_vOnFrKernelPacket(tRx.buffer + 1, (uint8_t)(tRx.length - 1));
+                break;
             default:
                 DBG("MeshNetwork: Unknown pkt type %u\r\n", tRx.buffer[0]);
                 break;
@@ -819,3 +823,8 @@ void MESHNETWORK_vResetNodeRole(void)
 
 void MESHNETWORK_vIncrDreqWaveCnt(void) { u8PrimaryDreqWaveCnt++; }
 void MESHNETWORK_vResetDreqWaveCnt(void) { u8PrimaryDreqWaveCnt = 0; }
+
+__attribute__((weak)) void MESHNETWORK_vOnFrKernelPacket(const uint8_t *buf, uint8_t len)
+{
+    (void)buf; (void)len;
+}

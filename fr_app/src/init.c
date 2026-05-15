@@ -44,6 +44,7 @@
 #endif
 #include "Battery.h"
 #include "Power.h"
+#include "FrKernel.h"
 
 #include "flashLog.h"
 
@@ -87,6 +88,7 @@ void INIT_vInitialization(void *parameters)
     osDelay(100);
 
     LORARADIO_vInit();
+    FRKERNEL_vInit();
 
 #ifdef ENABLE_RADIO_TEST
     /*
