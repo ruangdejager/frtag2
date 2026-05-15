@@ -80,6 +80,10 @@ bool FRKERNEL_bIsConnected(void)
 
 static void FRKERNEL_vRespond(const char *msg)
 {
+    /* Any TX extends an active session (covers bulk/slow data scenarios) */
+    if (s_bConnected)
+        s_u32LastCmdTick = osKernelGetTickCount();
+
     uint16_t len = (uint16_t)strlen(msg);
 
 #ifdef FRKERNEL_INTERFACE_UART
@@ -226,6 +230,10 @@ static void FRKERNEL_vTask(void *arg)
         uint8_t byte;
         while (DEBUG_bReadByte(&byte))
         {
+            /* Any received byte extends an active session */
+            if (s_bConnected)
+                s_u32LastCmdTick = osKernelGetTickCount();
+
             if (byte == '\r' || byte == '\n')
             {
                 if (s_lineIdx > 0U)
