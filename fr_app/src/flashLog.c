@@ -14,9 +14,12 @@
  *   [63:37] value   (27 bits)
  */
 
+#include "flashLog.h"
+
+#ifdef ENABLE_FLASH_LOG
+
 #include "FreeRTOS.h"
 #include "task.h"
-#include "flashLog.h"
 #include "stm32wlxx_hal.h"
 #include <string.h>
 #include <stdio.h>
@@ -288,3 +291,5 @@ void FLASHLOG_vDump(void)
         addr += 8;
     }
 }
+
+#endif /* ENABLE_FLASH_LOG */
