@@ -32,6 +32,7 @@
 #include "Power.h"
 #include "flashLog.h"
 #include "GPS.h"
+#include "FrKernel.h"
 
 /* ---- Private defines ---- */
 #define APP_TASK_STACK_SIZE     (configMINIMAL_STACK_SIZE * 10)
@@ -344,6 +345,16 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         MESHNETWORK_vResetNodeRole();
 
         LOG(LOG_DEVICE_ENTERING_SLEEP, eDeviceRole);
+
+        /* Hold off sleep while an active FrKernel session is in progress.
+         * The user must issue "tag release" (or 5-min inactivity auto-releases). */
+        if (FRKERNEL_bIsConnected())
+        {
+            DBG("DeviceDiscovery: FrKernel session active — waiting for release...\r\n");
+            while (FRKERNEL_bIsConnected())
+                osDelay(500);
+        }
+
         DBG("DeviceDiscovery: Waiting for synchronized wake-up...\r\n");
         osDelay(100);
         BSP_LED_Off(LED_YELLOW);

@@ -3,6 +3,13 @@
  *
  * Device command interface Worker.
  *
+ * Session management:
+ *   Any addressed command marks the session "connected".  DeviceDiscovery
+ *   checks FRKERNEL_bIsConnected() before entering deep sleep and waits
+ *   until the session is released.  The user releases explicitly with
+ *   "tag release" (or "tag <ID> release" on LoRa), or the session
+ *   auto-releases after FRKERNEL_INACTIVITY_TIMEOUT_MS of inactivity.
+ *
  * UART path:
  *   UART2_vNotifyOnRX() (overrides weak HAL callback) → thread flag →
  *   drain ring buffer → accumulate line → parse on CR/LF →
@@ -13,14 +20,15 @@
  *   enqueue FrKernelPkt_t → parse → LORARADIO_bTxPacket() response.
  *
  * Commands:
- *   tag -devicereq              — broadcast; every device replies with its ID
+ *   tag -devicereq              broadcast; every device replies with its ID
  *   UART:  tag <cmd>
- *   LoRa:  tag <ID> <cmd>       — only the addressed device replies
+ *   LoRa:  tag <ID> <cmd>       only the addressed device replies
  *
- *   Supported <cmd>:
+ *   <cmd>:
  *     -help               list all commands
  *     battery             battery voltage (mV)
  *     discovery schedule  wakeup interval (min)
+ *     release             release session; device may enter deep sleep
  */
 
 #include "FrKernel.h"
@@ -30,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <stdbool.h>
 
 #include "cmsis_os2.h"
 #include "Battery.h"
@@ -42,7 +51,9 @@
 
 /* -------------------------------------------------------------------------- */
 
-static osThreadId_t s_taskHandle = NULL;
+static osThreadId_t      s_taskHandle   = NULL;
+static volatile bool     s_bConnected   = false;
+static volatile uint32_t s_u32LastCmdTick = 0U;
 
 #ifdef FRKERNEL_INTERFACE_LORA
 typedef struct {
@@ -57,6 +68,13 @@ static osMessageQueueId_t s_rxQueue = NULL;
 static char    s_lineBuf[FRKERNEL_LINE_BUF_LEN];
 static uint8_t s_lineIdx = 0U;
 #endif
+
+/* -------------------------------------------------------------------------- */
+
+bool FRKERNEL_bIsConnected(void)
+{
+    return s_bConnected;
+}
 
 /* -------------------------------------------------------------------------- */
 
@@ -90,12 +108,17 @@ static void FRKERNEL_vProcessCommand(const char *line)
 
     char resp[FRKERNEL_RESP_BUF_LEN];
 
-    /* -devicereq: broadcast — every device responds regardless of addressing */
+    /* -devicereq: broadcast — every device responds, no addressing check.
+     * Does not start a session on LoRa (any device may respond to a scan). */
     if (strcmp(p, "-devicereq") == 0)
     {
         snprintf(resp, sizeof(resp), "Device ID: %04" PRIX32 "\r\n",
                  LORARADIO_u32GetUniqueId());
         FRKERNEL_vRespond(resp);
+#ifdef FRKERNEL_INTERFACE_UART
+        s_bConnected      = true;
+        s_u32LastCmdTick  = osKernelGetTickCount();
+#endif
         return;
     }
 
@@ -108,6 +131,18 @@ static void FRKERNEL_vProcessCommand(const char *line)
     p = end + 1;                                            /* skip "<ID> " */
 #endif
 
+    /* release: close the session so the device can enter deep sleep */
+    if (strcmp(p, "release") == 0)
+    {
+        s_bConnected = false;
+        FRKERNEL_vRespond("Released\r\n");
+        return;
+    }
+
+    /* All other addressed commands: mark session active and update timer */
+    s_bConnected     = true;
+    s_u32LastCmdTick = osKernelGetTickCount();
+
     if (strcmp(p, "-help") == 0)
     {
 #ifdef FRKERNEL_INTERFACE_UART
@@ -117,6 +152,7 @@ static void FRKERNEL_vProcessCommand(const char *line)
             "  tag -help                   list commands\r\n"
             "  tag battery                 battery voltage (mV)\r\n"
             "  tag discovery schedule      wakeup interval (min)\r\n"
+            "  tag release                 release device for sleep\r\n"
         );
 #else
         FRKERNEL_vRespond(
@@ -125,6 +161,7 @@ static void FRKERNEL_vProcessCommand(const char *line)
             "  tag <ID> -help              list commands\r\n"
             "  tag <ID> battery            battery voltage (mV)\r\n"
             "  tag <ID> discovery schedule wakeup interval (min)\r\n"
+            "  tag <ID> release            release device for sleep\r\n"
         );
 #endif
     }
@@ -183,7 +220,9 @@ static void FRKERNEL_vTask(void *arg)
 #ifdef FRKERNEL_INTERFACE_UART
     for (;;)
     {
-        osThreadFlagsWait(0x01U, osFlagsWaitAny, osWaitForever);
+        /* Timed wait so the inactivity check runs even with no input */
+        osThreadFlagsWait(0x01U, osFlagsWaitAny, FRKERNEL_POLL_INTERVAL_MS);
+
         uint8_t byte;
         while (DEBUG_bReadByte(&byte))
         {
@@ -201,14 +240,31 @@ static void FRKERNEL_vTask(void *arg)
                 s_lineBuf[s_lineIdx++] = (char)byte;
             }
         }
+
+        /* Inactivity auto-release */
+        if (s_bConnected &&
+            (osKernelGetTickCount() - s_u32LastCmdTick) >= FRKERNEL_INACTIVITY_TIMEOUT_MS)
+        {
+            s_bConnected = false;
+            FRKERNEL_vRespond("FrKernel: session timed out\r\n");
+        }
     }
 
 #elif defined(FRKERNEL_INTERFACE_LORA)
     FrKernelPkt_t pkt;
     for (;;)
     {
-        if (osMessageQueueGet(s_rxQueue, &pkt, NULL, osWaitForever) == osOK)
+        /* Timed wait so the inactivity check runs even with no packets */
+        if (osMessageQueueGet(s_rxQueue, &pkt, NULL, FRKERNEL_POLL_INTERVAL_MS) == osOK)
             FRKERNEL_vProcessCommand((const char *)pkt.data);
+
+        /* Inactivity auto-release */
+        if (s_bConnected &&
+            (osKernelGetTickCount() - s_u32LastCmdTick) >= FRKERNEL_INACTIVITY_TIMEOUT_MS)
+        {
+            s_bConnected = false;
+            FRKERNEL_vRespond("FrKernel: session timed out\r\n");
+        }
     }
 #endif
 }
