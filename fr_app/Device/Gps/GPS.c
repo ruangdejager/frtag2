@@ -12,7 +12,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "GPS.h"
-#include "debug_uart_output.h"
+#include "dbg_log.h"
 
 /* Task parameters */
 #define GPS_RX_TASK_PRIORITY    osPriorityRealtime7

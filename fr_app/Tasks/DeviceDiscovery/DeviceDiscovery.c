@@ -78,10 +78,10 @@ void DEVICE_DISCOVERY_vInit(void)
     configASSERT(DeviceDiscoveryWakeupTask_handle != NULL);
 
     uint32_t u32ModifiedCSR = u32GetCSR() >> 5;
-    LOG(LOG_RESET_CAUSE, u32ModifiedCSR);
+    EVTLOG(LOG_RESET_CAUSE, u32ModifiedCSR);
 
     DBG("DeviceDiscovery: Initialized.\r\n");
-    LOG(LOG_DISCOVERY_INIT, eDeviceRole);
+    EVTLOG(LOG_DISCOVERY_INIT, eDeviceRole);
 
     if (eDeviceRole == DEVICE_ROLE_PRIMARY)
         DBG("DeviceDiscovery: Device Role = PRIMARY\r\n");
@@ -130,7 +130,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             LORARADIO_u32GetUniqueId());
 
         osDelay(APP_WAKEUP_BUFFER_MS);
-        LOG(LOG_DISCOVERY_START, eDeviceRole);
+        EVTLOG(LOG_DISCOVERY_START, eDeviceRole);
 
 #ifdef LISTENER_MODE
 
@@ -162,7 +162,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             {
                 DBG("DeviceDiscovery %X: Listener observed %u device(s).\r\n",
                     LORARADIO_u32GetUniqueId(), u16NeighborCount);
-                LOG(LOG_DISCOVERY_COUNT, u16NeighborCount);
+                EVTLOG(LOG_DISCOVERY_COUNT, u16NeighborCount);
                 for (uint16_t i = 0; i < u16NeighborCount; i++)
                 {
                     DBG("  ID:%X  Hops:%X  RSSI:%d  Bat:%d  Wave:%d\r\n",
@@ -252,7 +252,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
          * ---------------------------------------------------------------- */
         DBG("DeviceDiscovery %X: Discovery complete.\r\n",
             LORARADIO_u32GetUniqueId());
-        LOG(LOG_DISCOVERY_CMPLT, eDeviceRole);
+        EVTLOG(LOG_DISCOVERY_CMPLT, eDeviceRole);
 
 #ifndef LISTENER_MODE
         if (eDeviceRole == DEVICE_ROLE_PRIMARY)
@@ -265,7 +265,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             {
                 DBG("DeviceDiscovery %X: Final UNION: %u neighbors.\r\n",
                     LORARADIO_u32GetUniqueId(), u16NeighborCount);
-                LOG(LOG_DISCOVERY_COUNT, u16NeighborCount);
+                EVTLOG(LOG_DISCOVERY_COUNT, u16NeighborCount);
                 for (uint16_t i = 0; i < u16NeighborCount; i++)
                 {
                     DBG("  ID:%X  Hops:%X  RSSI:%d  Bat:%d  Wave:%d\r\n",
@@ -316,7 +316,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
             /* ---- Send TimeSync to secondaries ---- */
             DEVICE_DISCOVERY_vSendTS();
-            LOG(LOG_TX_TS, 1);
+            EVTLOG(LOG_TX_TS, 1);
 
             osDelay(5000);
         }
@@ -334,7 +334,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 ((now - last_heard) > (uint64_t)LOST_PRIMARY_TIMEOUT_MIN * 60))
             {
                 DBG("DeviceDiscovery: ENTERING RECOVERY MODE.\r\n");
-                LOG(LOG_DISCOVERY_RECOVER, 1);
+                EVTLOG(LOG_DISCOVERY_RECOVER, 1);
                 DEVICE_DISCOVERY_vRecoveryMode();
             }
         }
@@ -343,7 +343,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         /* ---- Deep sleep ---- */
         MESHNETWORK_vResetNodeRole();
 
-        LOG(LOG_DEVICE_ENTERING_SLEEP, eDeviceRole);
+        EVTLOG(LOG_DEVICE_ENTERING_SLEEP, eDeviceRole);
         DBG("DeviceDiscovery: Waiting for synchronized wake-up...\r\n");
         osDelay(100);
         BSP_LED_Off(LED_YELLOW);
@@ -381,7 +381,7 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
 
 #ifdef ENABLE_DBG_UART
                 HAL_UART_vInit();
-                DBG_UART_vInit();
+                DBGLOG_vInit();
 #endif
                 LORARADIO_vWakeUp();
 
@@ -449,13 +449,13 @@ static void DEVICE_DISCOVERY_vRecoveryMode(void)
         {
             DBG("DeviceDiscovery: Node %X recovered; PRIMARY FOUND.\r\n",
                 LORARADIO_u32GetUniqueId());
-            LOG(LOG_DISCOVERY_RECOVER, 2);
+            EVTLOG(LOG_DISCOVERY_RECOVER, 2);
             return;
         }
     }
 
     DBG("DeviceDiscovery: Node %X not recovered; NO PRIMARY FOUND.\r\n",
         LORARADIO_u32GetUniqueId());
-    LOG(LOG_DISCOVERY_RECOVER, 3);
+    EVTLOG(LOG_DISCOVERY_RECOVER, 3);
     MESHNETWORK_vUpdatePrimaryLastSeen();
 }

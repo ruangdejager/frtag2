@@ -115,6 +115,19 @@ static inline void BSP_LED_Off(Led_TypeDef led)
 #define BSP_BAT_ADC_VOLTAGE_CHANNEL     ADC_CHANNEL_8
 
 /* -----------------------------------------------------------------------
+ * External Flash SPI (SPI2) — PA5/PA8/PA10/PA15
+ * AT25EU0041A-SSHN-T, 512 KB NOR flash
+ * ----------------------------------------------------------------------- */
+#define BSP_FLASH_MISO_PORT         GPIOA
+#define BSP_FLASH_MISO_PIN          GPIO_PIN_5
+#define BSP_FLASH_SCK_PORT          GPIOA
+#define BSP_FLASH_SCK_PIN           GPIO_PIN_8
+#define BSP_FLASH_MOSI_PORT         GPIOA
+#define BSP_FLASH_MOSI_PIN          GPIO_PIN_10
+#define BSP_FLASH_CS_PORT           GPIOA
+#define BSP_FLASH_CS_PIN            GPIO_PIN_15
+
+/* -----------------------------------------------------------------------
  * RF switch control — PA9 (HIGH = TX/LP, LOW = RX/OFF)
  * ----------------------------------------------------------------------- */
 #define BSP_RF_SW_CTRL_PORT         GPIOA

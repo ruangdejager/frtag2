@@ -9,13 +9,14 @@
  *   1. GPIO (board direction, charger enable)
  *   2. Device-role detection (primary vs secondary)
  *   3. UART (required by DBG macros)
- *   4. ADC, TIM2 tick counter
- *   5. Platform (creates heartbeat task — must come before HAL_RTC_vInit)
- *   6. Settings
- *   7. RTC  (starts 1 Hz wakeup interrupt — heartbeat task must exist)
- *   8. LoRa radio stack
- *   9. Role-specific subsystems
- *  10. Time, battery, power management
+ *   4. DbgLog, ext-flash, text log
+ *   5. ADC, TIM2 tick counter
+ *   6. Platform (creates heartbeat task — must come before HAL_RTC_vInit)
+ *   7. Settings
+ *   8. RTC  (starts 1 Hz wakeup interrupt — heartbeat task must exist)
+ *   9. LoRa radio stack
+ *  10. Role-specific subsystems
+ *  11. Time, battery, power management
  */
 
 #include "init.h"
@@ -27,7 +28,6 @@
 #include "hal_gpio.h"
 #include "hal_adc.h"
 #include "hal_wdt.h"
-#include "debug_uart_output.h"
 #include "settings.h"
 #include "main.h"
 
@@ -46,6 +46,9 @@
 #include "Power.h"
 
 #include "flashLog.h"
+#include "Flash.h"
+#include "Log.h"
+#include "DbgLog.h"
 
 #include "cmsis_os2.h"
 
@@ -67,10 +70,13 @@ void INIT_vInitialization(void *parameters)
 
 #ifdef LISTENER_MODE
     FARMRANGER_vInit();   /* must be first — DBG() routes through this */
-#elif defined(ENABLE_DBG_UART)
-    DBG_UART_vInit();
-    FLASHLOG_vDump();
 #endif
+    DBGLOG_vInit();
+
+    FLASH_vInit();
+    LOG_vInit();
+
+    FLASHLOG_vDump();     /* no-op unless ENABLE_FLASH_LOG + DEBUG_OUTPUT_UART both defined */
 
     HAL_WDT_vReset();
 
@@ -93,7 +99,7 @@ void INIT_vInitialization(void *parameters)
      * Radio smoke-test mode: transmit "Blink!\r\n" at 0.5 Hz and confirm
      * the TX-done IRQ fires.  MeshNetwork and DeviceDiscovery are skipped
      * because they also drive the radio and would interfere.
-     * Enable ENABLE_DBG_UART (or LISTENER_MODE) alongside this define to
+     * Enable DEBUG_OUTPUT_UART (or LISTENER_MODE) alongside this define to
      * see the output on the debug UART.
      */
     RADIO_TEST_vInit();

@@ -437,7 +437,7 @@ bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
                             respBuf,
                             1000))
     {
-        LOG(LOG_FRLOG_ERROR, 1);
+        EVTLOG(LOG_FRLOG_ERROR, 1);
         DBG("LogData: No 'Logger ready' received.\r\n");
         BSP_LED_On(LED_YELLOW);
     }
@@ -452,7 +452,7 @@ bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
         /* Wait until TX is fully drained */
         if (osSemaphoreAcquire(xUartTxDoneSem, 3500) != osOK)
         {
-            LOG(LOG_FRLOG_ERROR, 2);
+            EVTLOG(LOG_FRLOG_ERROR, 2);
             DBG("UART TX timeout\r\n");
             return false;
         }
@@ -468,7 +468,7 @@ bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
                             3500))
     {
         DBG("LogData: No final OK received.\r\n");
-        LOG(LOG_FRLOG_ERROR, 3);
+        EVTLOG(LOG_FRLOG_ERROR, 3);
         return false;
     }
 

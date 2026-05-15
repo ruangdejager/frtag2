@@ -301,7 +301,7 @@ static void MESHNETWORK_vBeaconTimerCallback(void *arg)
     tBeacon.dreqWaveDisc   = u8PrimaryDreqWaveCnt;
 
     DBG("MeshNetwork: Sending Beacon %08X\r\n", tBeacon.u32BeaconMsgId);
-    LOG(LOG_TX_BEACON, 1);
+    EVTLOG(LOG_TX_BEACON, 1);
 
     uint8_t u8Buf[64];
     size_t  u32Len = 0;
@@ -343,7 +343,7 @@ static void MESHNETWORK_vPrimaryAckTimerCallback(void *arg)
             {
                 FORWARD_vAdd(tAck.u32AckMsgId);
                 MESHNETWORK_bSendPacket(u8Buf, u32Len);
-                LOG(LOG_TX_ACK, 1);
+                EVTLOG(LOG_TX_ACK, 1);
             }
         }
     }
@@ -393,7 +393,7 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
 
     uint32_t u32LogValue;
     FLASHLOG_vEncodeRXLogValue(&u32LogValue, (uint16_t)u32OriginId, s16Rssi, u8WaveCnt);
-    LOG(LOG_RX_DREQ, u32LogValue);
+    EVTLOG(LOG_RX_DREQ, u32LogValue);
 
     if (u32OriginId == LORARADIO_u32GetUniqueId()) return;
 
@@ -412,7 +412,7 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
                 FORWARD_vAdd(u32DreqId);
                 MESHNETWORK_bSendPacket(u8Out, u32OutLen);
                 DBG("MeshNetwork: DReq forwarded\r\n");
-                LOG(LOG_TX_DREQ, 2);
+                EVTLOG(LOG_TX_DREQ, 2);
             }
         }
         else
@@ -453,7 +453,7 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
     uint32_t u32LogValue;
     FLASHLOG_vEncodeRXLogValue(&u32LogValue, (uint16_t)tBeacon.u32DeviceId,
                                tBeacon.i16Rssi, 0);
-    LOG(LOG_RX_BEACON, u32LogValue);
+    EVTLOG(LOG_RX_BEACON, u32LogValue);
 
     /* 1. Deduplicate */
     if (FORWARD_bHasSeen(tBeacon.u32BeaconMsgId))
@@ -487,7 +487,7 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
         {
             MESHNETWORK_bSendPacket(u8Buf, u32TempLen);
             DBG("MeshNetwork: Forwarding Beacon\r\n");
-            LOG(LOG_TX_BEACON, 2);
+            EVTLOG(LOG_TX_BEACON, 2);
         }
     }
 #endif
@@ -513,7 +513,7 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
     uint32_t u32LogValue;
     FLASHLOG_vEncodeRXLogValue(&u32LogValue, (uint16_t)(u32DreqId >> 16),
                                s16Rssi, u8AckCount);
-    LOG(LOG_RX_ACK, u32LogValue);
+    EVTLOG(LOG_RX_ACK, u32LogValue);
 
     if (FORWARD_bHasSeen(u32AckMsgId))
     {
@@ -527,7 +527,7 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
     {
         MESHNETWORK_bSendPacket(pBuf, u32Len);
         DBG("MeshNetwork: Ack forwarded\r\n");
-        LOG(LOG_TX_ACK, 2);
+        EVTLOG(LOG_TX_ACK, 2);
     }
 
     uint32_t u32MyId = LORARADIO_u32GetUniqueId();
@@ -554,7 +554,7 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
 
     uint32_t u32LogValue;
     FLASHLOG_vEncodeRXLogValue(&u32LogValue, 0, s16Rssi, 0);
-    LOG(LOG_RX_TS, u32LogValue);
+    EVTLOG(LOG_RX_TS, u32LogValue);
 
     if (FORWARD_bHasSeen(u32Utc))
     {
@@ -571,7 +571,7 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
 #ifndef LISTENER_MODE
     MESHNETWORK_bSendPacket(pBuf, u32Len);
     DBG("MeshNetwork: TimeSync forwarded\r\n");
-    LOG(LOG_TX_TS, 2);
+    EVTLOG(LOG_TX_TS, 2);
 #endif
 
     /* Notify DeviceDiscovery task that the round is complete */
@@ -716,7 +716,7 @@ bool MESHNETWORK_bStartDiscoveryRound(uint32_t u32DreqId)
 
     MESHNETWORK_vStartPrimaryAck();
     DBG("MeshNetwork: DReq %08X sent\r\n", u32DreqId);
-    LOG(LOG_TX_DREQ, 1);
+    EVTLOG(LOG_TX_DREQ, 1);
     return true;
 }
 
