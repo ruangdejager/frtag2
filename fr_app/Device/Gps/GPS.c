@@ -13,6 +13,7 @@
 #include "task.h"
 #include "GPS.h"
 #include "dbg_log.h"
+#include "Debug.h"
 
 /* Task parameters */
 #define GPS_RX_TASK_PRIORITY    osPriorityRealtime7
@@ -185,7 +186,7 @@ bool GPS_bOnRxByte(char pcRxByte)
     {
         acGpsRxBuf[u8GpsRxBufIdx] = pcRxByte;
         acGpsRxBuf[u8NextIdx]     = 0;
-        DBG_UART_vPutByte((uint8_t)pcRxByte);
+        DEBUG_vPutByte((uint8_t)pcRxByte);
     }
     else
     {

@@ -42,8 +42,7 @@ void DEBUG_vPutByte(uint8_t byte)
 
 void DEBUG_vPutBuffer(const uint8_t *buf, uint16_t len)
 {
-    for (uint16_t i = 0; i < len; i++)
-        DEBUG_vPutByte(buf[i]);
+    HAL_UART_vTxPutBuffer(&sDriverData, buf, len);
 }
 
 #else /* DEBUG_OUTPUT_UART not defined — stubs (covers USB and undefined cases) */
