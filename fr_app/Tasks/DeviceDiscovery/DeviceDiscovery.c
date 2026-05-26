@@ -106,6 +106,10 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                          osFlagsWaitAny,   /* auto-clears the bit */
                          osWaitForever);
 
+        /* Multi-primary: arm the "first TimeSync only" gate for this
+         * wake cycle. Subsequent TimeSyncs from other primaries during
+         * this campaign will be forwarded but not re-applied. */
+        MESHNETWORK_vResetTimeSyncAccepted();
 
 #ifdef ENABLE_GPS
         /* ---- GPS fix ---- */

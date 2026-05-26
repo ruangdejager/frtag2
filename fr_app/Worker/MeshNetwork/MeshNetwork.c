@@ -69,6 +69,10 @@ static uint32_t   u32NodeBeaconDreqId = 0;
 static uint8_t    u8NodeHopCount      = 0;
 static NodeRole_e eNodeRole           = NODE_ROLE_UNKNOWN;
 
+/* Multi-primary: "first TimeSync per wake" gate (secondaries only).
+ * Reset by DeviceDiscovery at the start of each wake cycle. */
+static bool       bTimeSyncAcceptedThisWake = false;
+
 /* ---- Wakeup interval ---- */
 static WakeupInterval tCurrentWakeupInterval = WAKEUP_INTERVAL_15_MIN;
 static const uint8_t u8CurrentWakeupIntervalMin[] = {
@@ -398,32 +402,38 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
     if (u32OriginId == LORARADIO_u32GetUniqueId()) return;
 
 #ifndef LISTENER_MODE
-    if (eNodeRole == NODE_ROLE_FORWARDER)
+    /* Multi-primary: primaries never beacon and never forward.
+     * They observe other primaries' DReqs (e.g. for RSSI tracking
+     * below) but take no action on them. */
+    if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_PRIMARY)
     {
-        if (!FORWARD_bHasSeen(u32DreqId))
+        if (eNodeRole == NODE_ROLE_FORWARDER)
         {
-            uint8_t u8Out[32];
-            size_t  u32OutLen = 0;
-            if (MESHNETWORK_bEncodeDReq(u32DreqId,
-                                        (uint8_t)(u8SenderHopCount + 1),
-                                        u8WaveCnt,
-                                        u8Out, sizeof(u8Out), &u32OutLen))
+            if (!FORWARD_bHasSeen(u32DreqId))
             {
-                FORWARD_vAdd(u32DreqId);
-                MESHNETWORK_bSendPacket(u8Out, u32OutLen);
-                DBG("MeshNetwork: DReq forwarded\r\n");
-                LOG(LOG_TX_DREQ, 2);
+                uint8_t u8Out[32];
+                size_t  u32OutLen = 0;
+                if (MESHNETWORK_bEncodeDReq(u32DreqId,
+                                            (uint8_t)(u8SenderHopCount + 1),
+                                            u8WaveCnt,
+                                            u8Out, sizeof(u8Out), &u32OutLen))
+                {
+                    FORWARD_vAdd(u32DreqId);
+                    MESHNETWORK_bSendPacket(u8Out, u32OutLen);
+                    DBG("MeshNetwork: DReq forwarded\r\n");
+                    LOG(LOG_TX_DREQ, 2);
+                }
+            }
+            else
+            {
+                DBG("MeshNetwork: DReq seen before\r\n");
             }
         }
-        else
+        else if (eNodeRole != NODE_ROLE_BEACONING)
         {
-            DBG("MeshNetwork: DReq seen before\r\n");
+            MESHNETWORK_vStartBeaconing(u32DreqId, (uint8_t)(u8SenderHopCount + 1));
+            u8PrimaryDreqWaveCnt = u8WaveCnt;
         }
-    }
-    else if (eNodeRole != NODE_ROLE_BEACONING)
-    {
-        MESHNETWORK_vStartBeaconing(u32DreqId, (uint8_t)(u8SenderHopCount + 1));
-        u8PrimaryDreqWaveCnt = u8WaveCnt;
     }
 #endif
 
@@ -530,13 +540,19 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
         LOG(LOG_TX_ACK, 2);
     }
 
-    uint32_t u32MyId = LORARADIO_u32GetUniqueId();
-    for (uint8_t i = 0; i < u8AckCount; i++)
+    /* Multi-primary: primaries never beacon, so they never need to
+     * stop-on-ACK. Guard explicitly so any future primary code path
+     * cannot accidentally trip the secondary state machine. */
+    if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_PRIMARY)
     {
-        if (u32Ids[i] == u32MyId)
+        uint32_t u32MyId = LORARADIO_u32GetUniqueId();
+        for (uint8_t i = 0; i < u8AckCount; i++)
         {
-            MESHNETWORK_vStopBeaconing(u32DreqId);
-            break;
+            if (u32Ids[i] == u32MyId)
+            {
+                MESHNETWORK_vStopBeaconing(u32DreqId);
+                break;
+            }
         }
     }
 #endif
@@ -563,21 +579,42 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
     }
     FORWARD_vAdd(u32Utc);
 
-    RTC_vSetUTC(u32Utc);
-    MESHNETWORK_vSetWakeupInterval(tInterval);
-    MESHNETWORK_vUpdatePrimaryLastSeen();
-    DBG("MeshNetwork: TimeSync applied: %u interval=%u\r\n", u32Utc, tInterval);
+    /* Multi-primary: primaries have authoritative time from the logger
+     * and must not accept TimeSync from a peer primary. Drop silently
+     * (no RTC update, no interval change, no forward, no AppTask
+     * notify — which would prematurely end this primary's campaign). */
+    if (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY)
+    {
+        DBG("MeshNetwork: TimeSync ignored (primary)\r\n");
+        return;
+    }
+
+    /* Secondary: accept only the first TimeSync this wake cycle.
+     * Subsequent TimeSyncs are still forwarded (the mesh keeps
+     * propagating during the few seconds the node stays awake) but
+     * do not re-apply RTC/interval and do not re-notify AppTask. */
+    if (!bTimeSyncAcceptedThisWake)
+    {
+        RTC_vSetUTC(u32Utc);
+        MESHNETWORK_vSetWakeupInterval(tInterval);
+        MESHNETWORK_vUpdatePrimaryLastSeen();
+        bTimeSyncAcceptedThisWake = true;
+        DBG("MeshNetwork: TimeSync applied: %u interval=%u\r\n", u32Utc, tInterval);
+
+        osThreadId_t xAppTask = DEVICE_DISCOVERY_xGetTaskHandle();
+        if (xAppTask != NULL)
+            osThreadFlagsSet(xAppTask, DEVICE_DISCOVERY_NOTIFY_TIMESYNC);
+    }
+    else
+    {
+        DBG("MeshNetwork: TimeSync seen (already accepted this wake)\r\n");
+    }
 
 #ifndef LISTENER_MODE
     MESHNETWORK_bSendPacket(pBuf, u32Len);
     DBG("MeshNetwork: TimeSync forwarded\r\n");
     LOG(LOG_TX_TS, 2);
 #endif
-
-    /* Notify DeviceDiscovery task that the round is complete */
-    osThreadId_t xAppTask = DEVICE_DISCOVERY_xGetTaskHandle();
-    if (xAppTask != NULL)
-        osThreadFlagsSet(xAppTask, DEVICE_DISCOVERY_NOTIFY_TIMESYNC);
 }
 
 /* --------------------------------------------------------------------------
@@ -807,6 +844,11 @@ void MESHNETWORK_vStopPrimaryAck(void)
 {
     if (xPrimaryAckTimer != NULL)
         osTimerStop(xPrimaryAckTimer);
+}
+
+void MESHNETWORK_vResetTimeSyncAccepted(void)
+{
+    bTimeSyncAcceptedThisWake = false;
 }
 
 void MESHNETWORK_vResetNodeRole(void)

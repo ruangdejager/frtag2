@@ -142,6 +142,10 @@ void     MESHNETWORK_vUpdatePrimaryLastSeen(void);
 void MESHNETWORK_vStartPrimaryAck(void);
 void MESHNETWORK_vStopPrimaryAck(void);
 
+/* Reset per-wake "first TimeSync only" gate.
+ * Call at the top of each wake cycle from DeviceDiscovery. */
+void MESHNETWORK_vResetTimeSyncAccepted(void);
+
 void MESHNETWORK_vResetNodeRole(void);
 void MESHNETWORK_vIncrDreqWaveCnt(void);
 void MESHNETWORK_vResetDreqWaveCnt(void);
