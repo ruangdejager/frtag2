@@ -37,7 +37,10 @@
  * TimeSync received in either phase exits recovery immediately.
  * RECOVER_SNIFF_CYCLES caps the per-wake sniff budget (30 × 20 s ≈ 10 min). */
 #define RECOVER_SNIFF_RX_MS          2000U              /* sniff window duration        */
-#define RECOVER_SNIFF_SLEEP_MS       18000U             /* off period between sniffs    */
+/* Off-period is jittered to spread collisions and de-correlate fleet timing.
+ * 13–23 s of sleep + the 2 s RX window → 15–25 s total cycle (avg 20 s, 10 %). */
+#define RECOVER_SNIFF_SLEEP_MIN_MS   13000U             /* min off period between sniffs */
+#define RECOVER_SNIFF_SLEEP_MAX_MS   23000U             /* max off period between sniffs */
 #define RECOVER_SNIFF_CYCLES         30U                /* max sniff cycles per wake    */
 #define RECOVER_ESCALATE_POLL_MS     1000U              /* activity poll interval in 100% mode */
 #define RECOVER_ESCALATE_IDLE_MS     20000U             /* 20 s idle → drop back to sniff     */

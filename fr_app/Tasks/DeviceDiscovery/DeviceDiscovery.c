@@ -545,9 +545,14 @@ static void DEVICE_DISCOVERY_vRecoveryMode(void)
                 continue;
             }
 
-            /* Quiet window — radio off for 18 s, then try again */
+            /* Quiet window — radio off for a jittered 13–23 s, then try again.
+             * Jitter spreads sniff cycles across the fleet so that two stranded
+             * tags do not lock into the same 20-s phase indefinitely. */
             LORARADIO_vEnterDeepSleep();
-            osDelay(RECOVER_SNIFF_SLEEP_MS);
+            uint32_t u32SleepMs = RECOVER_SNIFF_SLEEP_MIN_MS +
+                LORARADIO_u32GetRandomNumber(RECOVER_SNIFF_SLEEP_MAX_MS
+                                             - RECOVER_SNIFF_SLEEP_MIN_MS);
+            osDelay(u32SleepMs);
             u8Cycles++;
         }
 
