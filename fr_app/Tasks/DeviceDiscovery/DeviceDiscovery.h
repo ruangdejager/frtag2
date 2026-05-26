@@ -30,13 +30,16 @@
 #define RECOVER_SILENCE_SPARSE_S     ((uint64_t)(72UL * 3600UL))   /* 3 d  → sparse tier  */
 #define RECOVER_SILENCE_DEEP_S       ((uint64_t)(7UL * 24UL * 3600UL)) /* 7 d → deep tier */
 
-/* Tier 1 – Sniff: 2 s radio-on / 18 s radio-off duty cycle.
- * Any DBeacon heard in the 2-s window escalates to a 3-min full-RX window.
- * RECOVER_SNIFF_CYCLES caps the per-wake budget (30 × 20 s ≈ 10 min). */
-#define RECOVER_SNIFF_RX_MS          2000U              /* sniff window duration       */
-#define RECOVER_SNIFF_SLEEP_MS       18000U             /* off period between sniffs   */
-#define RECOVER_SNIFF_CYCLES         30U                /* max sniff cycles per wake   */
-#define RECOVER_ESCALATE_MS          (3U * 60U * 1000U) /* escalation RX window (3 min)*/
+/* Tier 1 – Sniff: 10 % duty cycle (2 s on / 18 s off), passive RX only.
+ * Any DBeacon heard in the 2-s window escalates to 100 % duty cycle.
+ * In 100 % mode the radio stays on as long as mesh activity continues;
+ * 20 s of silence drops back to sniff.  TimeSync in either phase exits.
+ * RECOVER_SNIFF_CYCLES caps the per-wake sniff budget (30 × 20 s ≈ 10 min). */
+#define RECOVER_SNIFF_RX_MS          2000U              /* sniff window duration        */
+#define RECOVER_SNIFF_SLEEP_MS       18000U             /* off period between sniffs    */
+#define RECOVER_SNIFF_CYCLES         30U                /* max sniff cycles per wake    */
+#define RECOVER_ESCALATE_POLL_MS     1000U              /* activity poll interval in 100% mode */
+#define RECOVER_ESCALATE_IDLE_MS     20000U             /* 20 s idle → drop back to sniff     */
 
 /* Tier 2 – Soft: 5 × 30 s probes separated by interval/5 gaps. */
 #define RECOVER_SOFT_WALK_N          5U                 /* linear offset walk steps    */

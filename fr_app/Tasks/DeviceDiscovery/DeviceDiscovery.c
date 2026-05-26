@@ -435,9 +435,11 @@ osThreadId_t DEVICE_DISCOVERY_xGetTaskHandle(void)
  * progressively more battery for progressively lower primary-detect rate.
  *
  * Tier 1 – Sniff      ( 8 h – 24 h silence)
- *   Radio on 2 s / off 18 s.  Any DBeacon heard in the 2-s window escalates
- *   to a 3-minute full-RX window.  TimeSync in any window → exit recovery.
- *   Budget: RECOVER_SNIFF_CYCLES cycles (≈ 10 min of wall time) per wake.
+ *   Passive 10 % duty cycle: 2 s radio on / 18 s off.  No TX / beaconing.
+ *   DBeacon heard in the 2-s window → 100 % duty cycle (radio stays on).
+ *   100 % mode exits back to sniff after 20 s with no beacon activity, or
+ *   exits recovery immediately on TimeSync.
+ *   Budget: RECOVER_SNIFF_CYCLES sniff cycles (≈ 10 min) per wake.
  *
  * Tier 2 – Soft       (24 h – 72 h)
  *   RECOVER_SOFT_WALK_N × RECOVER_SOFT_RX_MS probes separated by
@@ -467,8 +469,17 @@ static void DEVICE_DISCOVERY_vRecoveryMode(void)
 
     /* ----------------------------------------------------------------
      * Tier 1 – Sniff  (8 h – 24 h)
-     * 2-s RX window, 18-s off, up to RECOVER_SNIFF_CYCLES cycles / wake.
-     * A DBeacon heard during the sniff window triggers a 3-min escalation.
+     * Passive 10 % duty cycle: 2 s RX on / 18 s radio off.
+     * No beaconing is triggered — only the MeshNetwork parser task runs.
+     *
+     * Any DBeacon heard in the 2-s window escalates to 100 % duty cycle:
+     *   - Radio stays on continuously.
+     *   - Every RECOVER_ESCALATE_POLL_MS we check whether beacon activity
+     *     has been seen recently.
+     *   - If no DBeacon for RECOVER_ESCALATE_IDLE_MS (20 s) → drop back.
+     *   - TimeSync received at any point → exit recovery immediately.
+     *
+     * RECOVER_SNIFF_CYCLES caps the per-wake sniff budget (≈ 10 min).
      * ---------------------------------------------------------------- */
     if (u64SilenceS < RECOVER_SILENCE_SOFT_S)
     {
@@ -482,7 +493,7 @@ static void DEVICE_DISCOVERY_vRecoveryMode(void)
             /* Sample beacon-heard tick before the 2-s window */
             uint32_t u32BeaconBefore = MESHNETWORK_u32GetLastBeaconHeardTick();
 
-            /* 2-s RX: MeshNetwork parser runs normally on its own task */
+            /* 2-s passive RX — MeshNetwork parser task handles any packet */
             uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
                                            osFlagsWaitAny, RECOVER_SNIFF_RX_MS);
             if (!(r & osFlagsError))
@@ -493,20 +504,43 @@ static void DEVICE_DISCOVERY_vRecoveryMode(void)
             }
 
             /* Check whether a DBeacon arrived during the window */
-            if (MESHNETWORK_u32GetLastBeaconHeardTick() != u32BeaconBefore)
+            uint32_t u32BeaconTick = MESHNETWORK_u32GetLastBeaconHeardTick();
+            if (u32BeaconTick != u32BeaconBefore)
             {
-                /* Mesh activity detected → stay in full RX for 3 min */
-                DBG("DeviceDiscovery: Recovery SNIFF: activity — escalating 3 min\r\n");
-                r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
-                                     osFlagsWaitAny, RECOVER_ESCALATE_MS);
-                if (!(r & osFlagsError))
+                /* ---- 100 % duty cycle: radio stays on ---- */
+                DBG("DeviceDiscovery: Recovery SNIFF: activity — 100%% RX\r\n");
+
+                uint32_t u32IdleStartMs = osKernelGetTickCount();
+
+                for (;;)
                 {
-                    DBG("DeviceDiscovery: Recovery ESCALATE: TimeSync — exiting\r\n");
-                    LOG(LOG_DISCOVERY_RECOVER, 2);
-                    return;
+                    /* Poll for TimeSync; use short interval to stay responsive */
+                    r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
+                                         osFlagsWaitAny, RECOVER_ESCALATE_POLL_MS);
+                    if (!(r & osFlagsError))
+                    {
+                        DBG("DeviceDiscovery: Recovery 100%%: TimeSync — exiting\r\n");
+                        LOG(LOG_DISCOVERY_RECOVER, 2);
+                        return;
+                    }
+
+                    /* Reset idle timer whenever fresh beacon activity is seen */
+                    uint32_t u32NewTick = MESHNETWORK_u32GetLastBeaconHeardTick();
+                    if (u32NewTick != u32BeaconTick)
+                    {
+                        u32BeaconTick    = u32NewTick;
+                        u32IdleStartMs   = osKernelGetTickCount();
+                    }
+
+                    /* 20 s with no activity → drop back to 10 % sniff */
+                    if ((osKernelGetTickCount() - u32IdleStartMs) >= RECOVER_ESCALATE_IDLE_MS)
+                    {
+                        DBG("DeviceDiscovery: Recovery 100%%: idle — resuming sniff\r\n");
+                        break;
+                    }
                 }
-                /* Escalation expired without TimeSync — restart sniff budget
-                 * so we keep probing while the primary may still be nearby. */
+
+                /* Restart sniff budget; radio is still on for the next window */
                 u8Cycles = 0;
                 continue;
             }
