@@ -135,6 +135,7 @@ WakeupInterval MESHNETWORK_tGetWakeupInterval(void);
 uint8_t       MESHNETWORK_u8GetWakeupInterval(void);
 
 uint32_t MESHNETWORK_u32GetLastBeaconHeardTick(void);
+uint32_t MESHNETWORK_u32GetLastDiscoveryPktTick(void);  /* any DReq/DBeacon/DAck/TimeSync */
 
 uint64_t MESHNETWORK_u64GetLastPrimaryHeardTick(void);
 void     MESHNETWORK_vUpdatePrimaryLastSeen(void);

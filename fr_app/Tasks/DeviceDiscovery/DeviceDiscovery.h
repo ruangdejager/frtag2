@@ -31,9 +31,10 @@
 #define RECOVER_SILENCE_DEEP_S       ((uint64_t)(7UL * 24UL * 3600UL)) /* 7 d → deep tier */
 
 /* Tier 1 – Sniff: 10 % duty cycle (2 s on / 18 s off), passive RX only.
- * Any DBeacon heard in the 2-s window escalates to 100 % duty cycle.
- * In 100 % mode the radio stays on as long as mesh activity continues;
- * 20 s of silence drops back to sniff.  TimeSync in either phase exits.
+ * Any discovery packet (DReq/DBeacon/DAck/TimeSync) heard in the 2-s window
+ * escalates to 100 % duty cycle.  In 100 % mode the radio stays on as long
+ * as mesh activity continues; 20 s of silence drops back to sniff.
+ * TimeSync received in either phase exits recovery immediately.
  * RECOVER_SNIFF_CYCLES caps the per-wake sniff budget (30 × 20 s ≈ 10 min). */
 #define RECOVER_SNIFF_RX_MS          2000U              /* sniff window duration        */
 #define RECOVER_SNIFF_SLEEP_MS       18000U             /* off period between sniffs    */

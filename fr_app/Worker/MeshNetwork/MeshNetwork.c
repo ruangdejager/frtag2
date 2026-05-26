@@ -92,6 +92,11 @@ static uint64_t u64LastPrimaryHeardTick = 0;
 static int16_t  i16BestDreqRssi      = -256;
 static uint8_t  u8PrimaryDreqWaveCnt = 0;
 
+/* Tick of the most recent received discovery packet (any type).
+ * Updated in every handler so DeviceDiscovery can detect mesh activity
+ * without needing to track individual packet-type ticks. */
+static uint32_t u32LastDiscoveryPktTick = 0;
+
 /* ---- Forward declarations ---- */
 static void MESHNETWORK_vTxTask(void *pvParameters);
 static bool MESHNETWORK_bSendPacket(const uint8_t *pBuf, size_t u32Len);
@@ -397,6 +402,8 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
 
     if (u32OriginId == LORARADIO_u32GetUniqueId()) return;
 
+    u32LastDiscoveryPktTick = osKernelGetTickCount();
+
 #ifndef LISTENER_MODE
     if (eNodeRole == NODE_ROLE_FORWARDER)
     {
@@ -436,6 +443,8 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
                                         int16_t s16Rssi)
 {
     if (u32Len < 14) return;
+
+    u32LastDiscoveryPktTick = osKernelGetTickCount();
 
     MeshPktDBeacon_t tBeacon;
     tBeacon.u32DreqId      = read_u32_be(&pBuf[1]);
@@ -498,6 +507,9 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
                                      int16_t s16Rssi)
 {
     if (u32Len < 10) return;
+
+    u32LastDiscoveryPktTick = osKernelGetTickCount();
+
     uint32_t u32AckMsgId = read_u32_be(&pBuf[1]);
     uint32_t u32DreqId   = read_u32_be(&pBuf[5]);
     uint8_t  u8AckCount  = pBuf[9];
@@ -547,6 +559,9 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
                                          int16_t s16Rssi)
 {
     if (u32Len < 6) return;
+
+    u32LastDiscoveryPktTick = osKernelGetTickCount();
+
     uint32_t       u32Utc    = read_u32_be(&pBuf[1]);
     WakeupInterval tInterval = (WakeupInterval)pBuf[5];
 
@@ -793,7 +808,8 @@ void MESHNETWORK_vSetWakeupInterval(WakeupInterval tNewInterval)
 WakeupInterval MESHNETWORK_tGetWakeupInterval(void) { return tCurrentWakeupInterval; }
 uint8_t        MESHNETWORK_u8GetWakeupInterval(void) { return u8CurrentWakeupIntervalMin[tCurrentWakeupInterval]; }
 
-uint32_t MESHNETWORK_u32GetLastBeaconHeardTick(void) { return tLastBeaconHeardTick; }
+uint32_t MESHNETWORK_u32GetLastBeaconHeardTick(void)    { return tLastBeaconHeardTick;       }
+uint32_t MESHNETWORK_u32GetLastDiscoveryPktTick(void)   { return u32LastDiscoveryPktTick;    }
 
 void MESHNETWORK_vUpdatePrimaryLastSeen(void)   { u64LastPrimaryHeardTick = HAL_RTC_u64GetValue(); }
 uint64_t MESHNETWORK_u64GetLastPrimaryHeardTick(void) { return u64LastPrimaryHeardTick; }

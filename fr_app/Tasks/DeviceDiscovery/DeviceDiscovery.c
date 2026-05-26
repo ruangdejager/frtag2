@@ -490,8 +490,8 @@ static void DEVICE_DISCOVERY_vRecoveryMode(void)
         {
             LORARADIO_vWakeUp();
 
-            /* Sample beacon-heard tick before the 2-s window */
-            uint32_t u32BeaconBefore = MESHNETWORK_u32GetLastBeaconHeardTick();
+            /* Sample discovery-packet tick before the 2-s window */
+            uint32_t u32BeaconBefore = MESHNETWORK_u32GetLastDiscoveryPktTick();
 
             /* 2-s passive RX — MeshNetwork parser task handles any packet */
             uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
@@ -503,8 +503,8 @@ static void DEVICE_DISCOVERY_vRecoveryMode(void)
                 return;
             }
 
-            /* Check whether a DBeacon arrived during the window */
-            uint32_t u32BeaconTick = MESHNETWORK_u32GetLastBeaconHeardTick();
+            /* Check whether any discovery packet arrived during the window */
+            uint32_t u32BeaconTick = MESHNETWORK_u32GetLastDiscoveryPktTick();
             if (u32BeaconTick != u32BeaconBefore)
             {
                 /* ---- 100 % duty cycle: radio stays on ---- */
@@ -524,8 +524,8 @@ static void DEVICE_DISCOVERY_vRecoveryMode(void)
                         return;
                     }
 
-                    /* Reset idle timer whenever fresh beacon activity is seen */
-                    uint32_t u32NewTick = MESHNETWORK_u32GetLastBeaconHeardTick();
+                    /* Reset idle timer whenever any discovery packet is seen */
+                    uint32_t u32NewTick = MESHNETWORK_u32GetLastDiscoveryPktTick();
                     if (u32NewTick != u32BeaconTick)
                     {
                         u32BeaconTick    = u32NewTick;
