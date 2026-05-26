@@ -429,33 +429,195 @@ osThreadId_t DEVICE_DISCOVERY_xGetTaskHandle(void)
 }
 
 /* --------------------------------------------------------------------------
- * DEVICE_DISCOVERY_vRecoveryMode
+ * DEVICE_DISCOVERY_vRecoveryMode  — tiered low-duty-cycle recovery
  *
- * Listens for up to 2 hours for the primary to reappear.
+ * Replaces the former 2-hour continuous-RX loop with four tiers that trade
+ * progressively more battery for progressively lower primary-detect rate.
+ *
+ * Tier 1 – Sniff      ( 8 h – 24 h silence)
+ *   Radio on 2 s / off 18 s.  Any DBeacon heard in the 2-s window escalates
+ *   to a 3-minute full-RX window.  TimeSync in any window → exit recovery.
+ *   Budget: RECOVER_SNIFF_CYCLES cycles (≈ 10 min of wall time) per wake.
+ *
+ * Tier 2 – Soft       (24 h – 72 h)
+ *   RECOVER_SOFT_WALK_N × RECOVER_SOFT_RX_MS probes separated by
+ *   interval/N gaps (linear offset walk across the full wakeup period).
+ *
+ * Tier 3 – Sparse     (72 h – 7 d)
+ *   30-s RX; every other scheduled wake is skipped (net ≈ 2× interval).
+ *
+ * Tier 4 – Deep probe (> 7 d)
+ *   60-s RX every RECOVER_DEEP_PERIOD_S seconds; all other wakes skipped.
+ *
+ * All tiers: TimeSync received → return immediately (caller continues to
+ * normal post-discovery path, then deep sleep).
  * -------------------------------------------------------------------------- */
 static void DEVICE_DISCOVERY_vRecoveryMode(void)
 {
-    DBG("DeviceDiscovery: Node %X recovery; LISTENING FOR PRIMARY.\r\n",
-        LORARADIO_u32GetUniqueId());
+    uint64_t u64Now       = HAL_RTC_u64GetValue();
+    uint64_t u64LastHeard = MESHNETWORK_u64GetLastPrimaryHeardTick();
+    uint64_t u64SilenceS  = (u64Now > u64LastHeard) ? (u64Now - u64LastHeard) : 0ULL;
 
-    for (uint16_t i = 0; i < 120 * 60; i++)
+    LOG(LOG_DISCOVERY_RECOVER, 1);
+    DBG("DeviceDiscovery: Recovery mode — node %X, silence %llu s\r\n",
+        LORARADIO_u32GetUniqueId(), u64SilenceS);
+
+    /* Discard any stale TimeSync notification left from the discovery cycle */
+    osThreadFlagsClear(DEVICE_DISCOVERY_NOTIFY_TIMESYNC);
+
+    /* ----------------------------------------------------------------
+     * Tier 1 – Sniff  (8 h – 24 h)
+     * 2-s RX window, 18-s off, up to RECOVER_SNIFF_CYCLES cycles / wake.
+     * A DBeacon heard during the sniff window triggers a 3-min escalation.
+     * ---------------------------------------------------------------- */
+    if (u64SilenceS < RECOVER_SILENCE_SOFT_S)
     {
-        osDelay(1000);
+        DBG("DeviceDiscovery: Recovery SNIFF tier\r\n");
 
-        uint64_t last_heard = MESHNETWORK_u64GetLastPrimaryHeardTick();
-
-        if (last_heard != 0 &&
-            (HAL_RTC_u64GetValue() - last_heard) < (uint64_t)LOST_PRIMARY_TIMEOUT_MIN * 60)
+        uint8_t u8Cycles = 0;
+        while (u8Cycles < RECOVER_SNIFF_CYCLES)
         {
-            DBG("DeviceDiscovery: Node %X recovered; PRIMARY FOUND.\r\n",
-                LORARADIO_u32GetUniqueId());
+            LORARADIO_vWakeUp();
+
+            /* Sample beacon-heard tick before the 2-s window */
+            uint32_t u32BeaconBefore = MESHNETWORK_u32GetLastBeaconHeardTick();
+
+            /* 2-s RX: MeshNetwork parser runs normally on its own task */
+            uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
+                                           osFlagsWaitAny, RECOVER_SNIFF_RX_MS);
+            if (!(r & osFlagsError))
+            {
+                DBG("DeviceDiscovery: Recovery SNIFF: TimeSync — exiting recovery\r\n");
+                LOG(LOG_DISCOVERY_RECOVER, 2);
+                return;
+            }
+
+            /* Check whether a DBeacon arrived during the window */
+            if (MESHNETWORK_u32GetLastBeaconHeardTick() != u32BeaconBefore)
+            {
+                /* Mesh activity detected → stay in full RX for 3 min */
+                DBG("DeviceDiscovery: Recovery SNIFF: activity — escalating 3 min\r\n");
+                r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
+                                     osFlagsWaitAny, RECOVER_ESCALATE_MS);
+                if (!(r & osFlagsError))
+                {
+                    DBG("DeviceDiscovery: Recovery ESCALATE: TimeSync — exiting\r\n");
+                    LOG(LOG_DISCOVERY_RECOVER, 2);
+                    return;
+                }
+                /* Escalation expired without TimeSync — restart sniff budget
+                 * so we keep probing while the primary may still be nearby. */
+                u8Cycles = 0;
+                continue;
+            }
+
+            /* Quiet window — radio off for 18 s, then try again */
+            LORARADIO_vEnterDeepSleep();
+            osDelay(RECOVER_SNIFF_SLEEP_MS);
+            u8Cycles++;
+        }
+
+        /* Sniff budget exhausted this wake; radio is in deep sleep.
+         * AppTask main loop will handle the next osEventFlagsWait. */
+        DBG("DeviceDiscovery: Recovery SNIFF: budget exhausted this wake\r\n");
+        LOG(LOG_DISCOVERY_RECOVER, 3);
+        return;
+    }
+
+    /* ----------------------------------------------------------------
+     * Tier 2 – Soft  (24 h – 72 h)
+     * RECOVER_SOFT_WALK_N × 30-s probes with interval/N gaps between
+     * them (linear offset walk across the configured wakeup interval).
+     * ---------------------------------------------------------------- */
+    if (u64SilenceS < RECOVER_SILENCE_SPARSE_S)
+    {
+        DBG("DeviceDiscovery: Recovery SOFT tier\r\n");
+
+        uint32_t u32OffsetMs = (uint32_t)MESHNETWORK_u8GetWakeupInterval()
+                               * 60U * 1000U / RECOVER_SOFT_WALK_N;
+
+        for (uint8_t i = 0; i < RECOVER_SOFT_WALK_N; i++)
+        {
+            LORARADIO_vWakeUp();
+            uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
+                                           osFlagsWaitAny, RECOVER_SOFT_RX_MS);
+            if (!(r & osFlagsError))
+            {
+                DBG("DeviceDiscovery: Recovery SOFT: TimeSync — exiting recovery\r\n");
+                LOG(LOG_DISCOVERY_RECOVER, 2);
+                return;
+            }
+            LORARADIO_vEnterDeepSleep();
+            if (i < (RECOVER_SOFT_WALK_N - 1U))
+                osDelay(u32OffsetMs);
+        }
+
+        DBG("DeviceDiscovery: Recovery SOFT: walk complete, no primary\r\n");
+        LOG(LOG_DISCOVERY_RECOVER, 3);
+        return;
+    }
+
+    /* ----------------------------------------------------------------
+     * Tier 3 – Sparse  (72 h – 7 d)
+     * 30-s RX scan; every other scheduled wake is skipped, giving a
+     * net detection period of approximately 2× the wakeup interval.
+     * ---------------------------------------------------------------- */
+    if (u64SilenceS < RECOVER_SILENCE_DEEP_S)
+    {
+        static bool bSparseSkip = false;
+
+        if (bSparseSkip)
+        {
+            bSparseSkip = false;
+            DBG("DeviceDiscovery: Recovery SPARSE: skipping wake\r\n");
+            return;
+        }
+        bSparseSkip = true;
+
+        DBG("DeviceDiscovery: Recovery SPARSE tier\r\n");
+
+        uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
+                                       osFlagsWaitAny, RECOVER_SPARSE_RX_MS);
+        if (!(r & osFlagsError))
+        {
+            DBG("DeviceDiscovery: Recovery SPARSE: TimeSync — exiting recovery\r\n");
+            LOG(LOG_DISCOVERY_RECOVER, 2);
+            bSparseSkip = false;   /* reset skip state on clean exit */
+            return;
+        }
+
+        DBG("DeviceDiscovery: Recovery SPARSE: no primary this scan\r\n");
+        LOG(LOG_DISCOVERY_RECOVER, 3);
+        return;
+    }
+
+    /* ----------------------------------------------------------------
+     * Tier 4 – Deep probe  (> 7 d)
+     * 60-s RX scan every RECOVER_DEEP_PERIOD_S seconds (6 h).
+     * All other scheduled wakes are skipped entirely.
+     * ---------------------------------------------------------------- */
+    {
+        static uint64_t u64LastDeepProbeS = 0ULL;
+
+        if ((u64Now - u64LastDeepProbeS) < RECOVER_DEEP_PERIOD_S)
+        {
+            DBG("DeviceDiscovery: Recovery DEEP: skipping wake\r\n");
+            return;
+        }
+        u64LastDeepProbeS = u64Now;
+
+        DBG("DeviceDiscovery: Recovery DEEP tier\r\n");
+
+        uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
+                                       osFlagsWaitAny, RECOVER_DEEP_RX_MS);
+        if (!(r & osFlagsError))
+        {
+            DBG("DeviceDiscovery: Recovery DEEP: TimeSync — exiting recovery\r\n");
             LOG(LOG_DISCOVERY_RECOVER, 2);
             return;
         }
-    }
 
-    DBG("DeviceDiscovery: Node %X not recovered; NO PRIMARY FOUND.\r\n",
-        LORARADIO_u32GetUniqueId());
-    LOG(LOG_DISCOVERY_RECOVER, 3);
-    MESHNETWORK_vUpdatePrimaryLastSeen();
+        DBG("DeviceDiscovery: Recovery DEEP: no primary found\r\n");
+        LOG(LOG_DISCOVERY_RECOVER, 3);
+    }
 }
