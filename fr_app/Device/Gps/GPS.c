@@ -19,8 +19,8 @@
 #include <limits.h>
 
 /* ---- Task parameters ---- */
-#define GPS_RX_TASK_PRIORITY      osPriorityRealtime7
-#define GPS_RX_TASK_STACK_SIZE    (configMINIMAL_STACK_SIZE)
+#define GPS_RX_TASK_PRIORITY      osPriorityNormal
+#define GPS_RX_TASK_STACK_SIZE    (configMINIMAL_STACK_SIZE * 8)
 
 #define GPS_DISP_TASK_PRIORITY    osPriorityNormal
 #define GPS_DISP_TASK_STACK_SIZE  (configMINIMAL_STACK_SIZE * 2)
@@ -552,23 +552,23 @@ void GNSS_vOnSolution(void)
     if (!GnssSession.bDbgStartFlag)
     {
         if (GnssSol.PositionError.bHasValue)
-            DBG("\t\t\t\t\t\tgps ttff, sv, snr, fix_cnt, pos_err, [d_lat, d_long]\r\n");
+            DBG("gps ttff, sv, snr, fix_cnt, pos_err, [d_lat, d_long]\r\n");
         else
-            DBG("\t\t\t\t\t\tgps ttff, sv, snr, fix_cnt, [d_lat, d_long]\r\n");
+            DBG("gps ttff, sv, snr, fix_cnt, [d_lat, d_long]\r\n");
     }
     GnssSession.bDbgStartFlag = true;
 
     if (GnssSyslogFlag && !GnssSession.bDbgStopFlag)
     {
         if (GnssSol.PositionError.bHasValue)
-            DBG("gps %02u/%02u, %02u/%02u, %u, %u, %u, [%i,%i]",
+            DBG("gps %02u/%02u, %02u/%02u, %u, %u, %u, [%i,%i]\r\n",
                 GnssSession.u16TtffTmr, GnssSession.u16TtffTimeout,
                 GnssSol.Sv.u8SvTracking, GnssSol.Sv.u8SvInView,
                 GnssSol.Sv.u8SnrAvgDbHz, GnssSession.u8ValidFixCount,
                 GnssSol.PositionError.u16ValueInt,
                 (int16_t)i32LatDelta, (int16_t)i32LongDelta);
         else
-            DBG("gps %02u/%02u, %02u/%02u, %u, %u, [%i,%i]",
+            DBG("gps %02u/%02u, %02u/%02u, %u, %u, [%i,%i]\r\n",
                 GnssSession.u16TtffTmr, GnssSession.u16TtffTimeout,
                 GnssSol.Sv.u8SvTracking, GnssSol.Sv.u8SvInView,
                 GnssSol.Sv.u8SnrAvgDbHz, GnssSession.u8ValidFixCount,
