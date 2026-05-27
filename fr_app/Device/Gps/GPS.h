@@ -3,11 +3,20 @@
  *
  * GNSS module public interface — types, session control and data access.
  *
- * The GNSS subsystem runs a dedicated CMSIS-RTOS v2 RX task that is
- * woken by the UART ISR via thread flags.  Callers start a session with
- * GPS_vStart(), passing their own thread ID so the GPS layer can notify
- * them via osThreadFlagsSet() when a stable fix is acquired or the TTFF
- * timeout expires.
+ * The GNSS subsystem is a self-contained worker. A dispatcher task owns
+ * power and session lifecycle; an RX task parses NMEA from the UART ISR.
+ *
+ * Any module can call GPS_vRequestFix() to start (or attach to) a fix
+ * acquisition. Multiple callers may concurrently call GPS_eWaitForFix()
+ * to block until the session completes. Sessions can be auto-shutdown
+ * (GPS powers itself off after fix or TTFF timeout) or held open until
+ * GPS_vShutdown() is called.
+ *
+ * The most recent successful fix is retained across sessions and can be
+ * retrieved together with its age via GPS_bGetLastKnownFix().
+ *
+ * If the board is not in POWER_CLASS_NORMAL at request time, the GPS
+ * refuses to power up and any waiter is released with GPS_RESULT_NO_POWER.
  */
 
 #ifndef DEVICE_GPS_GPS_H_
@@ -19,6 +28,7 @@
 #include "cmsis_os2.h"
 #include "dbg_log.h"
 
+#include <stdbool.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -117,17 +127,55 @@ typedef struct {
     gnss_session_fix_t Fix;
 } gnss_session_t;
 
-/* Notification flags sent to the caller via osThreadFlagsSet() */
-#define GPS_NOTIFY_FIX_OK       (1UL << 0)   /* Stable fix acquired         */
-#define GPS_NOTIFY_FIX_TIMEOUT  (1UL << 1)   /* TTFF timeout — best fix used */
+/* ---- Result of a fix session (returned by GPS_eWaitForFix) ---- */
+typedef enum {
+    GPS_RESULT_FIX_OK      = 0,   /* Stable fix acquired                       */
+    GPS_RESULT_FIX_TIMEOUT = 1,   /* TTFF timeout — best-effort fix or none    */
+    GPS_RESULT_NO_POWER    = 2,   /* Refused — board not in POWER_CLASS_NORMAL */
+} gps_result_e;
 
 /* ---- Public API ---- */
+
+/* One-time initialization — call from main init path. Creates the dispatcher
+ * and RX tasks, mutex, and result-event-flags group. */
 void GPS_vInit(void);
-void GPS_vRxTask(void *parameters);
-void GPS_vStart(osThreadId_t callerTask);   /* Power on; notifies caller on fix/timeout */
-void GPS_vStop(void);
+
+/* Kick off (or attach to) a fix acquisition.
+ *   bAutoShutdown == true  → GPS powers off after fix or TTFF timeout
+ *   bAutoShutdown == false → GPS stays powered until GPS_vShutdown()
+ *
+ * Idempotent: if a session is already in progress, returns immediately
+ * and updates bAutoShutdown to the last-caller value. If the board is
+ * not in POWER_CLASS_NORMAL the call refuses to power the GPS and sets
+ * the NO_POWER result so any concurrent waiter is released. */
+void GPS_vRequestFix(bool bAutoShutdown);
+
+/* Block until the current (or next) session signals a terminal result.
+ * Returns the result enum, or GPS_RESULT_FIX_TIMEOUT if u32TimeoutMs
+ * expires before any GPS event. Multiple callers may wait concurrently. */
+gps_result_e GPS_eWaitForFix(uint32_t u32TimeoutMs);
+
+/* Manually power down the GPS (no-op if already off). Use only when the
+ * matching GPS_vRequestFix() was called with bAutoShutdown == false. */
+void GPS_vShutdown(void);
+
+/* Live coordinates from the current/last session — returns false if no
+ * stable fix has been declared in the current session. */
 bool GPS_bGetCoordinates(gnss_coord_deg_t *pLat, gnss_coord_deg_t *pLong);
 bool GPS_bHasStableFix(void);
-void GPS_vNotifyOnRX(void);                 /* Called from UART ISR — do not call directly */
+
+/* Last-known fix retention. Retained across sessions and power cycles;
+ * cleared only on cold boot. Returns true and copies lat/lon if any fix
+ * has ever been acquired since boot. *pu32AgeSeconds is set to the wall-
+ * clock age of the stored fix (RTC-based). */
+bool GPS_bGetLastKnownFix(gnss_coord_deg_t *pLat,
+                          gnss_coord_deg_t *pLon,
+                          uint32_t         *pu32AgeSeconds);
+
+/* Age in seconds of the most recent fix; UINT32_MAX if none yet. */
+uint32_t GPS_u32GetLastFixAgeSeconds(void);
+
+/* Called from USART1 ISR via uart_callbacks.c — do not call directly. */
+void GPS_vNotifyOnRX(void);
 
 #endif /* DEVICE_GPS_GPS_H_ */

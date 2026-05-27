@@ -12,18 +12,46 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "GPS.h"
+#include "Power.h"
+#include "platform_rtc.h"
 #include "debug_uart_output.h"
 
-/* Task parameters */
-#define GPS_RX_TASK_PRIORITY    osPriorityRealtime7
-#define GPS_RX_TASK_STACK_SIZE  (configMINIMAL_STACK_SIZE)
+#include <limits.h>
 
-/* Thread flag used by ISR → RX task notification */
-#define GPS_THREAD_FLAG_RX      0x0001U
+/* ---- Task parameters ---- */
+#define GPS_RX_TASK_PRIORITY      osPriorityRealtime7
+#define GPS_RX_TASK_STACK_SIZE    (configMINIMAL_STACK_SIZE)
 
-/* CMSIS-RTOS v2 task handle */
-static osThreadId_t GPS_vRxTask_handle;
+#define GPS_DISP_TASK_PRIORITY    osPriorityNormal
+#define GPS_DISP_TASK_STACK_SIZE  (configMINIMAL_STACK_SIZE * 2)
 
+/* ---- Thread flags ---- */
+#define GPS_THREAD_FLAG_RX        0x0001U   /* UART ISR  → RX task   */
+
+#define GPS_DISP_TRIGGER_BIT      (1UL << 0)   /* RequestFix → dispatcher */
+#define GPS_DISP_FIX_OK_BIT       (1UL << 1)   /* RX task    → dispatcher */
+#define GPS_DISP_FIX_TIMEOUT_BIT  (1UL << 2)   /* RX task    → dispatcher */
+#define GPS_DISP_SHUTDOWN_BIT     (1UL << 3)   /* Shutdown   → dispatcher */
+
+/* ---- Result event-flags bits (fan-out to waiters in GPS_eWaitForFix) ---- */
+#define GPS_RESULT_FIX_OK_BIT       (1UL << 0)
+#define GPS_RESULT_FIX_TIMEOUT_BIT  (1UL << 1)
+#define GPS_RESULT_NO_POWER_BIT     (1UL << 2)
+#define GPS_RESULT_ALL_BITS \
+    (GPS_RESULT_FIX_OK_BIT | GPS_RESULT_FIX_TIMEOUT_BIT | GPS_RESULT_NO_POWER_BIT)
+
+/* ---- Dispatcher state machine ---- */
+typedef enum {
+    GPS_STATE_IDLE      = 0,   /* GPS off, waiting for trigger              */
+    GPS_STATE_ACQUIRING = 1,   /* GPS powered, RX task searching for fix    */
+    GPS_STATE_FIX_HELD  = 2,   /* Fix held; GPS still powered (auto=false)  */
+} gps_state_e;
+
+/* ---- Task handles ---- */
+static osThreadId_t  GPS_vRxTask_handle;
+static osThreadId_t  GPS_vDispatcherTask_handle;
+
+/* ---- Solution/session state (NMEA parser ownership) ---- */
 gnss_session_t GnssSession;
 
 gnss_sol_t GnssSolDraft;
@@ -44,11 +72,23 @@ uint8_t  u8GpsSvTrackingCnt;
 
 bool GnssSyslogFlag = true;
 
-static osThreadId_t  GnssCallerTask  = NULL;
-static bool          bSessionActive  = false;
-static bool          bCallerNotified = false;
+/* ---- Dispatcher state (mutex-guarded except where atomic) ---- */
+static volatile gps_state_e eState         = GPS_STATE_IDLE;
+static volatile bool        bAutoShutdown  = true;
+static bool                 bSessionActive = false;   /* drives RX-task gating */
+static bool                 bCallerNotified= false;   /* GNSS_vOnSolution edge */
+static osEventFlagsId_t     xGpsResultFlags = NULL;
+static osMutexId_t          xGpsLock        = NULL;
+
+/* ---- Live session stable coordinates (current session only) ---- */
 static gnss_coord_deg_t GnssStableLat;
 static gnss_coord_deg_t GnssStableLong;
+
+/* ---- Last-known-fix retention (persists across sessions) ---- */
+static bool             bHasEverFixed  = false;
+static gnss_coord_deg_t tLastFixLat;
+static gnss_coord_deg_t tLastFixLon;
+static uint64_t         u64LastFixUtc  = 0;  /* RTC_u64GetUTC() at acquisition */
 
 struct _gps_s {
     hal_uart_t UartHandle;
@@ -73,6 +113,11 @@ uint8_t u8SnrDbHzToPercent(uint8_t u8DbHz);
 void    GNSS_vOnSolution(void);
 bool    bAddUbxChecksum(uint8_t *pUbxFrame, uint16_t u16Len);
 
+static void GPS_vRxTask(void *parameters);
+static void GPS_vDispatcherTask(void *parameters);
+static void GPS_vSessionArm(void);
+static void GPS_vPowerOff(void);
+
 /* -------------------------------------------------------------------------- */
 
 uint8_t u8SnrDbHzToPercent(uint8_t u8DbHz)
@@ -91,11 +136,17 @@ bool __bFindNext_P(char **p1, const char *p2, bool bAdvance)
 }
 
 /* --------------------------------------------------------------------------
- * GPS_vInit — set up UART handle and create the RX task
+ * GPS_vInit — set up UART handle, mutex, event flags, and worker tasks
  * -------------------------------------------------------------------------- */
 void GPS_vInit(void)
 {
     GPS_DRIVER_vInitGPS(&gps.UartHandle);
+
+    xGpsLock = osMutexNew(NULL);
+    configASSERT(xGpsLock != NULL);
+
+    xGpsResultFlags = osEventFlagsNew(NULL);
+    configASSERT(xGpsResultFlags != NULL);
 
     static const osThreadAttr_t rx_attr = {
         .name       = "GPSRxTask",
@@ -105,48 +156,157 @@ void GPS_vInit(void)
     GPS_vRxTask_handle = osThreadNew(GPS_vRxTask, NULL, &rx_attr);
     configASSERT(GPS_vRxTask_handle != NULL);
 
+    static const osThreadAttr_t disp_attr = {
+        .name       = "GPSDispatcher",
+        .stack_size = GPS_DISP_TASK_STACK_SIZE * sizeof(StackType_t),
+        .priority   = GPS_DISP_TASK_PRIORITY,
+    };
+    GPS_vDispatcherTask_handle = osThreadNew(GPS_vDispatcherTask, NULL, &disp_attr);
+    configASSERT(GPS_vDispatcherTask_handle != NULL);
+
     DBG("gps: init\r\n");
 }
 
 /* --------------------------------------------------------------------------
- * GPS_vStart — power on the GNSS module and begin a new session
+ * GPS_vSessionArm — internal: reset session state and power up GPS
+ * Caller must hold xGpsLock.
  * -------------------------------------------------------------------------- */
-void GPS_vStart(osThreadId_t callerTask)
+static void GPS_vSessionArm(void)
 {
-    GnssCallerTask   = callerTask;
-    bCallerNotified  = false;
-    bSessionActive   = true;
-
     memset(&GnssSession, 0, sizeof(gnss_session_t));
-    GnssSession.u32StartTime     = (uint32_t)RTC_u64GetTicks();
-    GnssSession.u16TtffTimeout   = GNSS_TTFF_TIMEOUT_1_AID_ASSIST;
-    GnssSession.tNmeaMsgFlagsBm  = GNSS_NMEA_MSG_RMC_bm | GNSS_NMEA_MSG_PQTMEPE_bm;
-    GnssSession.Fix              = GNSS_SESSION_FIX_BUSY;
+    GnssSession.u32StartTime    = (uint32_t)RTC_u64GetTicks();
+    GnssSession.u16TtffTimeout  = GNSS_TTFF_TIMEOUT_1_AID_ASSIST;
+    GnssSession.tNmeaMsgFlagsBm = GNSS_NMEA_MSG_RMC_bm | GNSS_NMEA_MSG_PQTMEPE_bm;
+    GnssSession.Fix             = GNSS_SESSION_FIX_BUSY;
     memset(&GnssSolDraft, 0, sizeof(gnss_sol_t));
+
+    bCallerNotified = false;
+    bSessionActive  = true;
 
     GPS_DRIVER_vEnableUart(&gps.UartHandle);
     HAL_UART_vClearBuffer(&gps.UartHandle);
     GPS_DRIVER_vPowerEnHigh();
 
-    DBG("gps: start, ttff timeout=%us\r\n", GnssSession.u16TtffTimeout);
+    eState = GPS_STATE_ACQUIRING;
+    DBG("gps: session armed, ttff timeout=%us\r\n", GnssSession.u16TtffTimeout);
 }
 
 /* --------------------------------------------------------------------------
- * GPS_vStop — power down and disable UART
+ * GPS_vPowerOff — internal: power down GPS and disable UART
+ * Caller must hold xGpsLock.
  * -------------------------------------------------------------------------- */
-void GPS_vStop(void)
+static void GPS_vPowerOff(void)
 {
     bSessionActive = false;
-    GnssCallerTask = NULL;
     GPS_DRIVER_vPowerEnLow();
     GPS_DRIVER_vDisableUart(&gps.UartHandle);
-    DBG("gps: stop\r\n");
+    eState = GPS_STATE_IDLE;
+    DBG("gps: powered off\r\n");
 }
 
 /* --------------------------------------------------------------------------
- * GPS_vRxTask — CMSIS-RTOS v2 task; blocks on thread flag from ISR
+ * GPS_vRequestFix — public: trigger (or attach to) a fix acquisition.
+ * Idempotent; updates bAutoShutdown to the last-caller value.
+ * Refuses if board is not in POWER_CLASS_NORMAL — sets NO_POWER result.
  * -------------------------------------------------------------------------- */
-void GPS_vRxTask(void *parameters)
+void GPS_vRequestFix(bool bAutoShutdownIn)
+{
+    /* Safe no-op if GPS_vInit() was never called (e.g. PRIMARY device or
+     * ENABLE_GPS not defined). The wake-schedule task fires this
+     * unconditionally on every cycle, so being defensive here is required. */
+    if (xGpsLock == NULL || xGpsResultFlags == NULL) return;
+
+    osMutexAcquire(xGpsLock, osWaitForever);
+
+    /* ---- Power-class gate ---- */
+    if ((POWER_tGetState() & POWER_CLASS_NORMAL) == 0U)
+    {
+        DBG("gps: request refused — power class not NORMAL\r\n");
+        osEventFlagsClear(xGpsResultFlags, GPS_RESULT_ALL_BITS);
+        osEventFlagsSet(xGpsResultFlags,   GPS_RESULT_NO_POWER_BIT);
+        osMutexRelease(xGpsLock);
+        return;
+    }
+
+    bAutoShutdown = bAutoShutdownIn;
+
+    switch (eState)
+    {
+    case GPS_STATE_IDLE:
+        /* Cold start — clear stale result flags and kick the dispatcher */
+        osEventFlagsClear(xGpsResultFlags, GPS_RESULT_ALL_BITS);
+        osThreadFlagsSet(GPS_vDispatcherTask_handle, GPS_DISP_TRIGGER_BIT);
+        DBG("gps: request — dispatcher kicked (auto=%u)\r\n", (unsigned)bAutoShutdownIn);
+        break;
+
+    case GPS_STATE_ACQUIRING:
+        /* Already searching — last-caller bAutoShutdown wins */
+        DBG("gps: request attached (auto=%u)\r\n", (unsigned)bAutoShutdownIn);
+        break;
+
+    case GPS_STATE_FIX_HELD:
+        /* Already have a fix held; if caller wants auto-shutdown, do it now */
+        if (bAutoShutdownIn)
+        {
+            DBG("gps: request — held fix consumed, powering off\r\n");
+            GPS_vPowerOff();
+        }
+        else
+        {
+            DBG("gps: request — held fix retained\r\n");
+        }
+        break;
+    }
+
+    osMutexRelease(xGpsLock);
+}
+
+/* --------------------------------------------------------------------------
+ * GPS_eWaitForFix — public: block until session signals a terminal result.
+ * Multiple callers may wait concurrently; osFlagsNoClear keeps the flag
+ * set across all waiters until the next GPS_vRequestFix() clears them.
+ * -------------------------------------------------------------------------- */
+gps_result_e GPS_eWaitForFix(uint32_t u32TimeoutMs)
+{
+    if (xGpsResultFlags == NULL) return GPS_RESULT_FIX_TIMEOUT;
+
+    uint32_t flags = osEventFlagsWait(xGpsResultFlags,
+                                       GPS_RESULT_ALL_BITS,
+                                       osFlagsWaitAny | osFlagsNoClear,
+                                       u32TimeoutMs);
+
+    if (flags & osFlagsError)
+        return GPS_RESULT_FIX_TIMEOUT;   /* caller's own wait timed out */
+
+    if (flags & GPS_RESULT_NO_POWER_BIT)    return GPS_RESULT_NO_POWER;
+    if (flags & GPS_RESULT_FIX_OK_BIT)      return GPS_RESULT_FIX_OK;
+    return GPS_RESULT_FIX_TIMEOUT;
+}
+
+/* --------------------------------------------------------------------------
+ * GPS_vShutdown — public: manual power-down (no-op if already off)
+ * -------------------------------------------------------------------------- */
+void GPS_vShutdown(void)
+{
+    if (xGpsLock == NULL) return;
+
+    osMutexAcquire(xGpsLock, osWaitForever);
+    if (eState != GPS_STATE_IDLE)
+    {
+        DBG("gps: manual shutdown\r\n");
+        GPS_vPowerOff();
+        /* Signal dispatcher in case it's mid-wait — it observes eState==IDLE
+         * and returns to its outer trigger-wait. */
+        osThreadFlagsSet(GPS_vDispatcherTask_handle, GPS_DISP_SHUTDOWN_BIT);
+    }
+    osMutexRelease(xGpsLock);
+}
+
+/* --------------------------------------------------------------------------
+ * GPS_vRxTask — CMSIS-RTOS v2 task; blocks on thread flag from ISR.
+ * Internal — only the dispatcher gates sessions on/off via bSessionActive.
+ * -------------------------------------------------------------------------- */
+static void GPS_vRxTask(void *parameters)
 {
     (void)parameters;
 
@@ -291,22 +451,29 @@ void GNSS_vOnSolution(void)
                     : (GnssSession.u16TtffTmr < GnssSession.u16TtffTimeout)
                         ? GNSS_SESSION_FIX_BUSY : GNSS_SESSION_FIX_ERROR;
 
-    /* Notify caller on first stable fix */
-    if (GnssSession.bHasFirstStableFix && !bCallerNotified && GnssCallerTask != NULL)
+    /* Notify dispatcher on first stable fix */
+    if (GnssSession.bHasFirstStableFix && !bCallerNotified)
     {
         taskENTER_CRITICAL();
         GnssStableLat  = GnssSol.Lat.Deg;
         GnssStableLong = GnssSol.Long.Deg;
+
+        /* Last-known-fix retention — persists across sessions */
+        tLastFixLat   = GnssSol.Lat.Deg;
+        tLastFixLon   = GnssSol.Long.Deg;
+        u64LastFixUtc = RTC_u64GetUTC();
+        bHasEverFixed = true;
         taskEXIT_CRITICAL();
+
         bCallerNotified = true;
         DBG("gps: FIX OK t=%us lat=%i.%06lu lon=%i.%06lu\r\n",
             GnssSession.u16TimeToFirstFix,
             GnssSol.Lat.Deg.i16Deg,  GnssSol.Lat.Deg.u32DeciMicroDeg,
             GnssSol.Long.Deg.i16Deg, GnssSol.Long.Deg.u32DeciMicroDeg);
-        osThreadFlagsSet(GnssCallerTask, GPS_NOTIFY_FIX_OK);
+        osThreadFlagsSet(GPS_vDispatcherTask_handle, GPS_DISP_FIX_OK_BIT);
     }
-    /* Notify caller on TTFF timeout */
-    else if (!bCallerNotified && GnssCallerTask != NULL
+    /* Notify dispatcher on TTFF timeout */
+    else if (!bCallerNotified
              && GnssSession.u16TtffTmr >= GnssSession.u16TtffTimeout)
     {
         if (GnssSol.bStatusValid)
@@ -314,6 +481,12 @@ void GNSS_vOnSolution(void)
             taskENTER_CRITICAL();
             GnssStableLat  = GnssSol.Lat.Deg;
             GnssStableLong = GnssSol.Long.Deg;
+
+            /* Best-effort fix at timeout — still retain as last-known */
+            tLastFixLat   = GnssSol.Lat.Deg;
+            tLastFixLon   = GnssSol.Long.Deg;
+            u64LastFixUtc = RTC_u64GetUTC();
+            bHasEverFixed = true;
             taskEXIT_CRITICAL();
             DBG("gps: FIX TIMEOUT t=%us, using best fix: lat=%i.%06lu lon=%i.%06lu\r\n",
                 GnssSession.u16TtffTmr,
@@ -325,7 +498,7 @@ void GNSS_vOnSolution(void)
             DBG("gps: FIX TIMEOUT t=%us, no valid fix\r\n", GnssSession.u16TtffTmr);
         }
         bCallerNotified = true;
-        osThreadFlagsSet(GnssCallerTask, GPS_NOTIFY_FIX_TIMEOUT);
+        osThreadFlagsSet(GPS_vDispatcherTask_handle, GPS_DISP_FIX_TIMEOUT_BIT);
     }
 
 #ifndef SWITCH_GNSS_LOGGER
@@ -376,6 +549,136 @@ bool GPS_bGetCoordinates(gnss_coord_deg_t *pLat, gnss_coord_deg_t *pLong)
 bool GPS_bHasStableFix(void)
 {
     return GnssSession.bHasFirstStableFix;
+}
+
+/* --------------------------------------------------------------------------
+ * GPS_bGetLastKnownFix — retained across sessions; returns false if no fix
+ * has ever been acquired since boot. Age is in seconds (RTC UTC delta).
+ * -------------------------------------------------------------------------- */
+bool GPS_bGetLastKnownFix(gnss_coord_deg_t *pLat,
+                          gnss_coord_deg_t *pLon,
+                          uint32_t         *pu32AgeSeconds)
+{
+    if (!bHasEverFixed)
+    {
+        if (pu32AgeSeconds != NULL) *pu32AgeSeconds = UINT32_MAX;
+        return false;
+    }
+
+    taskENTER_CRITICAL();
+    if (pLat != NULL) *pLat = tLastFixLat;
+    if (pLon != NULL) *pLon = tLastFixLon;
+    uint64_t u64Fixed = u64LastFixUtc;
+    taskEXIT_CRITICAL();
+
+    if (pu32AgeSeconds != NULL)
+    {
+        uint64_t u64Now = RTC_u64GetUTC();
+        *pu32AgeSeconds = (u64Now > u64Fixed) ? (uint32_t)(u64Now - u64Fixed) : 0U;
+    }
+    return true;
+}
+
+uint32_t GPS_u32GetLastFixAgeSeconds(void)
+{
+    if (!bHasEverFixed) return UINT32_MAX;
+    uint64_t u64Now = RTC_u64GetUTC();
+    return (u64Now > u64LastFixUtc) ? (uint32_t)(u64Now - u64LastFixUtc) : 0U;
+}
+
+/* --------------------------------------------------------------------------
+ * GPS_vDispatcherTask — owns session lifecycle and power control.
+ *
+ * Idles waiting for GPS_DISP_TRIGGER_BIT. Once triggered, arms a session
+ * and waits for the RX task to report FIX_OK or FIX_TIMEOUT (via thread
+ * flags). The wait polls every 5 s so it can re-check the power class:
+ * a drop out of NORMAL aborts the session with NO_POWER.
+ *
+ * After a terminal event the dispatcher either powers the GPS off (auto-
+ * shutdown) or transitions to FIX_HELD (caller must call GPS_vShutdown).
+ * -------------------------------------------------------------------------- */
+#define GPS_DISP_POLL_MS    5000U
+
+static void GPS_vDispatcherTask(void *parameters)
+{
+    (void)parameters;
+
+    for (;;)
+    {
+        /* ---- Idle: wait for a request ---- */
+        osThreadFlagsWait(GPS_DISP_TRIGGER_BIT, osFlagsWaitAny, osWaitForever);
+
+        osMutexAcquire(xGpsLock, osWaitForever);
+        GPS_vSessionArm();
+        osMutexRelease(xGpsLock);
+
+        /* ---- Acquiring: poll until terminal event or power loss ---- */
+        gps_result_e eResult = GPS_RESULT_FIX_TIMEOUT;
+
+        for (;;)
+        {
+            uint32_t flags = osThreadFlagsWait(GPS_DISP_FIX_OK_BIT
+                                              | GPS_DISP_FIX_TIMEOUT_BIT
+                                              | GPS_DISP_SHUTDOWN_BIT,
+                                              osFlagsWaitAny,
+                                              GPS_DISP_POLL_MS);
+
+            if (!(flags & osFlagsError))
+            {
+                if (flags & GPS_DISP_FIX_OK_BIT)      eResult = GPS_RESULT_FIX_OK;
+                else if (flags & GPS_DISP_FIX_TIMEOUT_BIT) eResult = GPS_RESULT_FIX_TIMEOUT;
+                else if (flags & GPS_DISP_SHUTDOWN_BIT)
+                {
+                    /* GPS_vShutdown already powered things off; just fan out
+                     * a TIMEOUT result so any blocked waiter is released. */
+                    eResult = GPS_RESULT_FIX_TIMEOUT;
+                }
+                break;
+            }
+
+            /* 5 s poll tick — re-check power class for mid-session loss */
+            if ((POWER_tGetState() & POWER_CLASS_NORMAL) == 0U)
+            {
+                DBG("gps: power class dropped mid-session — aborting\r\n");
+                osMutexAcquire(xGpsLock, osWaitForever);
+                if (eState != GPS_STATE_IDLE) GPS_vPowerOff();
+                osMutexRelease(xGpsLock);
+                eResult = GPS_RESULT_NO_POWER;
+                break;
+            }
+        }
+
+        /* ---- Terminal: fan out result and decide power state ---- */
+        osMutexAcquire(xGpsLock, osWaitForever);
+
+        if (eResult == GPS_RESULT_NO_POWER)
+        {
+            osEventFlagsSet(xGpsResultFlags, GPS_RESULT_NO_POWER_BIT);
+        }
+        else if (eResult == GPS_RESULT_FIX_OK)
+        {
+            osEventFlagsSet(xGpsResultFlags, GPS_RESULT_FIX_OK_BIT);
+            if (bAutoShutdown)
+            {
+                GPS_vPowerOff();
+            }
+            else
+            {
+                eState = GPS_STATE_FIX_HELD;
+                DBG("gps: fix held (auto-shutdown disabled)\r\n");
+            }
+        }
+        else  /* GPS_RESULT_FIX_TIMEOUT */
+        {
+            osEventFlagsSet(xGpsResultFlags, GPS_RESULT_FIX_TIMEOUT_BIT);
+            if (bAutoShutdown && eState != GPS_STATE_IDLE)
+                GPS_vPowerOff();
+            else if (eState != GPS_STATE_IDLE)
+                eState = GPS_STATE_FIX_HELD;
+        }
+
+        osMutexRelease(xGpsLock);
+    }
 }
 
 /* ===================================================================

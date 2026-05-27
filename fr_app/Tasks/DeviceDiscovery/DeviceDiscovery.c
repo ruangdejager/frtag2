@@ -107,20 +107,11 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                          osWaitForever);
 
 
-#ifdef ENABLE_GPS
-        /* ---- GPS fix ---- */
-        GPS_vStart(osThreadGetId());
-        osThreadFlagsWait(GPS_NOTIFY_FIX_OK | GPS_NOTIFY_FIX_TIMEOUT,
-                          osFlagsWaitAny,
-                          10000);
-
-        gnss_coord_deg_t lat, lon;
-        if (GPS_bGetCoordinates(&lat, &lon))
-        {
-            /* lat.fDegrees, lon.fDegrees — or use i32MicroDeg for integer math */
-        }
-        GPS_vStop();
-#endif
+        /* GPS is NOT acquired here — the wake-schedule task pre-triggers it
+         * 3 minutes before this wake. Consumers (MeshNetwork payload,
+         * logger metadata, etc.) read the last known fix on demand via
+         * GPS_bGetLastKnownFix() and use its age to decide. The AppTask
+         * never blocks on a GPS fix. */
 
         /* ---- Prepare for new campaign ---- */
         MESHNETWORK_vClearDiscoveredNeighbors();
@@ -370,9 +361,17 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
         /* Block until the platform heartbeat fires (any flag) */
         osThreadFlagsWait(0x7FFFFFFFU, osFlagsWaitAny, osWaitForever);
 
-        if (RTC_u64GetUTC() % ((uint64_t)MESHNETWORK_u8GetWakeupInterval() * 60) == 0)
+        uint64_t u64Utc       = RTC_u64GetUTC();
+        uint32_t u32IntervalS = (uint32_t)MESHNETWORK_u8GetWakeupInterval() * 60U;
+        uint32_t u32Phase     = (uint32_t)(u64Utc % (uint64_t)u32IntervalS);
+
+        /* --- Discovery wake trigger (phase == 0) --- */
+        if (u32Phase == 0U)
         {
-            if (POWER_tGetState() & POWER_CLASS_NORMAL)
+            /* Scheduled wakes still fire in LOW; only RECOVERY suppresses them.
+             * GPS gates strictly on NORMAL itself, so a LOW wake just produces
+             * a discovery campaign without a fresh fix attempt. */
+            if (POWER_tGetState() & (POWER_CLASS_NORMAL | POWER_CLASS_LOW))
             {
                 SYSTEM_vDeactivateDeepSleep();
 
@@ -389,6 +388,22 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                 osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_WAKEUP_BIT);
             }
         }
+
+#ifdef ENABLE_GPS
+        /* --- GPS pre-trigger (DEVICE_DISCOVERY_GPS_PRETRIGGER_S before wake) ---
+         * Fire-and-forget: by the time the discovery wake fires, the GPS
+         * dispatcher has either acquired a fresh fix (cached as last-known)
+         * or timed out. The AppTask never waits on this.
+         *
+         * The intervals (15 / 30 / 60 / 120 min × 60 s) are all comfortably
+         * larger than the 180 s pre-trigger window. */
+        if (u32IntervalS > DEVICE_DISCOVERY_GPS_PRETRIGGER_S &&
+            u32Phase == (u32IntervalS - DEVICE_DISCOVERY_GPS_PRETRIGGER_S))
+        {
+            DBG("DeviceDiscovery: GPS pre-trigger\r\n");
+            GPS_vRequestFix(true);   /* auto-shutdown on completion */
+        }
+#endif
     }
 }
 
