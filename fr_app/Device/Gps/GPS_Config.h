@@ -18,7 +18,7 @@
  * Testing shows solution deltas can take up to 7-8 fixes to converge;
  * choose a margin above that.
  */
-#define GNSS_SESSION_VALID_FIX_CNT_MIN      15
+#define GNSS_SESSION_VALID_FIX_CNT_MIN      10
 
 /*
  * Nominal sequential fix count: extra time beyond the minimum for the
@@ -53,5 +53,12 @@
  * Chosen for >50% safety margin over worst-case production startup time.
  */
 #define GNSS_EXT_MODULE_DETECT_TIMEOUT      2000
+
+/*
+ * Minimum RTC error [s] required before a GPS-derived time is applied.
+ * Differences smaller than this threshold are treated as within acceptable
+ * oscillator drift and the RTC is left unchanged.
+ */
+#define GPS_RTC_SYNC_MIN_ERROR_S            30U
 
 #endif /* DEVICE_GPS_GPS_CONFIG_H_ */

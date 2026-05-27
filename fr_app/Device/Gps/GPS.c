@@ -118,6 +118,7 @@ static void GPS_vRxTask(void *parameters);
 static void GPS_vDispatcherTask(void *parameters);
 static void GPS_vSessionArm(void);
 static void GPS_vPowerOff(void);
+static void GPS_vMaybeSyncRtc(uint32_t u32GpsUnixTime);
 
 /* -------------------------------------------------------------------------- */
 
@@ -218,6 +219,31 @@ static void GPS_vPowerOff(void)
     GPS_DRIVER_vDisableUart(&gps.UartHandle);
     eState = GPS_STATE_IDLE;
     DBG("gps: powered off\r\n");
+}
+
+/* --------------------------------------------------------------------------
+ * GPS_vMaybeSyncRtc — apply GPS-derived UTC to the RTC if the error exceeds
+ * GPS_RTC_SYNC_MIN_ERROR_S.  Called at most once per session (FIX_OK or
+ * TTFF timeout).  Time can be decoded from the NMEA RMC sentence before a
+ * full position fix is available, so this is attempted on both terminal paths.
+ * -------------------------------------------------------------------------- */
+static void GPS_vMaybeSyncRtc(uint32_t u32GpsUnixTime)
+{
+    if (u32GpsUnixTime == 0U) return;   /* RMC time fields not yet parsed */
+
+    uint64_t u64RtcNow = RTC_u64GetUTC();
+    int64_t  i64Delta  = (int64_t)u32GpsUnixTime - (int64_t)u64RtcNow;
+    if (i64Delta < 0) i64Delta = -i64Delta;
+
+    if ((uint64_t)i64Delta > (uint64_t)GPS_RTC_SYNC_MIN_ERROR_S)
+    {
+        RTC_vSetUTC((uint64_t)u32GpsUnixTime);
+        DBG("gps: RTC synced from GPS (delta=%lds)\r\n", (long)i64Delta);
+    }
+    else
+    {
+        DBG("gps: RTC within tolerance (delta=%lds), no sync\r\n", (long)i64Delta);
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -508,8 +534,9 @@ void GNSS_vOnSolution(void)
 
         if (!bCallerNotified)
         {
-            /* First stable fix of this session — wake the dispatcher */
+            /* First stable fix of this session — sync RTC then wake dispatcher */
             bCallerNotified = true;
+            GPS_vMaybeSyncRtc(GnssSol.u32TimeUnix);
             DBG("gps: FIX OK t=%us lat=%i.%06lu lon=%i.%06lu\r\n",
                 GnssSession.u16TimeToFirstFix,
                 GnssSol.Lat.Deg.i16Deg,  GnssSol.Lat.Deg.u32DeciMicroDeg,
@@ -544,6 +571,9 @@ void GNSS_vOnSolution(void)
         {
             DBG("gps: FIX TIMEOUT t=%us, no valid fix\r\n", GnssSession.u16TtffTmr);
         }
+        /* Attempt RTC sync regardless of position validity — NMEA time fields
+         * are typically decoded well before a position fix is declared. */
+        GPS_vMaybeSyncRtc(GnssSol.u32TimeUnix);
         bCallerNotified = true;
         osThreadFlagsSet(GPS_vDispatcherTask_handle, GPS_DISP_FIX_TIMEOUT_BIT);
     }
