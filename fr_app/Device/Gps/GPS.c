@@ -75,8 +75,9 @@ bool GnssSyslogFlag = true;
 /* ---- Dispatcher state (mutex-guarded except where atomic) ---- */
 static volatile gps_state_e eState         = GPS_STATE_IDLE;
 static volatile bool        bAutoShutdown  = true;
-static bool                 bSessionActive = false;   /* drives RX-task gating */
-static bool                 bCallerNotified= false;   /* GNSS_vOnSolution edge */
+static bool                 bSessionActive = false;   /* drives RX-task gating      */
+static bool                 bCallerNotified= false;   /* GNSS_vOnSolution edge       */
+static bool                 bGpsPowered    = false;   /* hardware rail + UART state  */
 static osEventFlagsId_t     xGpsResultFlags = NULL;
 static osMutexId_t          xGpsLock        = NULL;
 
@@ -183,12 +184,26 @@ static void GPS_vSessionArm(void)
     bCallerNotified = false;
     bSessionActive  = true;
 
-    GPS_DRIVER_vEnableUart(&gps.UartHandle);
-    HAL_UART_vClearBuffer(&gps.UartHandle);
-    GPS_DRIVER_vPowerEnHigh();
+    if (!bGpsPowered)
+    {
+        /* Cold start — power the hardware and enable the UART */
+        GPS_DRIVER_vEnableUart(&gps.UartHandle);
+        HAL_UART_vClearBuffer(&gps.UartHandle);
+        GPS_DRIVER_vPowerEnHigh();
+        bGpsPowered = true;
+        DBG("gps: session armed (cold start), ttff timeout=%us\r\n",
+            GnssSession.u16TtffTimeout);
+    }
+    else
+    {
+        /* Re-arm from FIX_HELD — GPS already powered, just reset session state.
+         * Flush the UART buffer so stale NMEA from the held session is discarded. */
+        HAL_UART_vClearBuffer(&gps.UartHandle);
+        DBG("gps: session re-armed (GPS already on), ttff timeout=%us\r\n",
+            GnssSession.u16TtffTimeout);
+    }
 
     eState = GPS_STATE_ACQUIRING;
-    DBG("gps: session armed, ttff timeout=%us\r\n", GnssSession.u16TtffTimeout);
 }
 
 /* --------------------------------------------------------------------------
@@ -198,6 +213,7 @@ static void GPS_vSessionArm(void)
 static void GPS_vPowerOff(void)
 {
     bSessionActive = false;
+    bGpsPowered    = false;
     GPS_DRIVER_vPowerEnLow();
     GPS_DRIVER_vDisableUart(&gps.UartHandle);
     eState = GPS_STATE_IDLE;
@@ -245,15 +261,31 @@ void GPS_vRequestFix(bool bAutoShutdownIn)
         break;
 
     case GPS_STATE_FIX_HELD:
-        /* Already have a fix held; if caller wants auto-shutdown, do it now */
-        if (bAutoShutdownIn)
+        if (GnssSession.bHasFirstStableFix)
         {
-            DBG("gps: request — held fix consumed, powering off\r\n");
-            GPS_vPowerOff();
+            /* A live fix is available (either from the original acquisition or
+             * acquired in the interim after a timeout).  Signal FIX_OK immediately
+             * so any concurrent GPS_eWaitForFix() caller is released at once. */
+            DBG("gps: request — live fix available, signalling FIX_OK immediately\r\n");
+            osEventFlagsClear(xGpsResultFlags, GPS_RESULT_ALL_BITS);
+            osEventFlagsSet(xGpsResultFlags, GPS_RESULT_FIX_OK_BIT);
+            if (bAutoShutdownIn)
+            {
+                DBG("gps: auto-shutdown after immediate FIX_OK\r\n");
+                GPS_vPowerOff();
+            }
+            /* else: GPS stays powered, continuous position updates continue */
         }
         else
         {
-            DBG("gps: request — held fix retained\r\n");
+            /* GPS is on but no stable fix yet (TTFF timed out, still searching).
+             * Re-arm the session with a fresh TTFF budget.  The dispatcher is
+             * waiting at its outer loop; sending TRIGGER_BIT causes it to call
+             * GPS_vSessionArm(), which skips the power-on (bGpsPowered=true) and
+             * only resets the session counters. */
+            DBG("gps: request — no fix in FIX_HELD, re-arming session\r\n");
+            osEventFlagsClear(xGpsResultFlags, GPS_RESULT_ALL_BITS);
+            osThreadFlagsSet(GPS_vDispatcherTask_handle, GPS_DISP_TRIGGER_BIT);
         }
         break;
     }
@@ -451,8 +483,17 @@ void GNSS_vOnSolution(void)
                     : (GnssSession.u16TtffTmr < GnssSession.u16TtffTimeout)
                         ? GNSS_SESSION_FIX_BUSY : GNSS_SESSION_FIX_ERROR;
 
-    /* Notify dispatcher on first stable fix */
-    if (GnssSession.bHasFirstStableFix && !bCallerNotified)
+    /* Continuously update position whenever a stable fix is available.
+     *
+     * The position update is intentionally NOT gated by bCallerNotified — when
+     * the GPS is held on (bAutoShutdown=false, GPS_STATE_FIX_HELD), the RX task
+     * keeps running and we want GnssStableLat/Long and the last-known-fix to
+     * track the freshest data on every NMEA cycle.
+     *
+     * The dispatcher signal (osThreadFlagsSet) IS gated by !bCallerNotified so
+     * the dispatcher wakes only once per session acquisition.
+     */
+    if (GnssSession.bHasFirstStableFix)
     {
         taskENTER_CRITICAL();
         GnssStableLat  = GnssSol.Lat.Deg;
@@ -465,14 +506,20 @@ void GNSS_vOnSolution(void)
         bHasEverFixed = true;
         taskEXIT_CRITICAL();
 
-        bCallerNotified = true;
-        DBG("gps: FIX OK t=%us lat=%i.%06lu lon=%i.%06lu\r\n",
-            GnssSession.u16TimeToFirstFix,
-            GnssSol.Lat.Deg.i16Deg,  GnssSol.Lat.Deg.u32DeciMicroDeg,
-            GnssSol.Long.Deg.i16Deg, GnssSol.Long.Deg.u32DeciMicroDeg);
-        osThreadFlagsSet(GPS_vDispatcherTask_handle, GPS_DISP_FIX_OK_BIT);
+        if (!bCallerNotified)
+        {
+            /* First stable fix of this session — wake the dispatcher */
+            bCallerNotified = true;
+            DBG("gps: FIX OK t=%us lat=%i.%06lu lon=%i.%06lu\r\n",
+                GnssSession.u16TimeToFirstFix,
+                GnssSol.Lat.Deg.i16Deg,  GnssSol.Lat.Deg.u32DeciMicroDeg,
+                GnssSol.Long.Deg.i16Deg, GnssSol.Long.Deg.u32DeciMicroDeg);
+            osThreadFlagsSet(GPS_vDispatcherTask_handle, GPS_DISP_FIX_OK_BIT);
+        }
     }
-    /* Notify dispatcher on TTFF timeout */
+    /* Notify dispatcher on TTFF timeout (position update only if a best-effort
+     * fix is available; no continuous update path — timeout is a terminal event
+     * for the current acquisition, though the GPS may stay on in FIX_HELD). */
     else if (!bCallerNotified
              && GnssSession.u16TtffTmr >= GnssSession.u16TtffTimeout)
     {
