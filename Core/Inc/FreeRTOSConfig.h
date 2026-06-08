@@ -156,6 +156,15 @@ standard names. */
 
 /* USER CODE BEGIN Defines */
 /* Section where parameter definitions can be added (for instance, to override default ones in FreeRTOS.h) */
+
+/* Tickless idle: a custom vPortSuppressTicksAndSleep() in Hal/src/hal_system.c
+ * overrides the weak ARM_CM3 port implementation. It parks the core in STOP2
+ * between RTC heartbeats and reconciles the FreeRTOS tick from the RTC on wake.
+ * The default SysTick-based suppress logic is unusable here because SysTick is
+ * stopped in STOP2; the RTC (LSE) is the only timebase that survives sleep.
+ * INCLUDE_vTaskSuspend (above) is required and already set to 1. */
+#define configUSE_TICKLESS_IDLE                  1
+
 /* USER CODE END Defines */
 
 #endif /* FREERTOS_CONFIG_H */

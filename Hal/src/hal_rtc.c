@@ -85,6 +85,31 @@ uint64_t HAL_RTC_u64GetValue(void)
     return hal_rtc_counter;
 }
 
+/* --------------------------------------------------------------------------
+ * HAL_RTC_u32GetMsOfDay
+ * Reads the live RTC hardware calendar (hh:mm:ss) plus the sub-second
+ * downcounter (SSR) and returns milliseconds since local midnight. Reading
+ * SSR locks the calendar shadow registers; reading DR afterwards releases
+ * the lock. Used by the tickless-idle sleep path to measure elapsed time
+ * across STOP2, where SysTick is stopped and the software second counter is
+ * not yet updated (its ISR is still pending).
+ * -------------------------------------------------------------------------- */
+uint32_t HAL_RTC_u32GetMsOfDay(void)
+{
+    uint32_t ssr = RTC->SSR & 0xFFFFU;
+    uint32_t tr  = RTC->TR;
+    (void)RTC->DR;                       /* release shadow-register lock */
+
+    uint32_t hh = ((tr & RTC_TR_HT)  >> RTC_TR_HT_Pos)  * 10U + ((tr & RTC_TR_HU)  >> RTC_TR_HU_Pos);
+    uint32_t mm = ((tr & RTC_TR_MNT) >> RTC_TR_MNT_Pos) * 10U + ((tr & RTC_TR_MNU) >> RTC_TR_MNU_Pos);
+    uint32_t ss = ((tr & RTC_TR_ST)  >> RTC_TR_ST_Pos)  * 10U + ((tr & RTC_TR_SU)  >> RTC_TR_SU_Pos);
+
+    uint32_t prediv_s = hrtc.Init.SynchPrediv;        /* 255 → 256 sub-ticks/s */
+    uint32_t sub_ms   = ((prediv_s - ssr) * 1000U) / (prediv_s + 1U);
+
+    return (((hh * 3600U) + (mm * 60U) + ss) * 1000U) + sub_ms;
+}
+
 void HAL_RTC_vRegisterWKUPCallback(rtc_tick_callback_t function)
 {
     one_second_callback = function;
