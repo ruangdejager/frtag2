@@ -19,7 +19,7 @@
 
 #define MS_PER_DAY   86400000U
 
-static bool bSleepActive = false;
+static bool bSleepActive = true;
 static volatile uint32_t gSleepLockCount = 0;
 
 void SystemClock_Config(void)

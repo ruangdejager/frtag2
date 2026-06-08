@@ -66,9 +66,18 @@ void HAL_ADC_vInit(void)
     LL_ADC_SetCommonPathInternalCh(__LL_ADC_COMMON_INSTANCE(hadc.Instance),
                                    LL_ADC_PATH_INTERNAL_VREFINT);
 
-    /* The ADC is shared between the battery and solar workers — serialize. */
-    adc_mutex = osMutexNew(NULL);
-    configASSERT(adc_mutex != NULL);
+    /* The ADC is shared between the battery and solar workers — serialize.
+     * Create the mutex ONCE. HAL_ADC_vInit() also runs on every STOP2 wake
+     * (from HAL_SYSTEM_vEnterStop2, in the tickless-idle path with interrupts
+     * masked). Re-creating the mutex there would (a) leak the previous one
+     * every second until the heap is exhausted and configASSERT traps, and
+     * (b) call pvPortMalloc from a masked-interrupt critical section, which is
+     * illegal. The guard keeps creation on the boot path only. */
+    if (adc_mutex == NULL)
+    {
+        adc_mutex = osMutexNew(NULL);
+        configASSERT(adc_mutex != NULL);
+    }
 }
 
 void HAL_ADC_MspInit(ADC_HandleTypeDef *adcHandle)
