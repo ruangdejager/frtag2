@@ -69,7 +69,7 @@ void DEVICE_DISCOVERY_vInit(void)
     static const osThreadAttr_t wakeup_attr = {
         .name       = "CheckWakeupSched",
         .stack_size = configMINIMAL_STACK_SIZE * sizeof(StackType_t),
-        .priority   = osPriorityBelowNormal,
+        .priority   = osPriorityNormal,
     };
 
     DeviceDiscoveryAppTask_handle =

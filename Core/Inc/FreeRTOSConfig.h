@@ -165,6 +165,13 @@ standard names. */
  * INCLUDE_vTaskSuspend (above) is required and already set to 1. */
 #define configUSE_TICKLESS_IDLE                  1
 
+/* Trap stack overflows instead of letting them corrupt silently. Method 2
+ * checks the magic-pattern fill at the stack end on every context switch (in
+ * addition to the high-water check), so it catches a task that overruns deep
+ * inside a call (e.g. the radio init) rather than only at switch-out boundaries.
+ * Requires vApplicationStackOverflowHook() — defined in Core/Src/app_freertos.c. */
+#define configCHECK_FOR_STACK_OVERFLOW           2
+
 /* USER CODE END Defines */
 
 #endif /* FREERTOS_CONFIG_H */
