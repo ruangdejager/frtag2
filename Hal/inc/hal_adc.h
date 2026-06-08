@@ -20,6 +20,7 @@ typedef enum {
     BAT_VOLTAGE_CHANNEL    = 0,
     VSOLAR_VOLTAGE_CHANNEL = 1,
     RSENSE_VOLTAGE_CHANNEL = 2,
+    VREFINT_CHANNEL        = 3,
 } hal_adc_channel_t;
 
 extern ADC_HandleTypeDef hadc;
@@ -34,7 +35,14 @@ void     HAL_ADC_vSelectChannel(hal_adc_channel_t channel);
 void     HAL_ADC_vStartConversion(hal_adc_channel_t channel);
 uint16_t HAL_ADC_u16GetResult(void);
 
+/* Serialize access to the shared ADC across workers (battery, solar). Acquire
+ * around the full enable → convert → disable sequence. */
 void     HAL_ADC_vLock(void);
 void     HAL_ADC_vUnlock(void);
+
+/* Convert a raw VREFINT conversion (12-bit) into the actual analog supply
+ * voltage VDDA in mV, using the chip's factory VREFINT calibration. Returns
+ * 0 if the raw value is 0 (conversion failed). */
+uint16_t HAL_ADC_u16VddaFromVrefint(uint16_t u16VrefintRaw);
 
 #endif /* INC_HAL_ADC_H_ */
