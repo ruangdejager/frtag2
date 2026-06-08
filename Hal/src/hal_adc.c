@@ -17,7 +17,11 @@ ADC_HandleTypeDef hadc;
 void HAL_ADC_vInit(void)
 {
     hadc.Instance                   = ADC;
-    hadc.Init.ClockPrescaler        = ADC_CLOCK_SYNC_PCLK_DIV2;
+    /* PCLK is 48 MHz; /2 would give 24 MHz, above the STM32WL ADC's 16 MHz
+     * limit. The low-impedance battery divider tolerated the overclock but the
+     * high-impedance VREFINT channel converted ~2 %% high, corrupting the VDDA
+     * estimate. /4 = 12 MHz keeps the ADC in spec. */
+    hadc.Init.ClockPrescaler        = ADC_CLOCK_SYNC_PCLK_DIV4;
     hadc.Init.Resolution            = ADC_RESOLUTION_12B;
     hadc.Init.DataAlign             = ADC_DATAALIGN_RIGHT;
     hadc.Init.ScanConvMode          = ADC_SCAN_DISABLE;
@@ -31,15 +35,23 @@ void HAL_ADC_vInit(void)
     hadc.Init.ExternalTrigConvEdge  = ADC_EXTERNALTRIGCONVEDGE_NONE;
     hadc.Init.DMAContinuousRequests = DISABLE;
     hadc.Init.Overrun               = ADC_OVR_DATA_PRESERVED;
-    /* 79.5 cycles: required for the high-impedance VREFINT internal channel
-     * to settle, and it also removes the undershoot on the high-impedance
-     * battery divider. Both channels use common sampling time 1. */
-    hadc.Init.SamplingTimeCommon1   = ADC_SAMPLETIME_79CYCLES_5;
-    hadc.Init.SamplingTimeCommon2   = ADC_SAMPLETIME_79CYCLES_5;
+    /* 160.5 cycles (~13 us at the 12 MHz ADC clock): the high-impedance
+     * VREFINT internal channel needs a long settling window or it converts
+     * high and corrupts the VDDA estimate. Both channels use common time 1. */
+    hadc.Init.SamplingTimeCommon1   = ADC_SAMPLETIME_160CYCLES_5;
+    hadc.Init.SamplingTimeCommon2   = ADC_SAMPLETIME_160CYCLES_5;
     hadc.Init.OversamplingMode      = DISABLE;
     hadc.Init.TriggerFrequencyMode  = ADC_TRIGGER_FREQ_HIGH;
 
     if (HAL_ADC_Init(&hadc) != HAL_OK)
+        Error_Handler();
+
+    /* Calibrate the ADC offset. The STM32WL SAR ADC powers up uncalibrated and
+     * carries a stable few-percent error until this runs — which is what made
+     * VREFINT read ~2 %% high and corrupted the VDDA estimate. Must run with the
+     * ADC disabled (it is, right after init). HAL_ADC_vInit() also runs after
+     * each STOP2 wake, so this re-calibrates whenever the ADC has lost power. */
+    if (HAL_ADCEx_Calibration_Start(&hadc) != HAL_OK)
         Error_Handler();
 
     /* Enable the VREFINT internal channel path up front so its buffer is

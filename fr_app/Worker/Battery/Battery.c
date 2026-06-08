@@ -166,11 +166,12 @@ static void BAT_vSampleTask(void *pvParameters)
         {
             uint16_t u16Vdda = HAL_ADC_u16VddaFromVrefint(u16VrefRaw);
 
-            /* Vpin  = adc_bat * VDDA / full_scale   (voltage at the ADC pin)
-             * Vbatt = Vpin * divider_num / divider_den
-             * Ordered to keep every intermediate within uint32_t. */
-            uint32_t u32Pin  = ((uint32_t)u16BatRaw * u16Vdda) / BAT_ADC_FULL_SCALE;
-            uint16_t u16BatMv = (uint16_t)((u32Pin * BAT_DIVIDER_NUM) / BAT_DIVIDER_DEN);
+            /* Vbatt = adc_bat * VDDA / full_scale * divider_ratio.
+             * Computed in one 64-bit expression to avoid intermediate
+             * truncation; the divider ratio comes from BAT_DIVIDER_NUM/DEN. */
+            uint16_t u16BatMv = (uint16_t)
+                (((uint64_t)u16BatRaw * u16Vdda * BAT_DIVIDER_NUM)
+                 / ((uint64_t)BAT_ADC_FULL_SCALE * BAT_DIVIDER_DEN));
 
             au16BatAvgBuf[u8BatAvgIdx] = u16BatMv;
 
