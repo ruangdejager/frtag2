@@ -50,7 +50,7 @@ void PLATFORM_vInit(void)
 {
     static const osThreadAttr_t heartbeat_attr = {
         .name       = "Heartbeat",
-        .stack_size = configMINIMAL_STACK_SIZE * 8 * sizeof(StackType_t),
+        .stack_size = configMINIMAL_STACK_SIZE * 4 * sizeof(StackType_t),
         .priority   = osPriorityNormal,
     };
 
