@@ -52,6 +52,29 @@ static float fCoulombs;
 /* ---- Forward declarations ---- */
 static void SOLAR_vSampleTask(void *pvParameters);
 static void SOLAR_vCheckSampleScheduleTask(void *pvParameters);
+static bool SOLAR_bConvert(hal_adc_channel_t channel, uint16_t *pu16Result);
+
+/* --------------------------------------------------------------------------
+ * SOLAR_bConvert — one blocking ADC conversion on the given channel.
+ * The ADC must already be enabled. Returns true and writes *pu16Result on
+ * success; false if the end-of-conversion flag never arrived.
+ * -------------------------------------------------------------------------- */
+static bool SOLAR_bConvert(hal_adc_channel_t channel, uint16_t *pu16Result)
+{
+    uint8_t u8DelayMs = 3;
+
+    SOLAR_DRIVER_vCleanInterrupt();
+    HAL_ADC_vStartConversion(channel);
+
+    while (!SOLAR_DRIVER_bGetInterruptFlag() && u8DelayMs--)
+        osDelay(1);
+
+    if (!SOLAR_DRIVER_bGetInterruptFlag())
+        return false;
+
+    *pu16Result = SOLAR_DRIVER_u16GetResult();
+    return true;
+}
 
 /* --------------------------------------------------------------------------
  * SOLAR_vInit
@@ -85,9 +108,9 @@ static void SOLAR_vSampleTask(void *pvParameters)
 {
     (void)pvParameters;
 
-    uint8_t  u8DelayMs;
-    uint16_t u16RawVsolar;
-    uint16_t u16RawRsense;
+    uint16_t u16RawVsolar = 0;
+    uint16_t u16RawRsense = 0;
+    uint16_t u16RawVref   = 0;
 
     for (;;)
     {
@@ -98,43 +121,37 @@ static void SOLAR_vSampleTask(void *pvParameters)
 
         SOLAR_DRIVER_vEnable();
 
-        /* ---- VSOLAR ---- */
-        SOLAR_DRIVER_vCleanInterrupt();
-        SOLAR_DRIVER_vStartVsolar();
-
-        u8DelayMs = 3;
-        while (!SOLAR_DRIVER_bGetInterruptFlag() && u8DelayMs--)
-            osDelay(1);
-
-        u16RawVsolar = SOLAR_DRIVER_u16GetResult();
-
-        /* ---- RSENSE ---- */
-        SOLAR_DRIVER_vCleanInterrupt();
-        SOLAR_DRIVER_vStartRsense();
-
-        u8DelayMs = 3;
-        while (!SOLAR_DRIVER_bGetInterruptFlag() && u8DelayMs--)
-            osDelay(1);
-
-        u16RawRsense = SOLAR_DRIVER_u16GetResult();
+        /* Read VSOLAR, RSENSE and VREFINT in one enabled window. VREFINT gives
+         * the true VDDA so both results are independent of the 1.8 V rail. */
+        bool bConvOk = SOLAR_bConvert(VSOLAR_VOLTAGE_CHANNEL, &u16RawVsolar)
+                    && SOLAR_bConvert(RSENSE_VOLTAGE_CHANNEL, &u16RawRsense)
+                    && SOLAR_bConvert(VREFINT_CHANNEL,        &u16RawVref);
 
         SOLAR_DRIVER_vDisable();
 
         SYSTEM_vSleepLockRelease();
         SOLAR_DRIVER_vUnlock();
 
-        /* ---- Store converted values ---- */
-        u16VsolarLastMV = (uint16_t)MATH_FUNC_i16ConvLin(u16RawVsolar,
-                                                          SOLAR_VSOLAR_ADC_M_NUM,
-                                                          SOLAR_VSOLAR_ADC_M_DEN,
-                                                          SOLAR_VSOLAR_ADC_C);
-        u16RsenseLastMV = (uint16_t)MATH_FUNC_i16ConvLin(u16RawRsense,
-                                                          SOLAR_RSENSE_ADC_M_NUM,
-                                                          SOLAR_RSENSE_ADC_M_DEN,
-                                                          SOLAR_RSENSE_ADC_C);
+        if (!bConvOk)
+        {
+            DBG("solar: ADC conversion timeout — sample skipped\r\n");
+            continue;
+        }
 
-        DBG("solar: Vsolar=%u mV  Vrsense=%u mV  I=%ld mA  P=%lu mW\r\n",
-            u16VsolarLastMV, u16RsenseLastMV,
+        /* ---- Convert to millivolts using the measured VDDA ---- */
+        uint16_t u16Vdda = HAL_ADC_u16VddaFromVrefint(u16RawVref);
+
+        /* Vsolar = adc * VDDA / full_scale * divider_ratio (64-bit, no truncation) */
+        u16VsolarLastMV = (uint16_t)
+            (((uint64_t)u16RawVsolar * u16Vdda * SOLAR_VSOLAR_DIV_NUM)
+             / ((uint64_t)SOLAR_ADC_FULL_SCALE * SOLAR_VSOLAR_DIV_DEN));
+
+        /* Vrsense = adc * VDDA / full_scale (no divider) */
+        u16RsenseLastMV = (uint16_t)
+            (((uint32_t)u16RawRsense * u16Vdda) / SOLAR_ADC_FULL_SCALE);
+
+        DBG("solar: Vsolar=%u mV  Vrsense=%u mV  Vdda=%u mV  I=%ld mA  P=%lu mW\r\n",
+            u16VsolarLastMV, u16RsenseLastMV, u16Vdda,
             SOLAR_i32GetCurrentMA(), SOLAR_u32GetPowerMW());
 
         /* ---- Coulomb accumulation: Q += I(A) × T(s) ---- */
