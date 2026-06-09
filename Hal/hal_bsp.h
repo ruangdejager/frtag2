@@ -60,6 +60,14 @@ static inline void BSP_LED_Off(Led_TypeDef led)
         HAL_GPIO_WritePin(BSP_LED_YELLOW_PORT, BSP_LED_YELLOW_PIN, GPIO_PIN_RESET);
 }
 
+static inline void BSP_LED_Toggle(Led_TypeDef led)
+{
+    if (led == LED_RED)
+        HAL_GPIO_TogglePin(BSP_LED_RED_PORT, BSP_LED_RED_PIN);
+    else
+        HAL_GPIO_TogglePin(BSP_LED_YELLOW_PORT, BSP_LED_YELLOW_PIN);
+}
+
 /* -----------------------------------------------------------------------
  * Debug UART (USART2) — PA2/PA3
  * ----------------------------------------------------------------------- */

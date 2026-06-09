@@ -107,7 +107,7 @@ void PLATFORM_vHeartbeatDispatchTask(void *parameters)
         char buf[32];
         ts = *localtime(&rawtime);
         strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ts);
-        DBG_LOG("%s\r\n", buf);
+        DBG_LOG("%s %dmV\r\n", buf, BAT_u16GetVoltage());
     }
 }
 

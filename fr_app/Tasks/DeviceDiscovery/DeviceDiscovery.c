@@ -34,6 +34,7 @@
 #include "GPS.h"
 #include "SolarPower.h"
 #include "SolarPower_Config.h"
+#include "Debug.h"
 
 /* ---- Private defines ---- */
 #define APP_TASK_STACK_SIZE     (configMINIMAL_STACK_SIZE * 10)
@@ -349,7 +350,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         EVTLOG(LOG_DEVICE_ENTERING_SLEEP, eDeviceRole);
         DBG_LOG("DeviceDiscovery: Waiting for synchronized wake-up...\r\n");
         osDelay(100);
-        BSP_LED_Off(LED_YELLOW);
+//        BSP_LED_Off(LED_YELLOW);
         LORARADIO_vEnterDeepSleep();
         SYSTEM_vActivateDeepSleep();
     }
@@ -387,6 +388,7 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             continue;
         }
 
+        BSP_LED_Toggle(LED_YELLOW);
         if (RTC_u64GetUTC() % ((uint64_t)MESHNETWORK_u8GetWakeupInterval() * 60) == 0)
         {
             if (POWER_tGetState() & POWER_CLASS_NORMAL)
@@ -396,13 +398,14 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                 if (eDeviceRole == DEVICE_ROLE_PRIMARY)
                     FARMRANGER_vUartOnWake();
 
-                /* UART and flash SPI are restored in HAL_SYSTEM_vEnterStop2()
-                 * (SPI via HAL_SPI_vInit, UART via SystemClock_Config restoring
-                 * APB clocks with UART registers intact).  No per-task re-init. */
+                HAL_UART_vInit();
+                DEBUG_vInit();
+
                 LORARADIO_vWakeUp();
 
                 DBG_LOG("\r\n--- WAKEUP ---\r\n");
                 osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_WAKEUP_BIT);
+
             }
         }
     }

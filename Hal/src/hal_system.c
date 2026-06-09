@@ -64,18 +64,6 @@ void SystemClock_Config(void)
     }
 }
 
-void HAL_SYSTEM_vSleepWakeOnRtc(void)
-{
-    HAL_GPIO_vOnSleep();
-
-    HAL_SuspendTick();
-    HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
-    HAL_ResumeTick();
-
-    SystemClock_Config();
-    HAL_GPIO_OnWake();
-}
-
 /* --------------------------------------------------------------------------
  * HAL_SYSTEM_vEnterStop2
  * Parks the core in STOP2 and restores clocks/peripherals on wake. Assumes

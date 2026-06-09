@@ -56,6 +56,9 @@ void FLASH_vInit(void)
             id[0], id[1], id[2], FLASH_MANUFACTURER_ID);
     else
         DBG("FLASH: JEDEC ID %02X %02X %02X OK\r\n", id[0], id[1], id[2]);
+
+    FLASH_vChipErase();
+
 }
 
 bool FLASH_bDeviceBusy(void)
