@@ -69,7 +69,7 @@ void DEVICE_DISCOVERY_vInit(void)
     };
     static const osThreadAttr_t wakeup_attr = {
         .name       = "CheckWakeupSched",
-        .stack_size = configMINIMAL_STACK_SIZE * sizeof(StackType_t),
+        .stack_size = configMINIMAL_STACK_SIZE * 2 * sizeof(StackType_t),
         .priority   = osPriorityNormal,
     };
 
@@ -409,16 +409,18 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
         }
 
 #ifdef ENABLE_GPS
-        /* --- GPS pre-trigger (DEVICE_DISCOVERY_GPS_PRETRIGGER_S before wake) ---
-         * Fire-and-forget: by the time the discovery wake fires, the GPS
-         * dispatcher has either acquired a fresh fix (cached as last-known)
-         * or timed out. The AppTask never waits on this.
-         *
-         * The intervals (15 / 30 / 60 / 120 min × 60 s) are all comfortably
-         * larger than the 180 s pre-trigger window. */
-        if (u32IntervalS > DEVICE_DISCOVERY_GPS_PRETRIGGER_S &&
+        /* --- GPS pre-trigger (SECONDARY only) ---
+         * GPS is not fitted on PRIMARY boards. Fire-and-forget 3 minutes
+         * before each scheduled wake so a fresh fix is cached by the time
+         * the AppTask runs. The AppTask never blocks on a GPS result. */
+        if (eDeviceRole == DEVICE_ROLE_SECONDARY &&
+            u32IntervalS > DEVICE_DISCOVERY_GPS_PRETRIGGER_S &&
             u32Phase == (u32IntervalS - DEVICE_DISCOVERY_GPS_PRETRIGGER_S))
         {
+            SYSTEM_vDeactivateDeepSleep();
+            HAL_UART_vInit();
+            DEBUG_vInit();
+
             DBG("DeviceDiscovery: GPS pre-trigger\r\n");
             GPS_vRequestFix(true);   /* auto-shutdown on completion */
         }
