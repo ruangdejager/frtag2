@@ -9,6 +9,7 @@
 #include "hal_system.h"
 #include "hal_spi.h"
 #include "hal_adc.h"
+#include "hal_uart.h"
 #include "hal_rtc.h"
 #include "tag_hal.h"
 #include "dbg_log.h"
@@ -100,11 +101,11 @@ void HAL_SYSTEM_vEnterStop2(void)
 
     SystemClock_Config();
 
-    /* SPI clocks are gated in STOP2 — restore both peripherals in one call.
-     * Flash SPI must be up before any post-wake log write; ACC SPI must be up
-     * for accelerometer tags. HAL_SPI_vInit() handles both unconditionally. */
-    HAL_SPI_vInit();
-
+    /* Restore peripherals whose clocks / state are lost through STOP2.
+     * Called with interrupts still masked (cpsid i in vPortSuppressTicksAndSleep)
+     * so there is no race with the DbgLog consumer or any other task. */
+    HAL_SPI_vInit();    /* SPI1 (ACC) + SPI2 (flash) — GPIO AF config lost in sleep */
+    HAL_UART_vInit();   /* USART2 debug UART — needs re-init after APB clock gate */
     HAL_ADC_vInit();
     HAL_GPIO_OnWake();
 
