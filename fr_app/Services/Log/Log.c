@@ -77,8 +77,13 @@ void LOG_vInit(void)
     }
     else
     {
-        /* Fine-scan within the first erased sector for exact byte boundary */
-        uint32_t sectorStart = LOG_FLASH_START_ADDR + sectorIdx * FLASH_SECTOR_SIZE_BYTES;
+        /* Fine-scan the last *written* sector (sectorIdx - 1) for the exact
+         * byte boundary.  The binary search found the first erased sector
+         * (where byte[0] == 0xFF) — scanning *that* sector would immediately
+         * hit 0xFF on byte 0 and set u32WriteAddr to the sector's start,
+         * which includes the unwritten 0xFF tail of the previous sector in
+         * LOG_u32GetUsedBytes() and therefore in the dump output. */
+        uint32_t sectorStart = LOG_FLASH_START_ADDR + (sectorIdx - 1U) * FLASH_SECTOR_SIZE_BYTES;
         uint32_t sectorEnd   = sectorStart + FLASH_SECTOR_SIZE_BYTES;
         uint32_t addr        = sectorStart;
         uint8_t  byte;

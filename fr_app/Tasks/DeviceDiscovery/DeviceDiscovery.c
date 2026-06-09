@@ -396,10 +396,9 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                 if (eDeviceRole == DEVICE_ROLE_PRIMARY)
                     FARMRANGER_vUartOnWake();
 
-#ifdef ENABLE_DBG_UART
-                HAL_UART_vInit();
-                DBGLOG_vInit();
-#endif
+                /* UART and flash SPI are restored in HAL_SYSTEM_vEnterStop2()
+                 * (SPI via HAL_SPI_vInit, UART via SystemClock_Config restoring
+                 * APB clocks with UART registers intact).  No per-task re-init. */
                 LORARADIO_vWakeUp();
 
                 DBG_LOG("\r\n--- WAKEUP ---\r\n");
