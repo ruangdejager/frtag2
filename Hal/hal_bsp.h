@@ -94,7 +94,7 @@ static inline void BSP_LED_Toggle(Led_TypeDef led)
 #define BSP_GPS_UART_RX_PORT        GPIOB
 #define BSP_GPS_UART_RX_PIN         GPIO_PIN_7
 #define BSP_GPS_UART_AF             GPIO_AF7_USART1
-#define BSP_GPS_UART_BAUD           115200
+#define BSP_GPS_UART_BAUD           38400    /* MAX-M10S factory default; switch to 115200 via UBX-CFG-VALSET once comms established */
 
 /* GNSS power enable — single pin (replaces 3-pin GPS power from frtag) */
 #define BSP_GNSS_ON_PORT            GPIOA

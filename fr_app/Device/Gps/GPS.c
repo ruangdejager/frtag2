@@ -143,7 +143,6 @@ bool __bFindNext_P(char **p1, const char *p2, bool bAdvance)
  * -------------------------------------------------------------------------- */
 void GPS_vInit(void)
 {
-    GPS_DRIVER_vInitGPS(&gps.UartHandle);
 
     xGpsLock = osMutexNew(NULL);
     configASSERT(xGpsLock != NULL);
@@ -189,11 +188,12 @@ static void GPS_vSessionArm(void)
     if (!bGpsPowered)
     {
         /* Cold start — power the hardware and enable the UART */
+    	GPS_DRIVER_vInitGPS(&gps.UartHandle);
         GPS_DRIVER_vEnableUart(&gps.UartHandle);
         HAL_UART_vClearBuffer(&gps.UartHandle);
         GPS_DRIVER_vPowerEnHigh();
         bGpsPowered = true;
-        DBG("gps: session armed (cold start), ttff timeout=%us\r\n",
+        DBG_LOG("gps: session armed (cold start), ttff timeout=%us\r\n",
             GnssSession.u16TtffTimeout);
     }
     else
@@ -201,7 +201,7 @@ static void GPS_vSessionArm(void)
         /* Re-arm from FIX_HELD — GPS already powered, just reset session state.
          * Flush the UART buffer so stale NMEA from the held session is discarded. */
         HAL_UART_vClearBuffer(&gps.UartHandle);
-        DBG("gps: session re-armed (GPS already on), ttff timeout=%us\r\n",
+        DBG_LOG("gps: session re-armed (GPS already on), ttff timeout=%us\r\n",
             GnssSession.u16TtffTimeout);
     }
 
