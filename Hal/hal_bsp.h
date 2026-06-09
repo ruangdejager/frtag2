@@ -106,13 +106,26 @@ static inline void BSP_LED_Off(Led_TypeDef led)
 
 /* -----------------------------------------------------------------------
  * Battery measurement (ADC)
- * MEAS_BAT_VOLT = PA12 = ADC_IN8
+ * MEAS_BAT_VOLT = PA12 = ADC_IN8, 10k/33k divider, 1.8 V ref
  * ----------------------------------------------------------------------- */
 #define BSP_BAT_BIAS_ENABLE_PORT        GPIOA
 #define BSP_BAT_BIAS_ENABLE_PIN         GPIO_PIN_4
 #define BSP_BAT_MEAS_VOLT_PORT          GPIOA
 #define BSP_BAT_MEAS_VOLT_PIN           GPIO_PIN_12
 #define BSP_BAT_ADC_VOLTAGE_CHANNEL     ADC_CHANNEL_8
+
+/* -----------------------------------------------------------------------
+ * Solar power measurement (ADC)
+ * VSOLAR_MEAS  = PB3 = ADC_IN2, 10k/33k divider, 1.8 V ref
+ * RSENSE_MEAS  = PB4 = ADC_IN3, no divider,       1.8 V ref
+ * ----------------------------------------------------------------------- */
+#define BSP_VSOLAR_MEAS_PORT            GPIOB
+#define BSP_VSOLAR_MEAS_PIN             GPIO_PIN_3
+#define BSP_VSOLAR_ADC_CHANNEL          ADC_CHANNEL_2
+
+#define BSP_RSENSE_MEAS_PORT            GPIOB
+#define BSP_RSENSE_MEAS_PIN             GPIO_PIN_4
+#define BSP_RSENSE_ADC_CHANNEL          ADC_CHANNEL_3
 
 /* -----------------------------------------------------------------------
  * RF switch control — PA9 (HIGH = TX/LP, LOW = RX/OFF)
