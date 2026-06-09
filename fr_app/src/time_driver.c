@@ -135,7 +135,7 @@ void TIME_vTick(void)
     /* Detect DTZ change */
     if (tTimeDayTimeZonePrev != tTimeDayTimeZoneNow)
     {
-        DBG("DTZ change: %s, %s [%u %u %c %c %u %u]\r\n",
+        DBG_LOG("DTZ change: %s, %s [%u %u %c %c %u %u]\r\n",
             TIME_pacGetDayTimeZoneNow(),
             (MOVE_bIsAlarmActiveNow() ? "ACTIVE" : "INACTIVE"),
             MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_MAX_LEVEL),
@@ -149,7 +149,7 @@ void TIME_vTick(void)
     }
 
     if (tTimeSeasonPrev != tTimeSeasonNow)
-        DBG("Season changed; now=%s\r\n", TIME_pacGetSeasonNow());
+        DBG_LOG("Season changed; now=%s\r\n", TIME_pacGetSeasonNow());
 
     tTimeSeasonPrev      = tTimeSeasonNow;
     tTimeDayTimeZonePrev = tTimeDayTimeZoneNow;

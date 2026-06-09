@@ -11,7 +11,6 @@
 #include <stdbool.h>
 
 void SystemClock_Config(void);
-void HAL_SYSTEM_vSleepWakeOnRtc(void);
 bool SYSTEM_bCheckSleepModeStatus(void);
 void SYSTEM_vSleepLockAcquire(void);
 void SYSTEM_vSleepLockRelease(void);

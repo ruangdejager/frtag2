@@ -238,7 +238,7 @@ bool FARMRANGER_bDeviceOn(void)
     FR_DRIVER_vIntEnable();
 
     char respBuf[32] = {0};
-    DBG("Wait for RDY...\r\n");
+    DBG_LOG("Wait for RDY...\r\n");
     if (!FARMRANGER_bATSend(NULL,
                             FARMRANGER_bParseRDY,
                             respBuf,
@@ -246,12 +246,12 @@ bool FARMRANGER_bDeviceOn(void)
                             respBuf,
                             5000))
     {
-        DBG("RDY not received\r\n");
+        DBG_LOG("RDY not received\r\n");
         return false;
     }
 
     bFRDeviceOn = true;
-    DBG("Farmranger Ready.\r\n");
+    DBG_LOG("Farmranger Ready.\r\n");
     return true;
 }
 
@@ -264,7 +264,7 @@ void FARMRANGER_vDeviceOff(void)
     FR_DRIVER_vDisableUart(&farmranger.UartHandle);
     FR_DRIVER_vIntDisable();
     bFRDeviceOn = false;
-    DBG("Farmranger released.\r\n");
+    DBG_LOG("Farmranger released.\r\n");
 }
 
 /* --------------------------------------------------------------------------
@@ -437,8 +437,8 @@ bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
                             respBuf,
                             1000))
     {
-        LOG(LOG_FRLOG_ERROR, 1);
-        DBG("LogData: No 'Logger ready' received.\r\n");
+        EVTLOG(LOG_FRLOG_ERROR, 1);
+        DBG_LOG("LogData: No 'Logger ready' received.\r\n");
         BSP_LED_On(LED_YELLOW);
     }
 
@@ -452,8 +452,8 @@ bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
         /* Wait until TX is fully drained */
         if (osSemaphoreAcquire(xUartTxDoneSem, 3500) != osOK)
         {
-            LOG(LOG_FRLOG_ERROR, 2);
-            DBG("UART TX timeout\r\n");
+            EVTLOG(LOG_FRLOG_ERROR, 2);
+            DBG_LOG("UART TX timeout\r\n");
             return false;
         }
     }
@@ -467,8 +467,8 @@ bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
                             respBuf,
                             3500))
     {
-        DBG("LogData: No final OK received.\r\n");
-        LOG(LOG_FRLOG_ERROR, 3);
+        DBG_LOG("LogData: No final OK received.\r\n");
+        EVTLOG(LOG_FRLOG_ERROR, 3);
         return false;
     }
 

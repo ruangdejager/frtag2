@@ -7,7 +7,7 @@
  * Each record is 8 bytes: 32-bit timestamp + 5-bit event + 27-bit value.
  *
  * Define ENABLE_FLASH_LOG to activate the logger.
- * When the define is absent every API call and LOG() compiles to nothing,
+ * When the define is absent every API call and EVTLOG() compiles to nothing,
  * and the background task is never created.
  */
 
@@ -47,7 +47,7 @@ typedef enum
     LOG_DISCOVERY_COUNT
 } FlashLogEvent;
 
-#define LOG(event, value)   FLASHLOG_vWrite(event, value)
+#define EVTLOG(event, value)   FLASHLOG_vWrite(event, value)
 
 /* API */
 void FLASHLOG_vInit(void);
@@ -64,18 +64,24 @@ void FLASHLOG_vWriteFromISR(uint16_t event, int16_t value,
 
 void FLASHLOG_vEncodeRXLogValue(uint32_t *pBuf, uint16_t id, int16_t rssi, uint8_t res);
 void FLASHLOG_vDecodeRXLogValue(uint32_t value, uint16_t *id, int16_t *rssi, uint8_t *res);
+
+/* Dump is only functional when the debug UART transport is active */
+#ifdef DEBUG_OUTPUT_UART
 void FLASHLOG_vDump(void);
+#else
+#define FLASHLOG_vDump()  do {} while (0)
+#endif
 
 #else /* ENABLE_FLASH_LOG not defined — compile everything out */
 
-#define LOG(event, value)                                                do { } while (0)
-#define FLASHLOG_vInit()                                                 do { } while (0)
-#define FLASHLOG_vDump()                                                 do { } while (0)
-#define FLASHLOG_vWrite(event, value)                                    do { } while (0)
-#define FLASHLOG_vWriteFromISR(event, value, pWoken)                     do { } while (0)
+#define EVTLOG(event, value)                                                 do { } while (0)
+#define FLASHLOG_vInit()                                                     do { } while (0)
+#define FLASHLOG_vDump()                                                     do { } while (0)
+#define FLASHLOG_vWrite(event, value)                                        do { } while (0)
+#define FLASHLOG_vWriteFromISR(event, value, pWoken)                         do { } while (0)
 /* Touch pBuf so the compiler does not warn about the output variable being set but unused */
-#define FLASHLOG_vEncodeRXLogValue(pBuf, id, rssi, res)                  do { (void)(pBuf); } while (0)
-#define FLASHLOG_vDecodeRXLogValue(value, id, rssi, res)                 do { } while (0)
+#define FLASHLOG_vEncodeRXLogValue(pBuf, id, rssi, res)                      do { (void)(pBuf); } while (0)
+#define FLASHLOG_vDecodeRXLogValue(value, id, rssi, res)                     do { } while (0)
 
 #endif /* ENABLE_FLASH_LOG */
 

@@ -171,7 +171,7 @@ bool MOVE_bTick(void)
                 !AccHealth.bErrorFlag)
             {
                 AccHealth.bErrorFlag = true;
-                DBG("+++ MOVE SENSOR ERROR (DEVICE_ID) - alert +++");
+                DBG_LOG("+++ MOVE SENSOR ERROR (DEVICE_ID) - alert +++");
             }
         }
         else
@@ -187,13 +187,13 @@ bool MOVE_bTick(void)
         if (AccHealth.u8NoSampleErrorCnt == MOVE_SENSOR_SAMPLE_ERR_CNT_RESET)
         {
             ACC_vInit();
-            DBG("+++ MOVE SENSOR ERROR (NO_SAMPLE) - reset +++");
+            DBG_LOG("+++ MOVE SENSOR ERROR (NO_SAMPLE) - reset +++");
         }
         if (AccHealth.u8NoSampleErrorCnt == MOVE_SENSOR_SAMPLE_ERR_CNT_ALERT &&
             !AccHealth.bErrorFlag)
         {
             AccHealth.bErrorFlag = true;
-            DBG("+++ MOVE SENSOR ERROR (NO_SAMPLE) - alert +++");
+            DBG_LOG("+++ MOVE SENSOR ERROR (NO_SAMPLE) - alert +++");
         }
     }
 
@@ -206,7 +206,7 @@ bool MOVE_bTick(void)
     {
         AccHealth.u8AlertCnt++;
         AccHealth.bAlertFlag = true;
-        DBG("+++ MOVE SENSOR HEALTH ALARM (%u of %u) +++",
+        DBG_LOG("+++ MOVE SENSOR HEALTH ALARM (%u of %u) +++",
             AccHealth.u8AlertCnt, MOVE_SENSOR_ALERT_COUNT_MAX);
     }
 
@@ -322,13 +322,13 @@ bool MOVE_bUpdateMovementLevel(uint8_t *pu8Level)
             if (AccHealth.u16SampleDeltaErrorCnt == MOVE_SENSOR_DELTA_ERR_CNT_RESET)
             {
                 ACC_vInit();
-                DBG("+++ MOVE SENSOR ERROR (NO_DELTA) - reset +++");
+                DBG_LOG("+++ MOVE SENSOR ERROR (NO_DELTA) - reset +++");
             }
             else if (AccHealth.u16SampleDeltaErrorCnt == MOVE_SENSOR_DELTA_ERR_CNT_ALERT &&
                      !AccHealth.bErrorFlag)
             {
                 AccHealth.bErrorFlag = true;
-                DBG("+++ MOVE SENSOR ERROR (NO_DELTA) - alert +++");
+                DBG_LOG("+++ MOVE SENSOR ERROR (NO_DELTA) - alert +++");
             }
         }
 
@@ -388,7 +388,7 @@ void MOVE_vEvalMovementLevel(void)
                         ((MoveWinA.u8TriggerCnt == 2) &&
                          (bool)MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_SECOND_HOLD)))
                     {
-                        DBG("--- high act alarm | hold (%u/%u) ---",
+                        DBG_LOG("--- high act alarm | hold (%u/%u) ---",
                             MoveWinA.u8TriggerCnt, MoveWinA.u8HoldBackCnt);
 
                         if (MoveHoldback.u8Idx < MOVE_HOLDBACK_BUF_SIZE &&
@@ -449,7 +449,7 @@ void MOVE_vWindowATick(void)
     {
         if (MoveWinA.u8TriggerCnt <= MoveWinA.u8HoldBackCnt)
         {
-            DBG("--- high act alarm | cancel (hold=%u/%u, hwm=%u/%us) ---",
+            DBG_LOG("--- high act alarm | cancel (hold=%u/%u, hwm=%u/%us) ---",
                 MoveWinA.u8TriggerCnt, MoveWinA.u8HoldBackCnt,
                 MoveWinA.u16TmrHwm / 25,
                 MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_MAX_WINDOW));
@@ -466,7 +466,7 @@ void MOVE_vWindowATick(void)
         }
         else
         {
-            DBG("--- high act alarm | done (trig=%u, hold=%u) ---",
+            DBG_LOG("--- high act alarm | done (trig=%u, hold=%u) ---",
                 MoveWinA.u8TriggerCnt, MoveWinA.u8HoldBackCnt);
         }
         memset(&MoveWinA, 0, sizeof(move_window_a_t));
@@ -547,10 +547,10 @@ bool MOVE_bNoActAlertPush(move_not_alarm_state_t tState)
     {
         MoveNotAlarmFifo.Buf[MoveNotAlarmFifo.u8Head].tState = tState;
         MoveNotAlarmFifo.u8Head = u8;
-        DBG("+++ NO ACTIVITY ALARM (%s) +++", (char *)acMoveNoActAlarmState[tState]);
+        DBG_LOG("+++ NO ACTIVITY ALARM (%s) +++", (char *)acMoveNoActAlarmState[tState]);
         return true;
     }
-    DBG("*** no activity alarm buffer ERROR ***");
+    DBG_LOG("*** no activity alarm buffer ERROR ***");
     return false;
 }
 

@@ -186,6 +186,7 @@ void FLASHLOG_vDecodeRXLogValue(uint32_t value,
 
 /* -------------------------------------------------------------------------- */
 
+#ifdef DEBUG_OUTPUT_UART
 void FLASHLOG_vDump(void)
 {
     uint32_t addr = FLASHLOG_START_ADDR;
@@ -287,9 +288,10 @@ void FLASHLOG_vDump(void)
                          timebuf, event, value);
                 break;
         }
-        DBG("%s", buf);
+        DBG_LOG("%s", buf);
         addr += 8;
     }
 }
+#endif /* DEBUG_OUTPUT_UART */
 
 #endif /* ENABLE_FLASH_LOG */
