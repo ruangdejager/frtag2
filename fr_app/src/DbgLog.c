@@ -17,6 +17,7 @@
 #include "stm32wlxx.h"     /* __get_IPSR() */
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"      /* configASSERT */
+#include "task.h"          /* taskDISABLE_INTERRUPTS (used by configASSERT) */
 
 #include <stdarg.h>
 #include <stdio.h>
