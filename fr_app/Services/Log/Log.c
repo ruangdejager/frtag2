@@ -3,15 +3,10 @@
  *
  * Circular FIFO text log on external NOR flash.
  *
- * Asynchronous design:
- *   LOG_vWrite()  — producers (DBGLOG_vPutLog) push bytes into a small RAM ring
- *                   buffer. Fast and bounded: a large burst returns immediately
- *                   and, if the ring is full, excess bytes are dropped rather
- *                   than blocking the caller.
- *   LOG_vDrainTask — a low-priority background task pops bytes from the ring and
- *                   commits them to flash at flash speed (byte-by-byte page
- *                   programs with per-sector erase). The slow ~1 ms/byte flash
- *                   latency therefore never appears on a caller's path.
+ * Synchronous flash primitive: LOG_vWrite() programs bytes directly. It is
+ * called only from the single DbgLog consumer task (see DbgLog.c), which owns
+ * all buffering — so callers of DBG/LOG/DBG_LOG never touch the flash and never
+ * see its latency.
  *
  * Flash FIFO: u32WriteAddr is the head, u32StartAddr is the tail. On every
  * sector-boundary crossing the sector is erased first; once wrapped, the tail
@@ -26,27 +21,13 @@
 #include "Flash_Config.h"
 #include "Debug.h"
 
-#include "cmsis_os2.h"
-#include "FreeRTOS.h"
-#include "task.h"
-
 #include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
 
-/* ---- Flash FIFO state (owned by the drain task) ---- */
 static uint32_t u32WriteAddr;
 static uint32_t u32StartAddr;
 static bool     bWrapped;
-
-/* ---- RAM ring buffer (producers → drain task) ---- */
-#define LOG_RING_SIZE   2048U
-#define LOG_DRAIN_FLAG  0x0001U
-
-static uint8_t           au8Ring[LOG_RING_SIZE];
-static volatile uint16_t u16RingHead;   /* next write slot (producers)  */
-static volatile uint16_t u16RingTail;   /* next read slot (drain task)  */
-static osThreadId_t      xLogDrainTask_handle = NULL;
-
-static void LOG_vDrainTask(void *arg);
 
 /* -------------------------------------------------------------------------- */
 
@@ -113,89 +94,36 @@ void LOG_vInit(void)
         u32StartAddr = LOG_FLASH_START_ADDR;
         bWrapped     = false;
     }
-
-    u16RingHead = 0U;
-    u16RingTail = 0U;
-
-    static const osThreadAttr_t drain_attr = {
-        .name       = "LogDrain",
-        .stack_size = configMINIMAL_STACK_SIZE * 2 * sizeof(StackType_t),
-        .priority   = osPriorityLow,   /* drain in the background */
-    };
-    xLogDrainTask_handle = osThreadNew(LOG_vDrainTask, NULL, &drain_attr);
-    configASSERT(xLogDrainTask_handle != NULL);
 }
 
 /* -------------------------------------------------------------------------- */
 
-/* Commit a single byte to the flash FIFO (drain-task context only). */
-static void LOG_vFlushByte(uint8_t byte)
-{
-    /* Erase the sector when crossing into a new one */
-    if ((u32WriteAddr % FLASH_SECTOR_SIZE_BYTES) == 0U)
-    {
-        FLASH_vSectorErase(u32WriteAddr);
-        if (bWrapped)
-        {
-            /* Advance tail past the freshly-erased sector */
-            u32StartAddr = u32WriteAddr + FLASH_SECTOR_SIZE_BYTES;
-            if (u32StartAddr >= LOG_FLASH_END_ADDR)
-                u32StartAddr = LOG_FLASH_START_ADDR;
-        }
-    }
-
-    FLASH_vPageWrite(u32WriteAddr, &byte, 1U);
-    u32WriteAddr++;
-
-    if (u32WriteAddr >= LOG_FLASH_END_ADDR)
-    {
-        u32WriteAddr = LOG_FLASH_START_ADDR;
-        bWrapped     = true;
-    }
-}
-
-static void LOG_vDrainTask(void *arg)
-{
-    (void)arg;
-    for (;;)
-    {
-        osThreadFlagsWait(LOG_DRAIN_FLAG, osFlagsWaitAny, osWaitForever);
-
-        /* Drain everything currently queued. Single consumer: only this task
-         * advances u16RingTail. */
-        while (u16RingTail != u16RingHead)
-        {
-            uint8_t byte = au8Ring[u16RingTail];
-            LOG_vFlushByte(byte);
-            u16RingTail = (uint16_t)((u16RingTail + 1U) % LOG_RING_SIZE);
-        }
-    }
-}
-
-/* -------------------------------------------------------------------------- */
-
-/*
- * Producer: enqueue bytes into the RAM ring and wake the drain task. Bounded
- * and non-blocking — if the ring is full the remaining bytes are dropped.
- * The critical section makes this safe for multiple producer tasks.
- */
 void LOG_vWrite(const char *buf, uint16_t len)
 {
-    if (xLogDrainTask_handle == NULL)
-        return;   /* not initialised yet */
-
-    taskENTER_CRITICAL();
     for (uint16_t i = 0U; i < len; i++)
     {
-        uint16_t u16Next = (uint16_t)((u16RingHead + 1U) % LOG_RING_SIZE);
-        if (u16Next == u16RingTail)
-            break;                       /* ring full — drop remainder */
-        au8Ring[u16RingHead] = (uint8_t)buf[i];
-        u16RingHead = u16Next;
-    }
-    taskEXIT_CRITICAL();
+        /* Erase the sector when crossing into a new one */
+        if ((u32WriteAddr % FLASH_SECTOR_SIZE_BYTES) == 0U)
+        {
+            FLASH_vSectorErase(u32WriteAddr);
+            if (bWrapped)
+            {
+                /* Advance tail past the freshly-erased sector */
+                u32StartAddr = u32WriteAddr + FLASH_SECTOR_SIZE_BYTES;
+                if (u32StartAddr >= LOG_FLASH_END_ADDR)
+                    u32StartAddr = LOG_FLASH_START_ADDR;
+            }
+        }
 
-    osThreadFlagsSet(xLogDrainTask_handle, LOG_DRAIN_FLAG);
+        FLASH_vPageWrite(u32WriteAddr, (const uint8_t *)&buf[i], 1U);
+        u32WriteAddr++;
+
+        if (u32WriteAddr >= LOG_FLASH_END_ADDR)
+        {
+            u32WriteAddr = LOG_FLASH_START_ADDR;
+            bWrapped     = true;
+        }
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -220,11 +148,6 @@ uint8_t LOG_u8GetUsedPercent(void)
 
 void LOG_vErase(void)
 {
-    taskENTER_CRITICAL();
-    u16RingHead = 0U;
-    u16RingTail = 0U;
-    taskEXIT_CRITICAL();
-
     FLASH_vChipErase();
     u32WriteAddr = LOG_FLASH_START_ADDR;
     u32StartAddr = LOG_FLASH_START_ADDR;
@@ -235,6 +158,13 @@ void LOG_vErase(void)
 
 void LOG_vStreamToDebug(void)
 {
+    char hdr[64];
+    int  n = snprintf(hdr, sizeof(hdr),
+                      "\r\n==== EXT-FLASH LOG DUMP (%lu bytes) ====\r\n",
+                      (unsigned long)LOG_u32GetUsedBytes());
+    if (n > 0)
+        DEBUG_vPutBuffer((const uint8_t *)hdr, (uint16_t)n);
+
     uint32_t u32Remaining = LOG_u32GetUsedBytes();
     uint32_t u32Addr      = u32StartAddr;        /* FIFO tail = oldest byte */
     uint8_t  au8Chunk[64];
@@ -245,7 +175,6 @@ void LOG_vStreamToDebug(void)
                           ? (uint16_t)sizeof(au8Chunk)
                           : (uint16_t)u32Remaining;
 
-        /* Do not read across the FIFO end in a single read */
         if ((u32Addr + u16Chunk) > LOG_FLASH_END_ADDR)
             u16Chunk = (uint16_t)(LOG_FLASH_END_ADDR - u32Addr);
 
@@ -258,4 +187,7 @@ void LOG_vStreamToDebug(void)
 
         u32Remaining -= u16Chunk;
     }
+
+    static const char end[] = "\r\n==== EXT-FLASH LOG DUMP END ====\r\n";
+    DEBUG_vPutBuffer((const uint8_t *)end, (uint16_t)(sizeof(end) - 1U));
 }

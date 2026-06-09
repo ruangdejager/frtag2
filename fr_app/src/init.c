@@ -77,15 +77,11 @@ void INIT_vInitialization(void *parameters)
     FLASH_vInit();
     LOG_vInit();
 
-    /* Stream the external-flash text log over the debug UART. Runs before any
-     * operational task is created, so there is no concurrent writer. After a
-     * reset this shows everything DBG_LOG()/LOG() persisted in the previous run —
-     * the readback test for the external flash. The markers use the UART-only
-     * path so they are not themselves written back into the flash log. */
-    DBGLOG_vPutDebug("\r\n==== EXT-FLASH LOG DUMP (%lu bytes) ====\r\n",
-                     (unsigned long)LOG_u32GetUsedBytes());
-    LOG_vStreamToDebug();
-    DBGLOG_vPutDebug("\r\n==== EXT-FLASH LOG DUMP END ====\r\n");
+    /* Ask the DbgLog consumer to stream the external-flash log over the debug
+     * UART once it runs — this replays everything DBG_LOG()/LOG() persisted in
+     * the previous run (the ext-flash readback test). Routed through the
+     * consumer so the dump never interleaves with live log output. */
+    DBGLOG_vRequestDump();
 
     FLASHLOG_vDump();     /* no-op unless ENABLE_FLASH_LOG + DEBUG_OUTPUT_UART both defined */
 
