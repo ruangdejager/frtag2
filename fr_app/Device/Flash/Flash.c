@@ -38,7 +38,6 @@ static void FLASH_vWriteEnable(void)
 
 void FLASH_vInit(void)
 {
-    HAL_SPI_FLASH_vInit();
     FLASH_vReleaseDeepPowerDown();
     osDelay(1);
 
@@ -53,7 +52,7 @@ void FLASH_vInit(void)
     FLASH_DRIVER_vDeselect();
 
     if (id[0] != FLASH_MANUFACTURER_ID)
-        DBG("FLASH: JEDEC ID mismatch — got %02X %02X %02X (expected mfr %02X)\r\n",
+        DBG("FLASH: JEDEC ID mismatch - got %02X %02X %02X (expected mfr %02X)\r\n",
             id[0], id[1], id[2], FLASH_MANUFACTURER_ID);
     else
         DBG("FLASH: JEDEC ID %02X %02X %02X OK\r\n", id[0], id[1], id[2]);

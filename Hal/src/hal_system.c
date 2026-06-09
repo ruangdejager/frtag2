@@ -19,7 +19,7 @@
 
 #define MS_PER_DAY   86400000U
 
-static bool bSleepActive = true;
+static bool bSleepActive = false;
 static volatile uint32_t gSleepLockCount = 0;
 
 void SystemClock_Config(void)
@@ -100,17 +100,10 @@ void HAL_SYSTEM_vEnterStop2(void)
 
     SystemClock_Config();
 
-    /* SPI clocks are stopped in STOP2 — reconfigure for accelerometer tags. */
-#ifdef ENABLE_MOVE
-    if (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY)
-        HAL_SPI_vInit();
-#endif
-
-    /* Restore the external-flash SPI too: its clock is gated in STOP2, and the
-     * text log (DBG/LOG -> ext flash) is written by tasks that run right after
-     * wake (e.g. the heartbeat). Without this a post-wake flash write would
-     * stall on an unconfigured SPI. Allocation-free, so safe in this context. */
-    HAL_SPI_FLASH_vInit();
+    /* SPI clocks are gated in STOP2 — restore both peripherals in one call.
+     * Flash SPI must be up before any post-wake log write; ACC SPI must be up
+     * for accelerometer tags. HAL_SPI_vInit() handles both unconditionally. */
+    HAL_SPI_vInit();
 
     HAL_ADC_vInit();
     HAL_GPIO_OnWake();

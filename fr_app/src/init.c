@@ -69,6 +69,10 @@ void INIT_vInitialization(void *parameters)
 
     HAL_UART_vInit();
 
+    /* Both SPI peripherals (ACC + flash) must be up before FLASH_vInit and any
+     * DBG_LOG call that writes to ext-flash.  Single call covers both. */
+    HAL_SPI_vInit();
+
 #ifdef LISTENER_MODE
     FARMRANGER_vInit();   /* must be first — DBG_LOG() routes through this */
 #endif
@@ -118,7 +122,6 @@ void INIT_vInitialization(void *parameters)
     {
         SOLAR_vInit();
 #ifdef ENABLE_MOVE
-        HAL_SPI_vInit();
         ACC_vInit();
         MOVE_vInit();
 #endif
