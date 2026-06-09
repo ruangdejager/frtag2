@@ -9,7 +9,6 @@
 #include "hal_system.h"
 #include "hal_spi.h"
 #include "hal_adc.h"
-#include "hal_uart.h"
 #include "hal_rtc.h"
 #include "tag_hal.h"
 #include "dbg_log.h"
@@ -20,7 +19,7 @@
 
 #define MS_PER_DAY   86400000U
 
-static bool bSleepActive = false;
+static bool bSleepActive = true;
 static volatile uint32_t gSleepLockCount = 0;
 
 void SystemClock_Config(void)
@@ -101,13 +100,23 @@ void HAL_SYSTEM_vEnterStop2(void)
 
     SystemClock_Config();
 
-    /* Restore peripherals whose clocks / state are lost through STOP2.
-     * Called with interrupts still masked (cpsid i in vPortSuppressTicksAndSleep)
-     * so there is no race with the DbgLog consumer or any other task. */
-    HAL_SPI_vInit();    /* SPI1 (ACC) + SPI2 (flash) — GPIO AF config lost in sleep */
-    HAL_UART_vInit();   /* USART2 debug UART — needs re-init after APB clock gate */
-    HAL_ADC_vInit();
+    /* Restore peripherals after STOP2.  Called with interrupts still masked
+     * (cpsid i in vPortSuppressTicksAndSleep) so there is no race with any task.
+     *
+     * Order matters: HAL_GPIO_OnWake() must run first so that GPIOA/B/C clocks
+     * are enabled before HAL_SPI_vInit() calls HAL_GPIO_Init() for SPI pins.
+     * HAL_GPIO_vOnSleep() only gated the AHB clock — it did NOT modify MODER/AFR —
+     * so the pin configuration is intact; we just need the bus clock restored.
+     *
+     * USART2 needs no explicit re-init: STOP2 retains both the APB1ENR clock-
+     * enable bit and the full USART2 register state (BRR, CR1, CR2, CR3).
+     * SystemClock_Config() above restores the APB bus, so USART2 is already live
+     * with its pre-sleep baud-rate and interrupt settings.  Calling HAL_UART_vInit()
+     * here would be actively harmful — it ends with __HAL_RCC_USART2_CLK_DISABLE()
+     * (boot-time design: clock off until vSetup/vEnable) which silences the TX path. */
     HAL_GPIO_OnWake();
+    HAL_SPI_vInit();    /* SPI1 (ACC) + SPI2 (flash) */
+    HAL_ADC_vInit();
 
     BSP_LED_On(LED_RED);
 }
