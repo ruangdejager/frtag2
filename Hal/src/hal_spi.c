@@ -10,8 +10,31 @@
 #include "hal_bsp.h"
 #include "stm32wle5xx.h"
 
+#include <string.h>
+
 SPI_HandleTypeDef hAccSpi;
 SPI_HandleTypeDef hFlashSpi;
+
+/* --------------------------------------------------------------------------
+ * HAL_SPI_FLASH_vReadPacket
+ * Reads 'len' bytes from the flash by clocking out 0xFF dummy bytes via
+ * full-duplex TransmitReceive (HAL_SPI_Receive does not clock in 2-line
+ * master mode). Chunked so the dummy buffer stays small.
+ * -------------------------------------------------------------------------- */
+void HAL_SPI_FLASH_vReadPacket(uint8_t *rx, uint16_t len)
+{
+    uint8_t  au8Dummy[64];
+    memset(au8Dummy, 0xFF, sizeof(au8Dummy));
+
+    uint16_t u16Off = 0U;
+    while (u16Off < len)
+    {
+        uint16_t u16N = (uint16_t)((len - u16Off) > sizeof(au8Dummy)
+                                   ? sizeof(au8Dummy) : (len - u16Off));
+        HAL_SPI_TransmitReceive(&hFlashSpi, au8Dummy, rx + u16Off, u16N, SPI_TIMEOUT);
+        u16Off = (uint16_t)(u16Off + u16N);
+    }
+}
 
 /* --------------------------------------------------------------------------
  * HAL_SPI_vInit
