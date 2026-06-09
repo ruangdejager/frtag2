@@ -14,7 +14,8 @@
 #include "GPS.h"
 #include "Power.h"
 #include "platform_rtc.h"
-#include "debug_uart_output.h"
+#include "dbg_log.h"
+#include "Debug.h"
 
 #include <limits.h>
 
@@ -166,7 +167,7 @@ void GPS_vInit(void)
     GPS_vDispatcherTask_handle = osThreadNew(GPS_vDispatcherTask, NULL, &disp_attr);
     configASSERT(GPS_vDispatcherTask_handle != NULL);
 
-    DBG("gps: init\r\n");
+    DBG_LOG("gps: init\r\n");
 }
 
 /* --------------------------------------------------------------------------
@@ -205,6 +206,7 @@ static void GPS_vSessionArm(void)
     }
 
     eState = GPS_STATE_ACQUIRING;
+    DBG_LOG("gps: start, ttff timeout=%us\r\n", GnssSession.u16TtffTimeout);
 }
 
 /* --------------------------------------------------------------------------
@@ -218,7 +220,7 @@ static void GPS_vPowerOff(void)
     GPS_DRIVER_vPowerEnLow();
     GPS_DRIVER_vDisableUart(&gps.UartHandle);
     eState = GPS_STATE_IDLE;
-    DBG("gps: powered off\r\n");
+    DBG_LOG("gps: powered off\r\n");
 }
 
 /* --------------------------------------------------------------------------
@@ -403,11 +405,11 @@ bool GPS_bOnRxByte(char pcRxByte)
     {
         acGpsRxBuf[u8GpsRxBufIdx] = pcRxByte;
         acGpsRxBuf[u8NextIdx]     = 0;
-        DBG_UART_vPutByte((uint8_t)pcRxByte);
+        DEBUG_vPutByte((uint8_t)pcRxByte);
     }
     else
     {
-        DBG("gps: rx buf overflow\r\n");
+        DBG_LOG("gps: rx buf overflow\r\n");
         u8NextIdx = 0;
         memset(acGpsRxBuf, 0, sizeof(acGpsRxBuf));
     }
@@ -499,7 +501,7 @@ void GNSS_vOnSolution(void)
     else
     {
         if (GnssSession.u8ValidFixCount != 0)
-            DBG("gps: fix LOST at t=%us (had %u valid fixes)\r\n",
+            DBG_LOG("gps: fix LOST at t=%us (had %u valid fixes)\r\n",
                 u16SessionTmr, GnssSession.u8ValidFixCount);
         GnssSession.u8ValidFixCount  = 0;
         GnssSession.bHasStableFixNow = false;
@@ -537,7 +539,7 @@ void GNSS_vOnSolution(void)
             /* First stable fix of this session — sync RTC then wake dispatcher */
             bCallerNotified = true;
             GPS_vMaybeSyncRtc(GnssSol.u32TimeUnix);
-            DBG("gps: FIX OK t=%us lat=%i.%06lu lon=%i.%06lu\r\n",
+            DBG_LOG("gps: FIX OK t=%us lat=%i.%06lu lon=%i.%06lu\r\n",
                 GnssSession.u16TimeToFirstFix,
                 GnssSol.Lat.Deg.i16Deg,  GnssSol.Lat.Deg.u32DeciMicroDeg,
                 GnssSol.Long.Deg.i16Deg, GnssSol.Long.Deg.u32DeciMicroDeg);
@@ -562,14 +564,14 @@ void GNSS_vOnSolution(void)
             u64LastFixUtc = RTC_u64GetUTC();
             bHasEverFixed = true;
             taskEXIT_CRITICAL();
-            DBG("gps: FIX TIMEOUT t=%us, using best fix: lat=%i.%06lu lon=%i.%06lu\r\n",
+            DBG_LOG("gps: FIX TIMEOUT t=%us, using best fix: lat=%i.%06lu lon=%i.%06lu\r\n",
                 GnssSession.u16TtffTmr,
                 GnssSol.Lat.Deg.i16Deg,  GnssSol.Lat.Deg.u32DeciMicroDeg,
                 GnssSol.Long.Deg.i16Deg, GnssSol.Long.Deg.u32DeciMicroDeg);
         }
         else
         {
-            DBG("gps: FIX TIMEOUT t=%us, no valid fix\r\n", GnssSession.u16TtffTmr);
+            DBG_LOG("gps: FIX TIMEOUT t=%us, no valid fix\r\n", GnssSession.u16TtffTmr);
         }
         /* Attempt RTC sync regardless of position validity — NMEA time fields
          * are typically decoded well before a position fix is declared. */
@@ -582,23 +584,23 @@ void GNSS_vOnSolution(void)
     if (!GnssSession.bDbgStartFlag)
     {
         if (GnssSol.PositionError.bHasValue)
-            DBG("gps ttff, sv, snr, fix_cnt, pos_err, [d_lat, d_long]\r\n");
+            DBG_LOG("gps ttff, sv, snr, fix_cnt, pos_err, [d_lat, d_long]\r\n");
         else
-            DBG("gps ttff, sv, snr, fix_cnt, [d_lat, d_long]\r\n");
+            DBG_LOG("gps ttff, sv, snr, fix_cnt, [d_lat, d_long]\r\n");
     }
     GnssSession.bDbgStartFlag = true;
 
     if (GnssSyslogFlag && !GnssSession.bDbgStopFlag)
     {
         if (GnssSol.PositionError.bHasValue)
-            DBG("gps %02u/%02u, %02u/%02u, %u, %u, %u, [%i,%i]\r\n",
+            DBG_LOG("gps %02u/%02u, %02u/%02u, %u, %u, %u, [%i,%i]\r\n",
                 GnssSession.u16TtffTmr, GnssSession.u16TtffTimeout,
                 GnssSol.Sv.u8SvTracking, GnssSol.Sv.u8SvInView,
                 GnssSol.Sv.u8SnrAvgDbHz, GnssSession.u8ValidFixCount,
                 GnssSol.PositionError.u16ValueInt,
                 (int16_t)i32LatDelta, (int16_t)i32LongDelta);
         else
-            DBG("gps %02u/%02u, %02u/%02u, %u, %u, [%i,%i]\r\n",
+            DBG_LOG("gps %02u/%02u, %02u/%02u, %u, %u, [%i,%i]\r\n",
                 GnssSession.u16TtffTmr, GnssSession.u16TtffTimeout,
                 GnssSol.Sv.u8SvTracking, GnssSol.Sv.u8SvInView,
                 GnssSol.Sv.u8SnrAvgDbHz, GnssSession.u8ValidFixCount,

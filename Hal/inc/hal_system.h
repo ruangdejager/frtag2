@@ -11,7 +11,6 @@
 #include <stdbool.h>
 
 void SystemClock_Config(void);
-void HAL_SYSTEM_vSleepWakeOnRtc(void);
 bool SYSTEM_bCheckSleepModeStatus(void);
 void SYSTEM_vSleepLockAcquire(void);
 void SYSTEM_vSleepLockRelease(void);
@@ -20,10 +19,9 @@ void SYSTEM_vDeactivateDeepSleep(void);
 bool SYSTEM_bIsDeepSleepActive(void);
 void Error_Handler(void);
 
-/* Weak hooks called by PreSleepProcessing / PostSleepProcessing.
- * Override in the application layer to perform role-specific peripheral
- * reinitialisation around STOP2 sleep. */
-void HAL_SYSTEM_vOnPreSleep(void);
-void HAL_SYSTEM_vOnPostWake(void);
+/* Enters STOP2 and restores clocks/peripherals on wake. Called from the
+ * tickless-idle sleep path (vPortSuppressTicksAndSleep) with interrupts
+ * already masked and deep-sleep eligibility already decided. */
+void HAL_SYSTEM_vEnterStop2(void);
 
 #endif /* INC_HAL_SYSTEM_H_ */

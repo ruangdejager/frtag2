@@ -60,6 +60,14 @@ static inline void BSP_LED_Off(Led_TypeDef led)
         HAL_GPIO_WritePin(BSP_LED_YELLOW_PORT, BSP_LED_YELLOW_PIN, GPIO_PIN_RESET);
 }
 
+static inline void BSP_LED_Toggle(Led_TypeDef led)
+{
+    if (led == LED_RED)
+        HAL_GPIO_TogglePin(BSP_LED_RED_PORT, BSP_LED_RED_PIN);
+    else
+        HAL_GPIO_TogglePin(BSP_LED_YELLOW_PORT, BSP_LED_YELLOW_PIN);
+}
+
 /* -----------------------------------------------------------------------
  * Debug UART (USART2) — PA2/PA3
  * ----------------------------------------------------------------------- */
@@ -106,13 +114,39 @@ static inline void BSP_LED_Off(Led_TypeDef led)
 
 /* -----------------------------------------------------------------------
  * Battery measurement (ADC)
- * MEAS_BAT_VOLT = PA12 = ADC_IN8
+ * MEAS_BAT_VOLT = PA12 = ADC_IN8, 10k/33k divider, 1.8 V ref
  * ----------------------------------------------------------------------- */
 #define BSP_BAT_BIAS_ENABLE_PORT        GPIOA
 #define BSP_BAT_BIAS_ENABLE_PIN         GPIO_PIN_4
 #define BSP_BAT_MEAS_VOLT_PORT          GPIOA
 #define BSP_BAT_MEAS_VOLT_PIN           GPIO_PIN_12
 #define BSP_BAT_ADC_VOLTAGE_CHANNEL     ADC_CHANNEL_8
+
+/* -----------------------------------------------------------------------
+ * External Flash SPI (SPI2) — PA5/PA8/PA10/PA15
+ * AT25EU0041A-SSHN-T, 512 KB NOR flash
+ * ----------------------------------------------------------------------- */
+#define BSP_FLASH_MISO_PORT         GPIOA
+#define BSP_FLASH_MISO_PIN          GPIO_PIN_5
+#define BSP_FLASH_SCK_PORT          GPIOA
+#define BSP_FLASH_SCK_PIN           GPIO_PIN_8
+#define BSP_FLASH_MOSI_PORT         GPIOA
+#define BSP_FLASH_MOSI_PIN          GPIO_PIN_10
+#define BSP_FLASH_CS_PORT           GPIOA
+#define BSP_FLASH_CS_PIN            GPIO_PIN_15
+
+/* -----------------------------------------------------------------------
+ * Solar power measurement (ADC)
+ * VSOLAR_MEAS  = PB3 = ADC_IN2, 10k/33k divider, 1.8 V ref
+ * RSENSE_MEAS  = PB4 = ADC_IN3, no divider,       1.8 V ref
+ * ----------------------------------------------------------------------- */
+#define BSP_VSOLAR_MEAS_PORT            GPIOB
+#define BSP_VSOLAR_MEAS_PIN             GPIO_PIN_3
+#define BSP_VSOLAR_ADC_CHANNEL          ADC_CHANNEL_2
+
+#define BSP_RSENSE_MEAS_PORT            GPIOB
+#define BSP_RSENSE_MEAS_PIN             GPIO_PIN_4
+#define BSP_RSENSE_ADC_CHANNEL          ADC_CHANNEL_3
 
 /* -----------------------------------------------------------------------
  * RF switch control — PA9 (HIGH = TX/LP, LOW = RX/OFF)

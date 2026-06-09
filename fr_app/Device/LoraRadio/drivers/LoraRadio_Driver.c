@@ -94,7 +94,7 @@ bool LORARADIO_DRIVER_bTransmitPayload(uint8_t *payload, uint8_t payload_length)
 
     if (u8ChipMode != RADIO_CHIP_MODE_STDBY_RC && u8ChipMode != RADIO_CHIP_MODE_STDBY_XOSC)
     {
-        DBG("LoraRadio_Driver: Radio not in standby (mode: 0x%02X). Forcing STDBY_RC.\r\n",
+        DBG_LOG("LoraRadio_Driver: Radio not in standby (mode: 0x%02X). Forcing STDBY_RC.\r\n",
             u8ChipMode);
         SUBGRF_SetStandby(STDBY_RC);
         osDelay(5);
@@ -103,7 +103,7 @@ bool LORARADIO_DRIVER_bTransmitPayload(uint8_t *payload, uint8_t payload_length)
         u8ChipMode   = tRadioStatus.Fields.ChipMode;
         if (u8ChipMode != RADIO_CHIP_MODE_STDBY_RC && u8ChipMode != RADIO_CHIP_MODE_STDBY_XOSC)
         {
-            DBG("LoraRadio_Driver: Failed to enter standby. TX aborted.\r\n");
+            DBG_LOG("LoraRadio_Driver: Failed to enter standby. TX aborted.\r\n");
             return false;
         }
     }
@@ -135,7 +135,7 @@ bool LORARADIO_DRIVER_bTransmitPayload(uint8_t *payload, uint8_t payload_length)
      * event is left in the notification word after this returns. */
     uint32_t r = osThreadFlagsWait(ALL_FLAGS, osFlagsWaitAny, 1000);
     bool bSuccess = (!(r & osFlagsError) && (r & RADIO_EVT_TX_DONE));
-    DBG("LoraRadio: TX %s\r\n", bSuccess ? "done" : "failed (timeout or error)");
+    DBG_LOG("LoraRadio: TX %s\r\n", bSuccess ? "done" : "failed (timeout or error)");
     return bSuccess;
 }
 

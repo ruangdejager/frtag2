@@ -50,7 +50,7 @@ void PLATFORM_vInit(void)
 {
     static const osThreadAttr_t heartbeat_attr = {
         .name       = "Heartbeat",
-        .stack_size = configMINIMAL_STACK_SIZE * 4 * sizeof(uint32_t),
+        .stack_size = configMINIMAL_STACK_SIZE * 4 * sizeof(StackType_t),
         .priority   = osPriorityNormal,
     };
 
@@ -99,13 +99,15 @@ void PLATFORM_vHeartbeatDispatchTask(void *parameters)
         osMutexRelease(SubMutex);
         /* ------------------------------------------------------------------ */
 
-        /* Print current UTC time to debug output */
+        /* Print current UTC time — DBG_LOG so the 1 Hz tick is persisted to the
+         * external-flash log (useful as a timeline during the preproduction
+         * phase). Enqueues asynchronously; the flash write happens off-path. */
         time_t rawtime = (time_t)RTC_u64GetUTC();
         struct tm ts;
         char buf[32];
         ts = *localtime(&rawtime);
         strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ts);
-        DBG("%s\r\n", buf);
+        DBG_LOG("%s %dmV\r\n", buf, BAT_u16GetVoltage());
     }
 }
 
