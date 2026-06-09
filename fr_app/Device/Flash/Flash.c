@@ -41,8 +41,22 @@ void FLASH_vInit(void)
     HAL_SPI_FLASH_vInit();
     FLASH_vReleaseDeepPowerDown();
     osDelay(1);
-    if (!FLASH_bVerifyDevice())
-        DBG("FLASH: JEDEC ID mismatch — check hardware\r\n");
+
+    /* Read and report the raw JEDEC ID so a mismatch shows what came back:
+     * 00s => no clock/data (AF or wiring), FFs => MISO idle / CS not asserting,
+     * other => CPOL/CPHA or wrong part. */
+    uint8_t cmd   = FLASH_CMD_JEDEC_ID;
+    uint8_t id[3] = {0};
+    FLASH_DRIVER_vSelect();
+    FLASH_DRIVER_vWrite(&cmd, 1);
+    FLASH_DRIVER_vRead(id, 3);
+    FLASH_DRIVER_vDeselect();
+
+    if (id[0] != FLASH_MANUFACTURER_ID)
+        DBG("FLASH: JEDEC ID mismatch — got %02X %02X %02X (expected mfr %02X)\r\n",
+            id[0], id[1], id[2], FLASH_MANUFACTURER_ID);
+    else
+        DBG("FLASH: JEDEC ID %02X %02X %02X OK\r\n", id[0], id[1], id[2]);
 }
 
 bool FLASH_bDeviceBusy(void)

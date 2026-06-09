@@ -41,7 +41,7 @@ extern SPI_HandleTypeDef hFlashSpi;
 #define FLASH_SPI_CLK_ENABLE()  __HAL_RCC_SPI2_CLK_ENABLE()
 #define FLASH_SPI_CLK_DISABLE() __HAL_RCC_SPI2_CLK_DISABLE()
 #define FLASH_PORT_CLK_ENABLE() __HAL_RCC_GPIOA_CLK_ENABLE()
-#define FLASH_SPI_AF            GPIO_AF5_SPI2   /* verify against STM32WLE5CC datasheet */
+#define FLASH_SPI_AF            GPIO_AF3_SPI2   /* SPI2 on PA5/PA8/PA10 is AF3 (AF5 is the PB/PC mapping) */
 
 void HAL_SPI_FLASH_vInit(void);
 void HAL_SPI_FLASH_vDeInit(void);
