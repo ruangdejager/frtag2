@@ -43,6 +43,7 @@
 #  include "RadioTest.h"
 #endif
 #include "Battery.h"
+#include "SolarPower.h"
 #include "Power.h"
 
 #include "flashLog.h"
@@ -109,6 +110,7 @@ void INIT_vInitialization(void *parameters)
 
     if (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY)
     {
+        SOLAR_vInit();
 #ifdef ENABLE_MOVE
         HAL_SPI_vInit();
         ACC_vInit();

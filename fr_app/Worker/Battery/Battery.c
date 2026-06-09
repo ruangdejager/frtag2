@@ -20,6 +20,7 @@
 
 #include "Battery.h"
 #include "hal_bsp.h"
+#include "hal_adc.h"
 #include "hal_system.h"
 #include "Battery_Driver.h"
 #include "Battery_Config.h"
@@ -59,6 +60,29 @@ uint16_t u16BatPreviousSample;
 static void BAT_vSampleTask(void *pvParameters);
 static void BAT_vBufferPurgeTask(void *pvParameters);
 static void BAT_vCheckSampleScheduleTask(void *pvParameters);
+static bool BAT_bConvert(hal_adc_channel_t channel, uint16_t *pu16Result);
+
+/* --------------------------------------------------------------------------
+ * BAT_bConvert — one blocking ADC conversion on the given channel.
+ * The ADC must already be enabled. Returns true and writes *pu16Result on
+ * success; false if the end-of-conversion flag never arrived.
+ * -------------------------------------------------------------------------- */
+static bool BAT_bConvert(hal_adc_channel_t channel, uint16_t *pu16Result)
+{
+    uint8_t u8DelayMs = 3;
+
+    BAT_DRIVER_vCleanInterrupt();
+    HAL_ADC_vStartConversion(channel);
+
+    while (!BAT_DRIVER_bGetInterruptFlag() && u8DelayMs--)
+        osDelay(1);
+
+    if (!BAT_DRIVER_bGetInterruptFlag())
+        return false;
+
+    *pu16Result = BAT_DRIVER_u16GetResult();
+    return true;
+}
 
 /* --------------------------------------------------------------------------
  * BAT_vInit
@@ -98,7 +122,6 @@ static void BAT_vSampleTask(void *pvParameters)
     bool     bDeltaLimit;
     bool     bPurge;
     uint8_t  u8DelayMs;
-    uint16_t u16AdcResult;
 
     for (;;)
     {
@@ -107,6 +130,7 @@ static void BAT_vSampleTask(void *pvParameters)
             osFlagsWaitAny,
             osWaitForever);
 
+        HAL_ADC_vLock();
         SYSTEM_vSleepLockAcquire();
 
         bDeltaLimit = (ulNotifiedValue & BAT_NOTIFY_DELTA_LIMIT)   != 0;
@@ -128,20 +152,36 @@ static void BAT_vSampleTask(void *pvParameters)
         }
 
         BAT_DRIVER_vEnable();
-        BAT_DRIVER_vCleanInterrupt();
-        BAT_DRIVER_vStartConversion();
 
-        u8DelayMs = 3;
-        while (!BAT_DRIVER_bGetInterruptFlag() && u8DelayMs--)
-            osDelay(1);
+        /* Read both the battery divider and VREFINT in the same enabled window.
+         * VREFINT yields the true VDDA, making the battery result independent
+         * of the actual 1.8 V rail voltage. */
+        uint16_t u16BatRaw  = 0;
+        uint16_t u16VrefRaw = 0;
+        bool bConvOk = BAT_bConvert(BAT_VOLTAGE_CHANNEL, &u16BatRaw)
+                    && BAT_bConvert(VREFINT_CHANNEL,     &u16VrefRaw);
 
-        u16AdcResult = BAT_DRIVER_u16GetResult();
         BAT_DRIVER_vDisable();
         BAT_DRIVER_vDisableBiasCircuit();
 
-        if (u8DelayMs != 0)
+        /* ADC and sleep no longer needed — the VDDA/divider math below is
+         * pure arithmetic. Release before computing so the shared ADC and
+         * STOP2 are freed as early as possible. */
+        SYSTEM_vSleepLockRelease();
+        HAL_ADC_vUnlock();
+
+        if (bConvOk)
         {
-            au16BatAvgBuf[u8BatAvgIdx] = u16AdcResult;
+            uint16_t u16Vdda = HAL_ADC_u16VddaFromVrefint(u16VrefRaw);
+
+            /* Vbatt = adc_bat * VDDA / full_scale * divider_ratio.
+             * Computed in one 64-bit expression to avoid intermediate
+             * truncation; the divider ratio comes from BAT_DIVIDER_NUM/DEN. */
+            uint16_t u16BatMv = (uint16_t)
+                (((uint64_t)u16BatRaw * u16Vdda * BAT_DIVIDER_NUM)
+                 / ((uint64_t)BAT_ADC_FULL_SCALE * BAT_DIVIDER_DEN));
+
+            au16BatAvgBuf[u8BatAvgIdx] = u16BatMv;
 
             if (bDeltaLimit &&
                 (au16BatAvgBuf[u8BatAvgIdx] < (u16BatPreviousSample - BAT_SAMPLE_VALUE_DELTA_MAX)))
@@ -167,8 +207,6 @@ static void BAT_vSampleTask(void *pvParameters)
             else
                 DBG("bat: purge notify — no purge handle");
         }
-
-        SYSTEM_vSleepLockRelease();
     }
 }
 
@@ -255,16 +293,13 @@ void BAT_vPurgeBuffer(void)
  * -------------------------------------------------------------------------- */
 uint16_t BAT_u16GetVoltage(void)
 {
+    /* The averaging buffer already holds VREFINT-compensated millivolts
+     * (computed per sample in BAT_vSampleTask), so just return the mean. */
     uint32_t u32Temp = 0;
     for (uint8_t i = 0; i < BAT_AVG_FACTOR; i++)
         u32Temp += au16BatAvgBuf[i];
 
-    u32Temp /= (uint32_t)BAT_AVG_FACTOR;
-
-    return MATH_FUNC_i16ConvLin((uint16_t)u32Temp,
-                                BAT_MEAS_ADC_M_NUM,
-                                BAT_MEAS_ADC_M_DEN,
-                                BAT_MEAS_ADC_C);
+    return (uint16_t)(u32Temp / (uint32_t)BAT_AVG_FACTOR);
 }
 
 /* --------------------------------------------------------------------------
