@@ -147,7 +147,7 @@ static void BAT_vSampleTask(void *pvParameters)
 
         if (u8DelayMs == 0)
         {
-            DBG("bat: adc enable ERROR");
+            DBG_LOG("bat: adc enable ERROR");
             BAT_DRIVER_vDisable();
         }
 
@@ -205,7 +205,7 @@ static void BAT_vSampleTask(void *pvParameters)
             if (purge != NULL)
                 osThreadFlagsSet(purge, BAT_NOTIFY_PURGE_DONE);
             else
-                DBG("bat: purge notify — no purge handle");
+                DBG_LOG("bat: purge notify — no purge handle");
         }
     }
 }

@@ -106,6 +106,12 @@ void HAL_SYSTEM_vEnterStop2(void)
         HAL_SPI_vInit();
 #endif
 
+    /* Restore the external-flash SPI too: its clock is gated in STOP2, and the
+     * text log (DBG/LOG -> ext flash) is written by tasks that run right after
+     * wake (e.g. the heartbeat). Without this a post-wake flash write would
+     * stall on an unconfigured SPI. Allocation-free, so safe in this context. */
+    HAL_SPI_FLASH_vInit();
+
     HAL_ADC_vInit();
     HAL_GPIO_OnWake();
 

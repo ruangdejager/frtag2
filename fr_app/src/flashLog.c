@@ -288,7 +288,7 @@ void FLASHLOG_vDump(void)
                          timebuf, event, value);
                 break;
         }
-        DBG("%s", buf);
+        DBG_LOG("%s", buf);
         addr += 8;
     }
 }

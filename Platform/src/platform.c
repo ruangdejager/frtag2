@@ -99,13 +99,15 @@ void PLATFORM_vHeartbeatDispatchTask(void *parameters)
         osMutexRelease(SubMutex);
         /* ------------------------------------------------------------------ */
 
-        /* Print current UTC time to debug output */
+        /* Print current UTC time — DBG_LOG so the 1 Hz tick is persisted to the
+         * external-flash log (useful as a timeline during the preproduction
+         * phase). Enqueues asynchronously; the flash write happens off-path. */
         time_t rawtime = (time_t)RTC_u64GetUTC();
         struct tm ts;
         char buf[32];
         ts = *localtime(&rawtime);
         strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ts);
-        DBG("%s\r\n", buf);
+        DBG_LOG("%s\r\n", buf);
     }
 }
 

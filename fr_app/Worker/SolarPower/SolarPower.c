@@ -134,7 +134,7 @@ static void SOLAR_vSampleTask(void *pvParameters)
 
         if (!bConvOk)
         {
-            DBG("solar: ADC conversion timeout — sample skipped\r\n");
+            DBG_LOG("solar: ADC conversion timeout — sample skipped\r\n");
             continue;
         }
 
@@ -150,7 +150,7 @@ static void SOLAR_vSampleTask(void *pvParameters)
         u16RsenseLastMV = (uint16_t)
             (((uint32_t)u16RawRsense * u16Vdda) / SOLAR_ADC_FULL_SCALE);
 
-        DBG("solar: Vsolar=%u mV  Vrsense=%u mV  Vdda=%u mV  I=%ld mA  P=%lu mW\r\n",
+        DBG_LOG("solar: Vsolar=%u mV  Vrsense=%u mV  Vdda=%u mV  I=%ld mA  P=%lu mW\r\n",
             u16VsolarLastMV, u16RsenseLastMV, u16Vdda,
             SOLAR_i32GetCurrentMA(), SOLAR_u32GetPowerMW());
 

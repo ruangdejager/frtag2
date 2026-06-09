@@ -22,4 +22,9 @@ uint32_t LOG_u32GetUsedBytes(void);
 uint8_t  LOG_u8GetUsedPercent(void);
 void     LOG_vErase(void);
 
+/* Stream the entire log FIFO (oldest → newest) out the debug transport via
+ * DEBUG_vPutBuffer. Intended as a test/readback hook; call when no task is
+ * concurrently writing the log (e.g. at boot right after LOG_vInit). */
+void     LOG_vStreamToDebug(void);
+
 #endif /* SERVICES_LOG_LOG_H_ */

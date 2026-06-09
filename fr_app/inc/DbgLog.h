@@ -17,6 +17,12 @@ void DBGLOG_vInit(void);
 void DBGLOG_vPutDebug(const char *format, ...);
 void DBGLOG_vPutLog(const char *format, ...);
 
+/* DBG     — debug transport only (UART / LISTENER), compiled out otherwise.
+ * LOG     — external-flash text log only.
+ * DBG_LOG — both. Use DBG_LOG at operational sites whose output should persist
+ *           across power cycles; plain DBG for transient diagnostics.
+ * The flash path is asynchronous (RAM ring + background drain task), so even a
+ * large DBG_LOG burst returns quickly and never blocks the caller. */
 #ifdef LISTENER_MODE
 #  define DBG(x, ...)    DBGLOG_vPutDebug(x, ##__VA_ARGS__)
 #elif defined(ENABLE_DBG_UART)
