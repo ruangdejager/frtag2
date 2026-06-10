@@ -238,7 +238,7 @@ static void MOVE_vSequenceTick(void)
             {
                 /* Sequence complete — flash 5 times then trigger kernel wakeup */
                 DBG_LOG("Movement: shake-sequence COMPLETE -> kernel wakeup\r\n");
-
+                DEVICE_DISCOVERY_vTriggerKernelWakeup();
                 for (uint8_t i = 0U; i < 20U; i++)
                 {
                     MOVE_DRIVER_vLedOn();
@@ -247,7 +247,6 @@ static void MOVE_vSequenceTick(void)
                     osDelay(75);
                 }
                 u8SeqStep = 0U;
-                DEVICE_DISCOVERY_vTriggerKernelWakeup();
             }
         }
     }
