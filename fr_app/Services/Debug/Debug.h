@@ -2,8 +2,13 @@
  * Debug.h
  *
  * Raw byte debug output/input service.
- * DEBUG_OUTPUT_UART must be explicitly defined to activate UART output.
- * All other cases (undefined or DEBUG_OUTPUT_USB) compile to stubs.
+ * Provides transport-level output (and, for UART, input) only — no
+ * formatting. All formatting lives in DbgLog.c (application layer).
+ *
+ * Transport selection (define exactly one at project level):
+ *   DEBUG_OUTPUT_UART — USART2 debug UART (default active choice)
+ *   DEBUG_OUTPUT_USB  — USB CDC (not yet implemented; stub bodies provided)
+ *   (neither defined) — all functions compile to stubs; no output produced
  */
 
 #ifndef SERVICES_DEBUG_DEBUG_H_

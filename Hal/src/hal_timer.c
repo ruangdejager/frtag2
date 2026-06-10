@@ -57,7 +57,9 @@ void HAL_TIMER_vOnPeriodElapsed(void)
  * -------------------------------------------------------------------------- */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-    if (htim->Instance == TIM2)
+    if (htim->Instance == TIM16)
+        HAL_IncTick();          /* HAL timebase — keep uwTick alive for HAL_GetTick() */
+    else if (htim->Instance == TIM2)
         HAL_TIMER_vOnPeriodElapsed();
 }
 
