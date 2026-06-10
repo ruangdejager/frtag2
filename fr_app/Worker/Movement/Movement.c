@@ -63,8 +63,9 @@ static MoveState_e eState        = MOVE_STATE_MOVING;
 static uint32_t    u32StillTicks = 0U;
 
 /* Gravity sequence detector */
-static uint8_t u8SeqStep     = 0U;
-static uint8_t u8HoldCounter = 0U;
+static uint8_t u8SeqStep         = 0U;
+static uint8_t u8HoldCounter     = 0U;
+static uint8_t u8TransitionTicks = 0U;
 
 /* --------------------------------------------------------------------------
  * Forward declarations
@@ -88,14 +89,15 @@ void MOVE_vInit(void)
 
     memset(&AccHealth, 0, sizeof(acc_health_t));
 
-    eState        = MOVE_STATE_MOVING;
-    u32StillTicks = 0U;
-    u8SeqStep     = 0U;
-    u8HoldCounter = 0U;
+    eState            = MOVE_STATE_MOVING;
+    u32StillTicks     = 0U;
+    u8SeqStep         = 0U;
+    u8HoldCounter     = 0U;
+    u8TransitionTicks = 0U;
 
     static const osThreadAttr_t attr = {
         .name       = "Movement",
-        .stack_size = configMINIMAL_STACK_SIZE * 4U,
+        .stack_size = configMINIMAL_STACK_SIZE * 5U,
         .priority   = osPriorityLow,
     };
     osThreadNew(MOVE_vTask, NULL, &attr);
@@ -166,6 +168,9 @@ static void MOVE_vUpdateState(void)
 {
     if (MoveAlg.u8EnvLevel > MOVE_STILL_ENV_THRESHOLD)
     {
+        if (eState != MOVE_STATE_MOVING)
+            DBG_LOG("Movement: state -> MOVING (env=%u)\r\n", MoveAlg.u8EnvLevel);
+
         eState        = MOVE_STATE_MOVING;
         u32StillTicks = 0U;
     }
@@ -173,8 +178,12 @@ static void MOVE_vUpdateState(void)
     {
         if (u32StillTicks < MOVE_STILL_TIMEOUT_S)
             u32StillTicks++;
-        if (u32StillTicks >= MOVE_STILL_TIMEOUT_S)
+
+        if (u32StillTicks >= MOVE_STILL_TIMEOUT_S && eState != MOVE_STATE_STILL)
+        {
             eState = MOVE_STATE_STILL;
+            DBG_LOG("Movement: state -> STILL (env=%u)\r\n", MoveAlg.u8EnvLevel);
+        }
     }
 }
 
@@ -211,6 +220,8 @@ static void MOVE_vSequenceTick(void)
     if (MOVE_bCheckPosition(u8SeqStep))
     {
         u8HoldCounter++;
+        u8TransitionTicks = 0U;
+
         if (u8HoldCounter >= MOVE_SEQ_HOLD_TICKS)
         {
             MOVE_DRIVER_vLedOn();
@@ -218,27 +229,46 @@ static void MOVE_vSequenceTick(void)
             MOVE_DRIVER_vLedOff();
 
             u8SeqStep++;
-            u8HoldCounter = 0U;
+            u8HoldCounter     = 0U;
+            u8TransitionTicks = 0U;
+
+            DBG_LOG("Movement: shake-sequence step %u/6 accepted\r\n", u8SeqStep);
 
             if (u8SeqStep >= 6U)
             {
                 /* Sequence complete — flash 5 times then trigger kernel wakeup */
-                for (uint8_t i = 0U; i < 5U; i++)
+                DBG_LOG("Movement: shake-sequence COMPLETE -> kernel wakeup\r\n");
+
+                for (uint8_t i = 0U; i < 20U; i++)
                 {
                     MOVE_DRIVER_vLedOn();
-                    osDelay(200);
+                    osDelay(25);
                     MOVE_DRIVER_vLedOff();
-                    osDelay(200);
+                    osDelay(75);
                 }
                 u8SeqStep = 0U;
                 DEVICE_DISCOVERY_vTriggerKernelWakeup();
             }
         }
     }
+    else if (u8SeqStep != 0U)
+    {
+        /* Mid-sequence: not yet in the next required position. Allow a few
+         * seconds to physically move into place before giving up. */
+        u8HoldCounter = 0U;
+        u8TransitionTicks++;
+
+        if (u8TransitionTicks >= MOVE_SEQ_TRANSITION_TICKS)
+        {
+            DBG_LOG("Movement: shake-sequence reset (was step %u/6)\r\n", u8SeqStep);
+            u8SeqStep         = 0U;
+            u8TransitionTicks = 0U;
+        }
+    }
     else
     {
-        u8SeqStep     = 0U;
-        u8HoldCounter = 0U;
+        u8HoldCounter     = 0U;
+        u8TransitionTicks = 0U;
     }
 }
 

@@ -33,7 +33,7 @@
 
 /* Accelerometer axis mask limits */
 #define MOVE_SENSOR_AXIS_MIN                    0b00000000
-#define MOVE_SENSOR_AXIS_DEF                    0b00000010
+#define MOVE_SENSOR_AXIS_DEF                    0b00000111   /* all axes active by default */
 #define MOVE_SENSOR_AXIS_MAX                    0b00000111
 
 #define MOVE_ALARM_TRACKING_UPDATE_INTERVAL     30
@@ -113,8 +113,10 @@
 #define MOVE_STILL_ENV_THRESHOLD      3U   /* envelope ≤ this counts as no motion   */
 
 /* Gravity sequence detector */
-#define MOVE_SEQ_GRAV_TH              7    /* |dcLevel| > this → axis carries gravity  */
-#define MOVE_SEQ_GRAV_NULL            4    /* |dcLevel| < this → axis is free          */
+#define MOVE_SEQ_GRAV_TH              50    /* |dcLevel| > this → axis carries gravity  */
+#define MOVE_SEQ_GRAV_NULL            10    /* |dcLevel| < this → axis is free          */
 #define MOVE_SEQ_HOLD_TICKS           2U   /* consecutive 1 Hz ticks to accept a step  */
+#define MOVE_SEQ_TRANSITION_TICKS     6U   /* grace ticks to move into the next position
+                                             * before the sequence resets               */
 
 #endif /* WORKER_MOVEMENT_MOVEMENT_CONFIG_H_ */

@@ -395,7 +395,7 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             continue;
         }
 
-        BSP_LED_Toggle(LED_YELLOW);
+//        BSP_LED_Toggle(LED_YELLOW);
         /* --- Discovery wake trigger (phase == 0) --- */
         if (u32Phase == 0U)
         {
@@ -440,7 +440,7 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             DBG("DeviceDiscovery: GPS pre-trigger\r\n");
             /* auto-shutdown on completion, bounded to GPS_PRETRIGGER_S so it
              * can never run forever */
-            GPS_vRequestFix(true, 60);
+            GPS_vRequestFix(true, 120);
         }
 #endif
     }
@@ -460,7 +460,9 @@ static void DEVICE_DISCOVERY_vSendTS(void)
  * -------------------------------------------------------------------------- */
 void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
 {
-    SYSTEM_vDeactivateDeepSleep();
+    /* Hold off deep sleep until the resulting (no-op) campaign completes —
+     * released at the end of DEVICE_DISCOVERY_vAppTask's loop. */
+    SYSTEM_vSleepLockAcquire();
     LORARADIO_vWakeUp();
     DBG("\r\n--- KERNEL WAKEUP ---\r\n");
     osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
