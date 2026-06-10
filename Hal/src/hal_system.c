@@ -19,7 +19,6 @@
 
 #define MS_PER_DAY   86400000U
 
-static bool bSleepActive = true;
 static volatile uint32_t gSleepLockCount = 0;
 
 void SystemClock_Config(void)
@@ -144,7 +143,6 @@ void vPortSuppressTicksAndSleep(TickType_t xExpectedIdleTime)
     }
 
     bool bDeep = INIT_bIsSleepReady()
-              && bSleepActive
               && (gSleepLockCount == 0U);
 
     if (bDeep)
@@ -201,21 +199,6 @@ void SYSTEM_vSleepLockRelease(void)
     if (gSleepLockCount > 0)
         gSleepLockCount--;
     taskEXIT_CRITICAL();
-}
-
-void SYSTEM_vActivateDeepSleep(void)
-{
-    bSleepActive = true;
-}
-
-void SYSTEM_vDeactivateDeepSleep(void)
-{
-    bSleepActive = false;
-}
-
-bool SYSTEM_bIsDeepSleepActive(void)
-{
-    return bSleepActive;
 }
 
 void Error_Handler(void)

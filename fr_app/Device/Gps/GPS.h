@@ -141,14 +141,22 @@ typedef enum {
 void GPS_vInit(void);
 
 /* Kick off (or attach to) a fix acquisition.
- *   bAutoShutdown == true  → GPS powers off after fix or TTFF timeout
- *   bAutoShutdown == false → GPS stays powered until GPS_vShutdown()
+ *   bAutoShutdown == true  → GPS powers off after a stable fix or after
+ *                            u32TtffTimeoutS seconds, whichever comes first.
+ *                            u32TtffTimeoutS is applied to GnssSession.u16TtffTimeout
+ *                            (clamped to uint16_t; 0 falls back to
+ *                            GNSS_TTFF_TIMEOUT_1_AID_ASSIST).
+ *   bAutoShutdown == false → GPS stays powered until GPS_vShutdown(); no TTFF
+ *                            timeout is enforced (GnssSession.u16TtffTimeout is
+ *                            set to GNSS_TTFF_NO_TIMEOUT) and u32TtffTimeoutS
+ *                            is ignored.
  *
  * Idempotent: if a session is already in progress, returns immediately
- * and updates bAutoShutdown to the last-caller value. If the board is
- * not in POWER_CLASS_NORMAL the call refuses to power the GPS and sets
- * the NO_POWER result so any concurrent waiter is released. */
-void GPS_vRequestFix(bool bAutoShutdown);
+ * and updates bAutoShutdown (and the TTFF timeout, if applicable) to the
+ * last-caller values. If the board is not in POWER_CLASS_NORMAL the call
+ * refuses to power the GPS and sets the NO_POWER result so any concurrent
+ * waiter is released. */
+void GPS_vRequestFix(bool bAutoShutdown, uint32_t u32TtffTimeoutS);
 
 /* Block until the current (or next) session signals a terminal result.
  * Returns the result enum, or GPS_RESULT_FIX_TIMEOUT if u32TimeoutMs

@@ -14,11 +14,18 @@
 #define GNSS_TTFF_TIMEOUT_2_COLD_START      UINT16_C(180)
 
 /*
+ * Sentinel TTFF timeout meaning "no timeout" — used when GPS_vRequestFix()
+ * is called with bAutoShutdown == false, so the session is allowed to run
+ * indefinitely until a stable fix is declared or GPS_vShutdown() is called.
+ */
+#define GNSS_TTFF_NO_TIMEOUT                UINT16_C(0xFFFF)
+
+/*
  * Minimum sequential valid fixes before declaring a stable solution.
  * Testing shows solution deltas can take up to 7-8 fixes to converge;
  * choose a margin above that.
  */
-#define GNSS_SESSION_VALID_FIX_CNT_MIN      10
+#define GNSS_SESSION_VALID_FIX_CNT_MIN      5
 
 /*
  * Nominal sequential fix count: extra time beyond the minimum for the

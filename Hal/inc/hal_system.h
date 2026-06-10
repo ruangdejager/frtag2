@@ -12,11 +12,15 @@
 
 void SystemClock_Config(void);
 bool SYSTEM_bCheckSleepModeStatus(void);
+
+/* Sleep-lock API — any task that needs the system to stay out of STOP2
+ * (deep sleep) calls SYSTEM_vSleepLockAcquire() and, once it no longer
+ * needs the system awake, SYSTEM_vSleepLockRelease(). Acquire/release
+ * pairs may come from independent tasks/modules and nest via a shared
+ * counter; deep sleep is only re-armed once the count returns to zero. */
 void SYSTEM_vSleepLockAcquire(void);
 void SYSTEM_vSleepLockRelease(void);
-void SYSTEM_vActivateDeepSleep(void);
-void SYSTEM_vDeactivateDeepSleep(void);
-bool SYSTEM_bIsDeepSleepActive(void);
+
 void Error_Handler(void);
 
 /* Enters STOP2 and restores clocks/peripherals on wake. Called from the

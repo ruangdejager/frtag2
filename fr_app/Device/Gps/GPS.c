@@ -16,6 +16,7 @@
 #include "platform_rtc.h"
 #include "dbg_log.h"
 #include "Debug.h"
+#include "hal_system.h"
 
 #include <limits.h>
 
@@ -68,6 +69,14 @@ char    acGpsRxBuf[GPS_RX_BUF_LEN];
 uint8_t u8GpsRxBufIdx;
 uint32_t u32GnssRxLastTs;
 
+/* ---- UBX-ACK-ACK/NAK capture (diagnostics for UBX-CFG-VALSET) ----
+ * Fixed-size frame: sync(2) B5 62 + class(1) + id(1) + len(2)=02 00
+ * + payload(2)=ackedClass,ackedId + ck(2) = 10 bytes total. */
+#define GPS_UBX_ACK_FRAME_LEN  10
+static bool    bUbxFrameActive;
+static uint8_t u8UbxRxBufIdx;
+static uint8_t acUbxRxBuf[GPS_UBX_ACK_FRAME_LEN];
+
 uint16_t u16GpsSvSnrAvg;
 uint8_t  u8GpsSvTrackingCnt;
 
@@ -76,6 +85,7 @@ bool GnssSyslogFlag = true;
 /* ---- Dispatcher state (mutex-guarded except where atomic) ---- */
 static volatile gps_state_e eState         = GPS_STATE_IDLE;
 static volatile bool        bAutoShutdown  = true;
+static volatile uint16_t    u16PendingTtffTimeout = GNSS_TTFF_TIMEOUT_1_AID_ASSIST;
 static bool                 bSessionActive = false;   /* drives RX-task gating      */
 static bool                 bCallerNotified= false;   /* GNSS_vOnSolution edge       */
 static bool                 bGpsPowered    = false;   /* hardware rail + UART state  */
@@ -139,6 +149,120 @@ bool __bFindNext_P(char **p1, const char *p2, bool bAdvance)
 }
 
 /* --------------------------------------------------------------------------
+ * UBX-CFG-VALSET cold-start configuration (MAX-M10S, PROTVER 34.10)
+ *
+ * Sent once per cold start (GPS_vSessionArm) to configure the receiver for:
+ *   - 1 Hz measurement/navigation rate (explicit, belt-and-braces)
+ *   - GPS-only (L1C/A) reception for lowest power draw. A single-constellation
+ *     receiver runs fewer correlator channels, which is the dominant RX power
+ *     cost on the M10. The capture from this unit shows 12-15 GPS SVs in view
+ *     with good C/N0 (open-sky), so dropping GLONASS/Galileo/BeiDou/QZSS/SBAS
+ *     should not meaningfully hurt TTFF here while cutting acquisition/tracking
+ *     power. (SBAS is dropped too — it adds power for a DGNSS correction this
+ *     application doesn't need.)
+ *   - NMEA output trimmed to RMC + GGA + GSV (GSA/VTG/GLL disabled). GSV is
+ *     forced to 1 report/epoch (CFG-MSGOUT-NMEA_ID_GSV_UART1=1) so it arrives
+ *     every second along with RMC — required because GnssSession.tNmeaMsgFlagsBm
+ *     is RMC_bm | GSV_bm, i.e. GNSS_vOnSolution() needs both per cycle. With
+ *     GPS-only there's a single GPGSV sequence per epoch, so this now lines up
+ *     1:1 with RMC instead of the ~5 s GSV burst period seen with multi-GNSS.
+ *   - CFG-PM-OPERATEMODE=FULL — the receiver's own power-save/cyclic-tracking
+ *     stays off; our own duty-cycling (GPS_vRequestFix/GPS_vPowerOff) already
+ *     handles power, and PSM would re-introduce a slow/irregular output rate.
+ *   - CFG-NAVSPG-DYNMODEL=Pedestrian — appropriate for a grazing-animal tag
+ *     (low velocity/acceleration), helps the navigation filter without
+ *     affecting TTFF or power.
+ *
+ * Layers = RAM | BBR (0x03). The M10 has no config flash; BBR is retained via
+ * V_BCKP across power-down so this only needs to be (re-)applied on cold start.
+ *
+ * Frames are stored with placeholder checksum bytes; GPS_vSendUbxValset() copies
+ * each to a scratch buffer and finalizes the checksum via bAddUbxChecksum()
+ * before transmitting on gps.UartHandle.
+ * -------------------------------------------------------------------------- */
+
+/* CFG-RATE: MEAS=1000 ms, NAV=1 -> 1 Hz */
+static const uint8_t aUbxCfgRate[] = {
+    0xB5, 0x62, 0x06, 0x8A, 0x10, 0x00,            /* hdr: CFG-VALSET, len=16 */
+    0x00, 0x03, 0x00, 0x00,                        /* version, layers=RAM|BBR, reserved */
+    0x01, 0x00, 0x21, 0x30, 0xE8, 0x03,            /* CFG-RATE-MEAS (U2) = 1000 */
+    0x02, 0x00, 0x21, 0x30, 0x01, 0x00,            /* CFG-RATE-NAV  (U2) = 1    */
+    0x00, 0x00,                                    /* checksum placeholder */
+};
+
+/* CFG-SIGNAL: GPS L1C/A only — disable GLONASS/Galileo/BeiDou/QZSS/SBAS */
+static const uint8_t aUbxCfgSignalGpsOnly[] = {
+    0xB5, 0x62, 0x06, 0x8A, 0x40, 0x00,            /* hdr: CFG-VALSET, len=64 */
+    0x00, 0x03, 0x00, 0x00,                        /* version, layers=RAM|BBR, reserved */
+    0x1F, 0x00, 0x31, 0x10, 0x01,                  /* CFG-SIGNAL-GPS_ENA       = 1 */
+    0x01, 0x00, 0x31, 0x10, 0x01,                  /* CFG-SIGNAL-GPS_L1CA_ENA  = 1 */
+    0x20, 0x00, 0x31, 0x10, 0x00,                  /* CFG-SIGNAL-SBAS_ENA      = 0 */
+    0x05, 0x00, 0x31, 0x10, 0x00,                  /* CFG-SIGNAL-SBAS_L1CA_ENA = 0 */
+    0x21, 0x00, 0x31, 0x10, 0x00,                  /* CFG-SIGNAL-GAL_ENA       = 0 */
+    0x07, 0x00, 0x31, 0x10, 0x00,                  /* CFG-SIGNAL-GAL_E1_ENA    = 0 */
+    0x22, 0x00, 0x31, 0x10, 0x00,                  /* CFG-SIGNAL-BDS_ENA       = 0 */
+    0x0D, 0x00, 0x31, 0x10, 0x00,                  /* CFG-SIGNAL-BDS_B1_ENA    = 0 */
+    0x24, 0x00, 0x31, 0x10, 0x00,                  /* CFG-SIGNAL-QZSS_ENA      = 0 */
+    0x12, 0x00, 0x31, 0x10, 0x00,                  /* CFG-SIGNAL-QZSS_L1CA_ENA = 0 */
+    0x25, 0x00, 0x31, 0x10, 0x00,                  /* CFG-SIGNAL-GLO_ENA       = 0 */
+    0x18, 0x00, 0x31, 0x10, 0x00,                  /* CFG-SIGNAL-GLO_L1_ENA    = 0 */
+    0x00, 0x00,                                    /* checksum placeholder */
+};
+
+/* CFG-MSGOUT: NMEA on UART1 — keep RMC/GGA, force GSV to every epoch, drop GSA/VTG/GLL */
+static const uint8_t aUbxCfgMsgOut[] = {
+    0xB5, 0x62, 0x06, 0x8A, 0x22, 0x00,            /* hdr: CFG-VALSET, len=34 */
+    0x00, 0x03, 0x00, 0x00,                        /* version, layers=RAM|BBR, reserved */
+    0xC5, 0x00, 0x91, 0x20, 0x01,                  /* CFG-MSGOUT-NMEA_ID_GSV_UART1 = 1 */
+    0xC0, 0x00, 0x91, 0x20, 0x00,                  /* CFG-MSGOUT-NMEA_ID_GSA_UART1 = 0 */
+    0xCA, 0x00, 0x91, 0x20, 0x00,                  /* CFG-MSGOUT-NMEA_ID_GLL_UART1 = 0 */
+    0xB1, 0x00, 0x91, 0x20, 0x00,                  /* CFG-MSGOUT-NMEA_ID_VTG_UART1 = 0 */
+    0xBB, 0x00, 0x91, 0x20, 0x01,                  /* CFG-MSGOUT-NMEA_ID_GGA_UART1 = 1 */
+    0xAB, 0x00, 0x91, 0x20, 0x01,                  /* CFG-MSGOUT-NMEA_ID_RMC_UART1 = 1 */
+    0x00, 0x00,                                    /* checksum placeholder */
+};
+
+/* CFG-PM / CFG-NAVSPG: full-power (no internal PSM), pedestrian dynamic model */
+static const uint8_t aUbxCfgPmNav[] = {
+    0xB5, 0x62, 0x06, 0x8A, 0x0E, 0x00,            /* hdr: CFG-VALSET, len=14 */
+    0x00, 0x03, 0x00, 0x00,                        /* version, layers=RAM|BBR, reserved */
+    0x01, 0x00, 0xD0, 0x20, 0x00,                  /* CFG-PM-OPERATEMODE  (E1) = 0 (FULL) */
+    0x21, 0x00, 0x11, 0x20, 0x03,                  /* CFG-NAVSPG-DYNMODEL (E1) = 3 (Pedestrian) */
+    0x00, 0x00,                                    /* checksum placeholder */
+};
+
+/* --------------------------------------------------------------------------
+ * GPS_vSendUbxValset — finalize checksum and transmit one UBX-CFG-VALSET frame.
+ * Copies the const template to a scratch buffer (bAddUbxChecksum writes the
+ * last two bytes in place) and pushes it out via the TX ring buffer.
+ * -------------------------------------------------------------------------- */
+static void GPS_vSendUbxValset(const uint8_t *pTemplate, uint16_t u16Len)
+{
+    uint8_t acFrame[80];
+
+    if (u16Len > sizeof(acFrame))
+        return;
+
+    memcpy(acFrame, pTemplate, u16Len);
+    bAddUbxChecksum(acFrame, u16Len);
+    HAL_UART_vTxPutBuffer(&gps.UartHandle, acFrame, u16Len);
+}
+
+/* --------------------------------------------------------------------------
+ * GPS_vConfigureModule — send the cold-start UBX-CFG-VALSET sequence.
+ * See the frame definitions above for the rationale of each setting.
+ * -------------------------------------------------------------------------- */
+static void GPS_vConfigureModule(void)
+{
+    GPS_vSendUbxValset(aUbxCfgRate,          sizeof(aUbxCfgRate));
+    GPS_vSendUbxValset(aUbxCfgSignalGpsOnly, sizeof(aUbxCfgSignalGpsOnly));
+    GPS_vSendUbxValset(aUbxCfgMsgOut,        sizeof(aUbxCfgMsgOut));
+    GPS_vSendUbxValset(aUbxCfgPmNav,         sizeof(aUbxCfgPmNav));
+
+    DBG_LOG("gps: ubx config sent (1Hz, GPS-only, full power, pedestrian)\r\n");
+}
+
+/* --------------------------------------------------------------------------
  * GPS_vInit — set up UART handle, mutex, event flags, and worker tasks
  * -------------------------------------------------------------------------- */
 void GPS_vInit(void)
@@ -177,8 +301,8 @@ static void GPS_vSessionArm(void)
 {
     memset(&GnssSession, 0, sizeof(gnss_session_t));
     GnssSession.u32StartTime    = (uint32_t)RTC_u64GetTicks();
-    GnssSession.u16TtffTimeout  = GNSS_TTFF_TIMEOUT_1_AID_ASSIST;
-    GnssSession.tNmeaMsgFlagsBm = GNSS_NMEA_MSG_RMC_bm | GNSS_NMEA_MSG_PQTMEPE_bm;
+    GnssSession.u16TtffTimeout  = u16PendingTtffTimeout;
+    GnssSession.tNmeaMsgFlagsBm = GNSS_NMEA_MSG_RMC_bm | GNSS_NMEA_MSG_GSV_bm;// | GNSS_NMEA_MSG_PQTMEPE_bm;
     GnssSession.Fix             = GNSS_SESSION_FIX_BUSY;
     memset(&GnssSolDraft, 0, sizeof(gnss_sol_t));
 
@@ -193,6 +317,19 @@ static void GPS_vSessionArm(void)
         HAL_UART_vClearBuffer(&gps.UartHandle);
         GPS_DRIVER_vPowerEnHigh();
         bGpsPowered = true;
+
+        /* Apply 1Hz/GPS-only/full-power config. The MAX-M10S emits its first
+         * $GNTXT boot messages almost immediately, but its UART *receiver*
+         * is not guaranteed to be live yet — frames sent at t=0 are silently
+         * lost. Wait briefly, send the VALSET sequence, then send it again
+         * after a further delay as a hedge against a slow boot. Idempotent
+         * (same keys both times); any UBX-ACK/NAK is logged by
+         * GPS_bOnRxByte for diagnostics. */
+        osDelay(300);
+        GPS_vConfigureModule();
+        osDelay(700);
+        GPS_vConfigureModule();
+
         DBG_LOG("gps: session armed (cold start), ttff timeout=%us\r\n",
             GnssSession.u16TtffTimeout);
     }
@@ -221,6 +358,11 @@ static void GPS_vPowerOff(void)
     GPS_DRIVER_vDisableUart(&gps.UartHandle);
     eState = GPS_STATE_IDLE;
     DBG_LOG("gps: powered off\r\n");
+
+    /* GPS is fully off — release the sleep lock taken by whoever requested
+     * this session (e.g. the DeviceDiscovery GPS pre-trigger), allowing
+     * deep sleep again once any other outstanding lock is also released. */
+    SYSTEM_vSleepLockRelease();
 }
 
 /* --------------------------------------------------------------------------
@@ -250,10 +392,11 @@ static void GPS_vMaybeSyncRtc(uint32_t u32GpsUnixTime)
 
 /* --------------------------------------------------------------------------
  * GPS_vRequestFix — public: trigger (or attach to) a fix acquisition.
- * Idempotent; updates bAutoShutdown to the last-caller value.
+ * Idempotent; updates bAutoShutdown (and the TTFF timeout) to the
+ * last-caller values.
  * Refuses if board is not in POWER_CLASS_NORMAL — sets NO_POWER result.
  * -------------------------------------------------------------------------- */
-void GPS_vRequestFix(bool bAutoShutdownIn)
+void GPS_vRequestFix(bool bAutoShutdownIn, uint32_t u32TtffTimeoutS)
 {
     /* Safe no-op if GPS_vInit() was never called (e.g. PRIMARY device or
      * ENABLE_GPS not defined). The wake-schedule task fires this
@@ -273,6 +416,23 @@ void GPS_vRequestFix(bool bAutoShutdownIn)
     }
 
     bAutoShutdown = bAutoShutdownIn;
+
+    /* ---- TTFF timeout: only enforced when auto-shutdown is requested ----
+     * Without auto-shutdown the session is held open (FIX_HELD) until
+     * GPS_vShutdown() is called, so it is allowed to run "forever". */
+    if (bAutoShutdownIn)
+    {
+        if (u32TtffTimeoutS == 0U)
+            u16PendingTtffTimeout = GNSS_TTFF_TIMEOUT_1_AID_ASSIST;
+        else if (u32TtffTimeoutS > (uint32_t)UINT16_MAX)
+            u16PendingTtffTimeout = UINT16_MAX;
+        else
+            u16PendingTtffTimeout = (uint16_t)u32TtffTimeoutS;
+    }
+    else
+    {
+        u16PendingTtffTimeout = GNSS_TTFF_NO_TIMEOUT;
+    }
 
     switch (eState)
     {
@@ -398,6 +558,49 @@ void GPS_vNotifyOnRX(void)
  * -------------------------------------------------------------------------- */
 bool GPS_bOnRxByte(char pcRxByte)
 {
+    uint8_t u8Byte = (uint8_t)pcRxByte;
+
+    /* UBX-ACK-ACK/ACK-NAK capture — diagnostics for the UBX-CFG-VALSET
+     * frames sent at cold start. These are binary (start with 0xB5 0x62),
+     * so they're handled separately from the '$'-delimited NMEA path below
+     * and never enter acGpsRxBuf. */
+    if (u8GpsRxBufIdx == 0 && !bUbxFrameActive && u8Byte == 0xB5)
+    {
+        bUbxFrameActive = true;
+        u8UbxRxBufIdx   = 0;
+    }
+
+    if (bUbxFrameActive)
+    {
+        if (u8UbxRxBufIdx < GPS_UBX_ACK_FRAME_LEN)
+            acUbxRxBuf[u8UbxRxBufIdx] = u8Byte;
+        u8UbxRxBufIdx++;
+
+        if (u8UbxRxBufIdx >= GPS_UBX_ACK_FRAME_LEN)
+        {
+            /* sync 0xB5 0x62 already matched at index 0; verify class==ACK
+             * (0x05) and checksum over class..payload (indices 2..7). */
+            if (acUbxRxBuf[1] == 0x62 && acUbxRxBuf[2] == 0x05)
+            {
+                uint8_t ck_a = 0, ck_b = 0;
+                for (uint8_t i = 2; i < 8; i++)
+                {
+                    ck_a += acUbxRxBuf[i];
+                    ck_b += ck_a;
+                }
+                if (ck_a == acUbxRxBuf[8] && ck_b == acUbxRxBuf[9])
+                {
+                    DBG_LOG("gps: ubx %s %02X/%02X\r\n",
+                        (acUbxRxBuf[3] == 0x01) ? "ACK" : "NAK",
+                        acUbxRxBuf[6], acUbxRxBuf[7]);
+                }
+            }
+            bUbxFrameActive = false;
+            u8UbxRxBufIdx   = 0;
+        }
+        return true;
+    }
+
     if (u8GpsRxBufIdx == 0 && pcRxByte != '$') return true;
 
     uint8_t u8NextIdx = u8GpsRxBufIdx + 1;
@@ -405,7 +608,7 @@ bool GPS_bOnRxByte(char pcRxByte)
     {
         acGpsRxBuf[u8GpsRxBufIdx] = pcRxByte;
         acGpsRxBuf[u8NextIdx]     = 0;
-        DEBUG_vPutByte((uint8_t)pcRxByte);
+//        DEBUG_vPutByte((uint8_t)pcRxByte);
     }
     else
     {
@@ -539,8 +742,8 @@ void GNSS_vOnSolution(void)
             /* First stable fix of this session — sync RTC then wake dispatcher */
             bCallerNotified = true;
             GPS_vMaybeSyncRtc(GnssSol.u32TimeUnix);
-            DBG_LOG("gps: FIX OK t=%us lat=%i.%06lu lon=%i.%06lu\r\n",
-                GnssSession.u16TimeToFirstFix,
+            DBG_LOG("gps: FIX OK t=%us/%us lat=%i.%06lu lon=%i.%06lu\r\n",
+                GnssSession.u16TimeToFirstFix, GnssSession.u16TtffTimeout,
                 GnssSol.Lat.Deg.i16Deg,  GnssSol.Lat.Deg.u32DeciMicroDeg,
                 GnssSol.Long.Deg.i16Deg, GnssSol.Long.Deg.u32DeciMicroDeg);
             osThreadFlagsSet(GPS_vDispatcherTask_handle, GPS_DISP_FIX_OK_BIT);
@@ -564,14 +767,15 @@ void GNSS_vOnSolution(void)
             u64LastFixUtc = RTC_u64GetUTC();
             bHasEverFixed = true;
             taskEXIT_CRITICAL();
-            DBG_LOG("gps: FIX TIMEOUT t=%us, using best fix: lat=%i.%06lu lon=%i.%06lu\r\n",
-                GnssSession.u16TtffTmr,
+            DBG_LOG("gps: FIX TIMEOUT t=%us/%us, using best fix: lat=%i.%06lu lon=%i.%06lu\r\n",
+                GnssSession.u16TtffTmr, GnssSession.u16TtffTimeout,
                 GnssSol.Lat.Deg.i16Deg,  GnssSol.Lat.Deg.u32DeciMicroDeg,
                 GnssSol.Long.Deg.i16Deg, GnssSol.Long.Deg.u32DeciMicroDeg);
         }
         else
         {
-            DBG_LOG("gps: FIX TIMEOUT t=%us, no valid fix\r\n", GnssSession.u16TtffTmr);
+            DBG_LOG("gps: FIX TIMEOUT t=%us/%us, no valid fix\r\n",
+                GnssSession.u16TtffTmr, GnssSession.u16TtffTimeout);
         }
         /* Attempt RTC sync regardless of position validity — NMEA time fields
          * are typically decoded well before a position fix is declared. */
@@ -590,7 +794,7 @@ void GNSS_vOnSolution(void)
     }
     GnssSession.bDbgStartFlag = true;
 
-    if (GnssSyslogFlag && !GnssSession.bDbgStopFlag)
+    if ( !GnssSession.bDbgStopFlag && (GnssSession.u8ValidFixCount || (u16SessionTmr % 10 == 0) ) )
     {
         if (GnssSol.PositionError.bHasValue)
             DBG_LOG("gps %02u/%02u, %02u/%02u, %u, %u, %u, [%i,%i]\r\n",

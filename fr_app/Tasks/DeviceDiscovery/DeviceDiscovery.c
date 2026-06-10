@@ -343,7 +343,10 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         osDelay(100);
 //        BSP_LED_Off(LED_YELLOW);
         LORARADIO_vEnterDeepSleep();
-        SYSTEM_vActivateDeepSleep();
+
+        /* Campaign complete — release the sleep lock taken when this wake
+         * was triggered (Discovery wake trigger or ProductionSleep exit). */
+        SYSTEM_vSleepLockRelease();
     }
 }
 
@@ -377,7 +380,9 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                 eProductionState = PRODUCTION_ACTIVE;
                 DBG_LOG("DeviceDiscovery: Solar activation (%lu mW) — exiting ProductionSleep\r\n",
                     SOLAR_u32GetPowerMW());
-                SYSTEM_vDeactivateDeepSleep();
+                /* Hold off deep sleep until the resulting campaign completes
+                 * (released at the end of DEVICE_DISCOVERY_vAppTask's loop). */
+                SYSTEM_vSleepLockAcquire();
                 osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_WAKEUP_BIT);
             }
             continue;
@@ -392,7 +397,9 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
              * a discovery campaign without a fresh fix attempt. */
             if (POWER_tGetState() & (POWER_CLASS_NORMAL | POWER_CLASS_LOW))
             {
-                SYSTEM_vDeactivateDeepSleep();
+                /* Hold off deep sleep until the discovery campaign completes
+                 * (released at the end of DEVICE_DISCOVERY_vAppTask's loop). */
+                SYSTEM_vSleepLockAcquire();
 
                 if (eDeviceRole == DEVICE_ROLE_PRIMARY)
                     FARMRANGER_vUartOnWake();
@@ -417,12 +424,16 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             u32IntervalS > DEVICE_DISCOVERY_GPS_PRETRIGGER_S &&
             u32Phase == (u32IntervalS - DEVICE_DISCOVERY_GPS_PRETRIGGER_S))
         {
-            SYSTEM_vDeactivateDeepSleep();
+            /* Hold off deep sleep until GPS auto-shuts-down, times out, or is
+             * otherwise turned off — released inside GPS_vPowerOff(). */
+            SYSTEM_vSleepLockAcquire();
             HAL_UART_vInit();
             DEBUG_vInit();
 
             DBG("DeviceDiscovery: GPS pre-trigger\r\n");
-            GPS_vRequestFix(true);   /* auto-shutdown on completion */
+            /* auto-shutdown on completion, bounded to GPS_PRETRIGGER_S so it
+             * can never run forever */
+            GPS_vRequestFix(true, 60);
         }
 #endif
     }
