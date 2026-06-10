@@ -216,9 +216,12 @@ void HAL_UART_vTxPutBuffer(hal_uart_t *drv, const uint8_t *data, uint16_t length
 {
     for (uint16_t idx = 0; idx < length; idx++)
     {
+        /* Push into the interrupt-driven TX ring; only yield when the ring is
+         * full (waiting for the ISR to drain), not after every byte. Otherwise
+         * output is throttled to ~1 KB/s, which makes a flash-log dump take
+         * minutes. With this, throughput is limited by the UART baud rate. */
         while (!HAL_UART_vTxPutByte(drv, data[idx]))
-            ;
-        osDelay(1);
+            osDelay(1);
     }
 }
 

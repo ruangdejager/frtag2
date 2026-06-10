@@ -32,6 +32,9 @@
 #include "Power.h"
 #include "flashLog.h"
 #include "GPS.h"
+#include "SolarPower.h"
+#include "SolarPower_Config.h"
+#include "Debug.h"
 
 /* ---- Private defines ---- */
 #define APP_TASK_STACK_SIZE     (configMINIMAL_STACK_SIZE * 10)
@@ -42,8 +45,9 @@ static osThreadId_t      DeviceDiscoveryAppTask_handle;
 static osThreadId_t      DeviceDiscoveryWakeupTask_handle;
 
 /* ---- Device state ---- */
-DeviceRole_e eDeviceRole;
-uint32_t     u32DreqId;
+DeviceRole_e              eDeviceRole;
+uint32_t                  u32DreqId;
+static volatile ProductionState_e eProductionState = PRODUCTION_READY;
 
 /* ---- Forward declarations ---- */
 static void DEVICE_DISCOVERY_vRecoveryMode(void);
@@ -65,8 +69,8 @@ void DEVICE_DISCOVERY_vInit(void)
     };
     static const osThreadAttr_t wakeup_attr = {
         .name       = "CheckWakeupSched",
-        .stack_size = configMINIMAL_STACK_SIZE * sizeof(StackType_t),
-        .priority   = osPriorityBelowNormal,
+        .stack_size = configMINIMAL_STACK_SIZE * 2 * sizeof(StackType_t),
+        .priority   = osPriorityNormal,
     };
 
     DeviceDiscoveryAppTask_handle =
@@ -78,15 +82,15 @@ void DEVICE_DISCOVERY_vInit(void)
     configASSERT(DeviceDiscoveryWakeupTask_handle != NULL);
 
     uint32_t u32ModifiedCSR = u32GetCSR() >> 5;
-    LOG(LOG_RESET_CAUSE, u32ModifiedCSR);
+    EVTLOG(LOG_RESET_CAUSE, u32ModifiedCSR);
 
-    DBG("DeviceDiscovery: Initialized.\r\n");
-    LOG(LOG_DISCOVERY_INIT, eDeviceRole);
+    DBG_LOG("DeviceDiscovery: Initialized.\r\n");
+    EVTLOG(LOG_DISCOVERY_INIT, eDeviceRole);
 
     if (eDeviceRole == DEVICE_ROLE_PRIMARY)
-        DBG("DeviceDiscovery: Device Role = PRIMARY\r\n");
+        DBG_LOG("DeviceDiscovery: Device Role = PRIMARY\r\n");
     else
-        DBG("DeviceDiscovery: Device Role = SECONDARY\r\n");
+        DBG_LOG("DeviceDiscovery: Device Role = SECONDARY\r\n");
 }
 
 /* --------------------------------------------------------------------------
@@ -112,35 +116,26 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         if (!bKernelWakeup)
         {
 
-#ifdef ENABLE_GPS
-        /* ---- GPS fix ---- */
-        GPS_vStart(osThreadGetId());
-        osThreadFlagsWait(GPS_NOTIFY_FIX_OK | GPS_NOTIFY_FIX_TIMEOUT,
-                          osFlagsWaitAny,
-                          10000);
-
-        gnss_coord_deg_t lat, lon;
-        if (GPS_bGetCoordinates(&lat, &lon))
-        {
-            /* lat.fDegrees, lon.fDegrees — or use i32MicroDeg for integer math */
-        }
-        GPS_vStop();
-#endif
+        /* GPS is NOT acquired here — the wake-schedule task pre-triggers it
+         * 3 minutes before this wake. Consumers (MeshNetwork payload,
+         * logger metadata, etc.) read the last known fix on demand via
+         * GPS_bGetLastKnownFix() and use its age to decide. The AppTask
+         * never blocks on a GPS fix. */
 
         /* ---- Prepare for new campaign ---- */
         MESHNETWORK_vClearDiscoveredNeighbors();
         MESHNETWORK_vResetDreqWaveCnt();
 
-        DBG("DeviceDiscovery %X: Woke up for discovery.\r\n",
+        DBG_LOG("DeviceDiscovery %X: Woke up for discovery.\r\n",
             LORARADIO_u32GetUniqueId());
 
         osDelay(APP_WAKEUP_BUFFER_MS);
-        LOG(LOG_DISCOVERY_START, eDeviceRole);
+        EVTLOG(LOG_DISCOVERY_START, eDeviceRole);
 
 #ifdef LISTENER_MODE
 
         /* Listener: passively observe the full discovery window */
-        DBG("DeviceDiscovery %X: LISTENER MODE - monitoring for %d ms\r\n",
+        DBG_LOG("DeviceDiscovery %X: LISTENER MODE - monitoring for %d ms\r\n",
             LORARADIO_u32GetUniqueId(), APP_DISCOVERY_WINDOW_TIMEOUT_MS);
 
         {
@@ -150,10 +145,10 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                                            APP_DISCOVERY_WINDOW_TIMEOUT_MS);
 
             if (!(r & osFlagsError))
-                DBG("DeviceDiscovery %X: Listener received TimeSync\r\n",
+                DBG_LOG("DeviceDiscovery %X: Listener received TimeSync\r\n",
                     LORARADIO_u32GetUniqueId());
             else
-                DBG("DeviceDiscovery %X: Listener window timed out\r\n",
+                DBG_LOG("DeviceDiscovery %X: Listener window timed out\r\n",
                     LORARADIO_u32GetUniqueId());
         }
 
@@ -165,12 +160,12 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             if (MESHNETWORK_bGetDiscoveredNeighbors(tNeighbors, MESH_MAX_NEIGHBORS,
                                                     &u16NeighborCount))
             {
-                DBG("DeviceDiscovery %X: Listener observed %u device(s).\r\n",
+                DBG_LOG("DeviceDiscovery %X: Listener observed %u device(s).\r\n",
                     LORARADIO_u32GetUniqueId(), u16NeighborCount);
-                LOG(LOG_DISCOVERY_COUNT, u16NeighborCount);
+                EVTLOG(LOG_DISCOVERY_COUNT, u16NeighborCount);
                 for (uint16_t i = 0; i < u16NeighborCount; i++)
                 {
-                    DBG("  ID:%X  Hops:%X  RSSI:%d  Bat:%d  Wave:%d\r\n",
+                    DBG_LOG("  ID:%X  Hops:%X  RSSI:%d  Bat:%d  Wave:%d\r\n",
                         tNeighbors[i].u32DeviceId,
                         tNeighbors[i].u8HopCount,
                         tNeighbors[i].i16Rssi,
@@ -180,7 +175,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             }
             else
             {
-                DBG("DeviceDiscovery %X: Error retrieving neighbor table.\r\n",
+                DBG_LOG("DeviceDiscovery %X: Error retrieving neighbor table.\r\n",
                     LORARADIO_u32GetUniqueId());
             }
         }
@@ -190,7 +185,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         if (eDeviceRole == DEVICE_ROLE_PRIMARY)
         {
             bool bDiscoveryFinished = false;
-            DBG("DeviceDiscovery: Primary starting discovery campaign\r\n");
+            DBG_LOG("DeviceDiscovery: Primary starting discovery campaign\r\n");
 
             while (!bDiscoveryFinished)
             {
@@ -226,13 +221,13 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 }
                 else
                 {
-                    DBG("DeviceDiscovery: Primary extending discovery with new DReq wave\r\n");
+                    DBG_LOG("DeviceDiscovery: Primary extending discovery with new DReq wave\r\n");
                 }
             }
         }
         else
         {
-            DBG("DeviceDiscovery %X: Secondary waiting for timesync.\r\n",
+            DBG_LOG("DeviceDiscovery %X: Secondary waiting for timesync.\r\n",
                 LORARADIO_u32GetUniqueId());
 
             osThreadFlagsClear(DEVICE_DISCOVERY_NOTIFY_TIMESYNC);
@@ -241,10 +236,10 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                                            APP_DISCOVERY_WINDOW_TIMEOUT_MS);
 
             if (!(r & osFlagsError))
-                DBG("DeviceDiscovery: Secondary %04X: TimeSync received\r\n",
+                DBG_LOG("DeviceDiscovery: Secondary %04X: TimeSync received\r\n",
                     LORARADIO_u32GetUniqueId());
             else
-                DBG("DeviceDiscovery: Secondary %04X: TimeSync timed out\r\n",
+                DBG_LOG("DeviceDiscovery: Secondary %04X: TimeSync timed out\r\n",
                     LORARADIO_u32GetUniqueId());
 
             MESHNETWORK_vStopBeaconing(u32DreqId);
@@ -255,9 +250,9 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         /* ----------------------------------------------------------------
          * Discovery complete — log and upload (primary only)
          * ---------------------------------------------------------------- */
-        DBG("DeviceDiscovery %X: Discovery complete.\r\n",
+        DBG_LOG("DeviceDiscovery %X: Discovery complete.\r\n",
             LORARADIO_u32GetUniqueId());
-        LOG(LOG_DISCOVERY_CMPLT, eDeviceRole);
+        EVTLOG(LOG_DISCOVERY_CMPLT, eDeviceRole);
 
 #ifndef LISTENER_MODE
         if (eDeviceRole == DEVICE_ROLE_PRIMARY)
@@ -268,12 +263,12 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             if (MESHNETWORK_bGetDiscoveredNeighbors(tNeighbors, MESH_MAX_NEIGHBORS,
                                                     &u16NeighborCount))
             {
-                DBG("DeviceDiscovery %X: Final UNION: %u neighbors.\r\n",
+                DBG_LOG("DeviceDiscovery %X: Final UNION: %u neighbors.\r\n",
                     LORARADIO_u32GetUniqueId(), u16NeighborCount);
-                LOG(LOG_DISCOVERY_COUNT, u16NeighborCount);
+                EVTLOG(LOG_DISCOVERY_COUNT, u16NeighborCount);
                 for (uint16_t i = 0; i < u16NeighborCount; i++)
                 {
-                    DBG("  ID:%X  Hops:%X  RSSI:%d  Bat:%d  Wave:%d\r\n",
+                    DBG_LOG("  ID:%X  Hops:%X  RSSI:%d  Bat:%d  Wave:%d\r\n",
                         tNeighbors[i].u32DeviceId,
                         tNeighbors[i].u8HopCount,
                         tNeighbors[i].i16Rssi,
@@ -283,7 +278,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             }
             else
             {
-                DBG("DeviceDiscovery %X: Error retrieving neighbor table.\r\n",
+                DBG_LOG("DeviceDiscovery %X: Error retrieving neighbor table.\r\n",
                     LORARADIO_u32GetUniqueId());
             }
 
@@ -291,14 +286,14 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             /* ---- Logger connection + upload ---- */
             DEVICE_DISCOVERY_DRIVER_bConnectLogger();
 
-            DBG("DeviceDiscovery %X: Logger connected.\r\n",
+            DBG_LOG("DeviceDiscovery %X: Logger connected.\r\n",
                 LORARADIO_u32GetUniqueId());
 
             if (DEVICE_DISCOVERY_bSendDiscoveryData(tNeighbors, u16NeighborCount))
-                DBG("DeviceDiscovery %X: Log SUCCESS.\r\n", LORARADIO_u32GetUniqueId());
+                DBG_LOG("DeviceDiscovery %X: Log SUCCESS.\r\n", LORARADIO_u32GetUniqueId());
             else
             {
-                DBG("DeviceDiscovery %X: Log FAILED.\r\n", LORARADIO_u32GetUniqueId());
+                DBG_LOG("DeviceDiscovery %X: Log FAILED.\r\n", LORARADIO_u32GetUniqueId());
                 osDelay(2000);
             }
 
@@ -307,7 +302,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             if (now > 0)
                 RTC_vSetUTC(now);
             else
-                DBG("DeviceDiscovery: Failed to get timestamp\r\n");
+                DBG_LOG("DeviceDiscovery: Failed to get timestamp\r\n");
 
             /* ---- Wake-interval update ---- */
             uint8_t u8WakeInterval = DEVICE_DISCOVERY_DRIVER_u8RequestInterval();
@@ -321,7 +316,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
             /* ---- Send TimeSync to secondaries ---- */
             DEVICE_DISCOVERY_vSendTS();
-            LOG(LOG_TX_TS, 1);
+            EVTLOG(LOG_TX_TS, 1);
 
             osDelay(5000);
         }
@@ -338,8 +333,8 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             if ((eDeviceRole == DEVICE_ROLE_SECONDARY) &&
                 ((now - last_heard) > (uint64_t)LOST_PRIMARY_TIMEOUT_MIN * 60))
             {
-                DBG("DeviceDiscovery: ENTERING RECOVERY MODE.\r\n");
-                LOG(LOG_DISCOVERY_RECOVER, 1);
+                DBG_LOG("DeviceDiscovery: ENTERING RECOVERY MODE.\r\n");
+                EVTLOG(LOG_DISCOVERY_RECOVER, 1);
                 DEVICE_DISCOVERY_vRecoveryMode();
             }
         }
@@ -350,12 +345,15 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         /* ---- Deep sleep ---- */
         MESHNETWORK_vResetNodeRole();
 
-        LOG(LOG_DEVICE_ENTERING_SLEEP, eDeviceRole);
-        DBG("DeviceDiscovery: Waiting for synchronized wake-up...\r\n");
+        EVTLOG(LOG_DEVICE_ENTERING_SLEEP, eDeviceRole);
+        DBG_LOG("DeviceDiscovery: Waiting for synchronized wake-up...\r\n");
         osDelay(100);
-        BSP_LED_Off(LED_YELLOW);
+//        BSP_LED_Off(LED_YELLOW);
         LORARADIO_vEnterDeepSleep();
-        SYSTEM_vActivateDeepSleep();
+
+        /* Campaign complete — release the sleep lock taken when this wake
+         * was triggered (Discovery wake trigger or ProductionSleep exit). */
+        SYSTEM_vSleepLockRelease();
     }
 }
 
@@ -377,25 +375,74 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
         /* Block until the platform heartbeat fires (any flag) */
         osThreadFlagsWait(0x7FFFFFFFU, osFlagsWaitAny, osWaitForever);
 
-        if (RTC_u64GetUTC() % ((uint64_t)MESHNETWORK_u8GetWakeupInterval() * 60) == 0)
+        uint64_t u64Utc       = RTC_u64GetUTC();
+        uint32_t u32IntervalS = (uint32_t)MESHNETWORK_u8GetWakeupInterval() * 60U;
+        uint32_t u32Phase     = (uint32_t)(u64Utc % (uint64_t)u32IntervalS);
+
+        /* ---- ProductionSleep: secondary only — primary has no solar panel ---- */
+        if (eDeviceRole == DEVICE_ROLE_SECONDARY && eProductionState == PRODUCTION_SLEEP)
         {
-            if (POWER_tGetState() & POWER_CLASS_NORMAL)
+            if (SOLAR_u32GetPowerMW() >= SOLAR_ACTIVATION_POWER_MW)
             {
-                SYSTEM_vDeactivateDeepSleep();
+                eProductionState = PRODUCTION_ACTIVE;
+                DBG_LOG("DeviceDiscovery: Solar activation (%lu mW) — exiting ProductionSleep\r\n",
+                    SOLAR_u32GetPowerMW());
+                /* Hold off deep sleep until the resulting campaign completes
+                 * (released at the end of DEVICE_DISCOVERY_vAppTask's loop). */
+                SYSTEM_vSleepLockAcquire();
+                osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_WAKEUP_BIT);
+            }
+            continue;
+        }
+
+        BSP_LED_Toggle(LED_YELLOW);
+        /* --- Discovery wake trigger (phase == 0) --- */
+        if (u32Phase == 0U)
+        {
+            /* Scheduled wakes still fire in LOW; only RECOVERY suppresses them.
+             * GPS gates strictly on NORMAL itself, so a LOW wake just produces
+             * a discovery campaign without a fresh fix attempt. */
+            if (POWER_tGetState() & (POWER_CLASS_NORMAL | POWER_CLASS_LOW))
+            {
+                /* Hold off deep sleep until the discovery campaign completes
+                 * (released at the end of DEVICE_DISCOVERY_vAppTask's loop). */
+                SYSTEM_vSleepLockAcquire();
 
                 if (eDeviceRole == DEVICE_ROLE_PRIMARY)
                     FARMRANGER_vUartOnWake();
 
-#ifdef ENABLE_DBG_UART
                 HAL_UART_vInit();
-                DBG_UART_vInit();
-#endif
+                DEBUG_vInit();
+
                 LORARADIO_vWakeUp();
 
-                DBG("\r\n--- WAKEUP ---\r\n");
+                DBG_LOG("\r\n--- WAKEUP ---\r\n");
                 osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_WAKEUP_BIT);
+
             }
         }
+
+#ifdef ENABLE_GPS
+        /* --- GPS pre-trigger (SECONDARY only) ---
+         * GPS is not fitted on PRIMARY boards. Fire-and-forget 3 minutes
+         * before each scheduled wake so a fresh fix is cached by the time
+         * the AppTask runs. The AppTask never blocks on a GPS result. */
+        if (eDeviceRole == DEVICE_ROLE_SECONDARY &&
+            u32IntervalS > DEVICE_DISCOVERY_GPS_PRETRIGGER_S &&
+            u32Phase == (u32IntervalS - DEVICE_DISCOVERY_GPS_PRETRIGGER_S))
+        {
+            /* Hold off deep sleep until GPS auto-shuts-down, times out, or is
+             * otherwise turned off — released inside GPS_vPowerOff(). */
+            SYSTEM_vSleepLockAcquire();
+            HAL_UART_vInit();
+            DEBUG_vInit();
+
+            DBG("DeviceDiscovery: GPS pre-trigger\r\n");
+            /* auto-shutdown on completion, bounded to GPS_PRETRIGGER_S so it
+             * can never run forever */
+            GPS_vRequestFix(true, 60);
+        }
+#endif
     }
 }
 
@@ -404,7 +451,7 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
  * -------------------------------------------------------------------------- */
 static void DEVICE_DISCOVERY_vSendTS(void)
 {
-    DBG("\r\n--- START TIMESYNC ---\r\n");
+    DBG_LOG("\r\n--- START TIMESYNC ---\r\n");
     MESHNETWORK_vSendTimeSync(RTC_u64GetUTC(), MESHNETWORK_tGetWakeupInterval());
 }
 
@@ -447,13 +494,35 @@ osThreadId_t DEVICE_DISCOVERY_xGetTaskHandle(void)
 }
 
 /* --------------------------------------------------------------------------
+ * DEVICE_DISCOVERY_vEnterProductionSleep
+ * -------------------------------------------------------------------------- */
+void DEVICE_DISCOVERY_vEnterProductionSleep(void)
+{
+    if (eDeviceRole != DEVICE_ROLE_SECONDARY)
+    {
+        DBG_LOG("DeviceDiscovery: ProductionSleep not applicable on primary device\r\n");
+        return;
+    }
+    eProductionState = PRODUCTION_SLEEP;
+    DBG_LOG("DeviceDiscovery: Entering ProductionSleep\r\n");
+}
+
+/* --------------------------------------------------------------------------
+ * DEVICE_DISCOVERY_eGetProductionState
+ * -------------------------------------------------------------------------- */
+ProductionState_e DEVICE_DISCOVERY_eGetProductionState(void)
+{
+    return eProductionState;
+}
+
+/* --------------------------------------------------------------------------
  * DEVICE_DISCOVERY_vRecoveryMode
  *
  * Listens for up to 2 hours for the primary to reappear.
  * -------------------------------------------------------------------------- */
 static void DEVICE_DISCOVERY_vRecoveryMode(void)
 {
-    DBG("DeviceDiscovery: Node %X recovery; LISTENING FOR PRIMARY.\r\n",
+    DBG_LOG("DeviceDiscovery: Node %X recovery; LISTENING FOR PRIMARY.\r\n",
         LORARADIO_u32GetUniqueId());
 
     for (uint16_t i = 0; i < 120 * 60; i++)
@@ -465,15 +534,15 @@ static void DEVICE_DISCOVERY_vRecoveryMode(void)
         if (last_heard != 0 &&
             (HAL_RTC_u64GetValue() - last_heard) < (uint64_t)LOST_PRIMARY_TIMEOUT_MIN * 60)
         {
-            DBG("DeviceDiscovery: Node %X recovered; PRIMARY FOUND.\r\n",
+            DBG_LOG("DeviceDiscovery: Node %X recovered; PRIMARY FOUND.\r\n",
                 LORARADIO_u32GetUniqueId());
-            LOG(LOG_DISCOVERY_RECOVER, 2);
+            EVTLOG(LOG_DISCOVERY_RECOVER, 2);
             return;
         }
     }
 
-    DBG("DeviceDiscovery: Node %X not recovered; NO PRIMARY FOUND.\r\n",
+    DBG_LOG("DeviceDiscovery: Node %X not recovered; NO PRIMARY FOUND.\r\n",
         LORARADIO_u32GetUniqueId());
-    LOG(LOG_DISCOVERY_RECOVER, 3);
+    EVTLOG(LOG_DISCOVERY_RECOVER, 3);
     MESHNETWORK_vUpdatePrimaryLastSeen();
 }

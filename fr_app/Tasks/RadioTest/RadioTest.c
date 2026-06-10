@@ -64,7 +64,7 @@ static void RADIO_TEST_vTask(void *arg)
      */
     osDelay(500U);
 
-    DBG("\r\nRadioTest: started — transmitting \"Blink!\\r\\n\" at 0.5 Hz\r\n");
+    DBG_LOG("\r\nRadioTest: started — transmitting \"Blink!\\r\\n\" at 0.5 Hz\r\n");
 
     for (;;)
     {
@@ -76,9 +76,9 @@ static void RADIO_TEST_vTask(void *arg)
         memcpy(pkt.buffer, msg, pkt.length);
 
         if (LORARADIO_bTxPacket(&pkt))
-            DBG("RadioTest: TX enqueued\r\n");
+            DBG_LOG("RadioTest: TX enqueued\r\n");
         else
-            DBG("RadioTest: TX queue full!\r\n");
+            DBG_LOG("RadioTest: TX queue full!\r\n");
 
         osDelay(RADIO_TEST_PERIOD_MS);
     }
