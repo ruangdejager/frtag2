@@ -64,7 +64,7 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
-#define configTOTAL_HEAP_SIZE                    ((size_t)3072)
+#define configTOTAL_HEAP_SIZE                    ((size_t)49152)  /* 48 KB — sized for all tasks incl. GPS dispatcher + RX */
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0
@@ -156,6 +156,22 @@ standard names. */
 
 /* USER CODE BEGIN Defines */
 /* Section where parameter definitions can be added (for instance, to override default ones in FreeRTOS.h) */
+
+/* Tickless idle: a custom vPortSuppressTicksAndSleep() in Hal/src/hal_system.c
+ * overrides the weak ARM_CM3 port implementation. It parks the core in STOP2
+ * between RTC heartbeats and reconciles the FreeRTOS tick from the RTC on wake.
+ * The default SysTick-based suppress logic is unusable here because SysTick is
+ * stopped in STOP2; the RTC (LSE) is the only timebase that survives sleep.
+ * INCLUDE_vTaskSuspend (above) is required and already set to 1. */
+#define configUSE_TICKLESS_IDLE                  1
+
+/* Trap stack overflows instead of letting them corrupt silently. Method 2
+ * checks the magic-pattern fill at the stack end on every context switch (in
+ * addition to the high-water check), so it catches a task that overruns deep
+ * inside a call (e.g. the radio init) rather than only at switch-out boundaries.
+ * Requires vApplicationStackOverflowHook() — defined in Core/Src/app_freertos.c. */
+#define configCHECK_FOR_STACK_OVERFLOW           2
+
 /* USER CODE END Defines */
 
 #endif /* FREERTOS_CONFIG_H */

@@ -20,6 +20,16 @@
 #define APP_WAKEUP_BUFFER_MS                (5  * 1000)   /* buffer after sync wake-up   */
 #define APP_DISCOVERY_WINDOW_TIMEOUT_MS     (180 * 1000)  /* max discovery window        */
 
+/* GPS pre-trigger lead time: how many seconds before each scheduled wake the
+ * wake-schedule task asks the GPS module for a fresh fix. The dispatcher runs
+ * asynchronously; the AppTask never blocks waiting for it. */
+#define DEVICE_DISCOVERY_GPS_PRETRIGGER_S   180U          /* 3 minutes              */
+
+/* Kernel wakeup (shake-sequence): how long to wait for the user to start a
+ * FrKernel session (send any "tag ..." command) before giving up and letting
+ * the device return to deep sleep. */
+#define DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS  (60 * 1000)  /* 60 seconds */
+
 #define LOST_PRIMARY_TIMEOUT_MIN            480           /* ~8 hours before recovery    */
 
 /* ---- Tiered recovery configuration ---- */
@@ -59,6 +69,9 @@
 /* osEventFlags bit — set by wakeup-schedule task to start a campaign */
 #define DISCOVERY_WAKEUP_BIT                (1UL << 0)
 
+/* osEventFlags bit — set by Movement to bypass deep sleep into FrKernel */
+#define DISCOVERY_KERNEL_BIT                (1UL << 1)
+
 /* Thread flag bit — set by MeshNetwork when a TimeSync packet is received */
 #define DEVICE_DISCOVERY_NOTIFY_TIMESYNC    (1UL << 0)
 
@@ -69,11 +82,22 @@
 #define DEVICE_DISCOVERY_DRIVER_u8RequestInterval()          FARMRANGER_u8RequestInterval()
 #define DEVICE_DISCOVERY_bSendDiscoveryData(items, size)     FARMRANGER_bLogData(items, size)
 
+/* ---- Production sleep state ---- */
+typedef enum {
+    PRODUCTION_READY  = 0,  /* initial state — normal operation (dev/test) */
+    PRODUCTION_SLEEP  = 1,  /* super deep sleep, waiting for solar activation */
+    PRODUCTION_ACTIVE = 2,  /* solar-activated, full discovery running */
+} ProductionState_e;
+
 /* ---- Public API ---- */
-void          DEVICE_DISCOVERY_vInit(void);
-void          DEVICE_DISCOVERY_vAppTask(void *pvParameters);
-void          DEVICE_DISCOVERY_vConfigDeviceRole(void);
-DeviceRole_e  DEVICE_DISCOVERY_eGetDeviceRole(void);
-osThreadId_t  DEVICE_DISCOVERY_xGetTaskHandle(void);
+void               DEVICE_DISCOVERY_vInit(void);
+void               DEVICE_DISCOVERY_vAppTask(void *pvParameters);
+void               DEVICE_DISCOVERY_vConfigDeviceRole(void);
+DeviceRole_e       DEVICE_DISCOVERY_eGetDeviceRole(void);
+osThreadId_t       DEVICE_DISCOVERY_xGetTaskHandle(void);
+void               DEVICE_DISCOVERY_vTriggerKernelWakeup(void);
+
+void               DEVICE_DISCOVERY_vEnterProductionSleep(void);
+ProductionState_e  DEVICE_DISCOVERY_eGetProductionState(void);
 
 #endif /* TASKS_DEVICEDISCOVERY_DEVICEDISCOVERY_H_ */

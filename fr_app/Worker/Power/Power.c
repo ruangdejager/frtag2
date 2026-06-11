@@ -60,7 +60,16 @@ void POWER_vInit(void)
 void POWER_vSetModeNormal(void)
 {
     osEventFlagsSet(gPowerEvents,   POWER_CLASS_NORMAL | POWER_CLASS_ALWAYS);
-    osEventFlagsClear(gPowerEvents, POWER_CLASS_RECOVERY);
+    osEventFlagsClear(gPowerEvents, POWER_CLASS_LOW | POWER_CLASS_RECOVERY);
+}
+
+/* --------------------------------------------------------------------------
+ * POWER_vSetModeLow
+ * -------------------------------------------------------------------------- */
+void POWER_vSetModeLow(void)
+{
+    osEventFlagsSet(gPowerEvents,   POWER_CLASS_LOW | POWER_CLASS_ALWAYS);
+    osEventFlagsClear(gPowerEvents, POWER_CLASS_NORMAL | POWER_CLASS_RECOVERY);
 }
 
 /* --------------------------------------------------------------------------
@@ -69,7 +78,7 @@ void POWER_vSetModeNormal(void)
 void POWER_vSetModeRecovery(void)
 {
     osEventFlagsSet(gPowerEvents,   POWER_CLASS_RECOVERY | POWER_CLASS_ALWAYS);
-    osEventFlagsClear(gPowerEvents, POWER_CLASS_NORMAL);
+    osEventFlagsClear(gPowerEvents, POWER_CLASS_NORMAL | POWER_CLASS_LOW);
 }
 
 /* --------------------------------------------------------------------------
@@ -93,6 +102,15 @@ uint32_t POWER_tGetState(void)
 
 /* --------------------------------------------------------------------------
  * POWER_vStateManagerTask — heartbeat-driven voltage check (secondary only)
+ *
+ * Three-class state machine driven by battery voltage:
+ *
+ *   NORMAL   ──(V ≤ ENTER_LOW_MV)──►  LOW       ──(V ≤ ENTER_RECOVERY_MV)──►  RECOVERY
+ *   NORMAL  ◄──(V ≥ EXIT_LOW_MV) ──   LOW      ◄──(V ≥ EXIT_RECOVERY_MV) ──   RECOVERY
+ *
+ * Hysteresis windows prevent oscillation:
+ *   LOW ↔ NORMAL boundary  : 20 mV (3500 → 3520)
+ *   LOW ↔ RECOVERY boundary: 50 mV (3400 → 3450)
  * -------------------------------------------------------------------------- */
 static void POWER_vStateManagerTask(void *arg)
 {
@@ -104,18 +122,31 @@ static void POWER_vStateManagerTask(void *arg)
     {
         osThreadFlagsWait(0x7FFFFFFFU, osFlagsWaitAny, osWaitForever);
 
-        uint16_t batVoltage = BAT_u16GetVoltage();
+        uint16_t u16Bat   = BAT_u16GetVoltage();
+        uint32_t u32State = POWER_tGetState();
 
-        if ((POWER_tGetState() & POWER_CLASS_NORMAL) &&
-            batVoltage < ENTER_RECOVERY_MV)
+        if (u32State & POWER_CLASS_NORMAL)
         {
-            POWER_vSetModeRecovery();
+            /* From NORMAL, drop to LOW when at/below ENTER_LOW_MV.
+             * A direct NORMAL→RECOVERY transition is also covered: LOW will
+             * collapse to RECOVERY on the next tick if voltage stays low. */
+            if (u16Bat <= ENTER_LOW_MV)
+                POWER_vSetModeLow();
         }
-
-        if (!(POWER_tGetState() & POWER_CLASS_NORMAL) &&
-            batVoltage > EXIT_RECOVERY_MV)
+        else if (u32State & POWER_CLASS_LOW)
         {
-            POWER_vSetModeNormal();
+            if (u16Bat <= ENTER_RECOVERY_MV)
+                POWER_vSetModeRecovery();
+            else if (u16Bat >= EXIT_LOW_MV)
+                POWER_vSetModeNormal();
+        }
+        else if (u32State & POWER_CLASS_RECOVERY)
+        {
+            /* RECOVERY only releases up to LOW; LOW→NORMAL is a separate
+             * step that requires another EXIT_LOW_MV crossing. This makes
+             * the climb out of a deep brown-out conservative. */
+            if (u16Bat >= EXIT_RECOVERY_MV)
+                POWER_vSetModeLow();
         }
     }
 }

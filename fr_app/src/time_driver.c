@@ -13,7 +13,6 @@
 
 #include "platform.h"
 #include "dbg_log.h"
-#include "Movement.h"
 
 /* Day-of-week strings */
 static const char acTimeDayOfWeekSun[] = "Sun";
@@ -135,21 +134,13 @@ void TIME_vTick(void)
     /* Detect DTZ change */
     if (tTimeDayTimeZonePrev != tTimeDayTimeZoneNow)
     {
-        DBG("DTZ change: %s, %s [%u %u %c %c %u %u]\r\n",
-            TIME_pacGetDayTimeZoneNow(),
-            (MOVE_bIsAlarmActiveNow() ? "ACTIVE" : "INACTIVE"),
-            MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_MAX_LEVEL),
-            MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_MAX_WINDOW),
-            (MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_FIRST_HOLD) ? 'Y' : 'N'),
-            (MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_SECOND_HOLD) ? 'Y' : 'N'),
-            MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_MIN_LEVEL),
-            MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_MIN_WINDOW));
+        DBG_LOG("DTZ change: %s\r\n", TIME_pacGetDayTimeZoneNow());
 
         bTimeDtzChange = true;
     }
 
     if (tTimeSeasonPrev != tTimeSeasonNow)
-        DBG("Season changed; now=%s\r\n", TIME_pacGetSeasonNow());
+        DBG_LOG("Season changed; now=%s\r\n", TIME_pacGetSeasonNow());
 
     tTimeSeasonPrev      = tTimeSeasonNow;
     tTimeDayTimeZonePrev = tTimeDayTimeZoneNow;
