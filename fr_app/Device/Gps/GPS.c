@@ -895,6 +895,12 @@ static void GPS_vDispatcherTask(void *parameters)
         GPS_vSessionArm();
         osMutexRelease(xGpsLock);
 
+        /* Drop any FIX_OK/FIX_TIMEOUT/SHUTDOWN bits left pending from a prior
+         * session (e.g. a wall-clock timeout below racing a late NMEA-driven
+         * notification) so the poll loop below can't return immediately on a
+         * stale flag. */
+        osThreadFlagsClear(GPS_DISP_FIX_OK_BIT | GPS_DISP_FIX_TIMEOUT_BIT | GPS_DISP_SHUTDOWN_BIT);
+
         /* ---- Acquiring: poll until terminal event or power loss ---- */
         gps_result_e eResult = GPS_RESULT_FIX_TIMEOUT;
 
@@ -928,6 +934,45 @@ static void GPS_vDispatcherTask(void *parameters)
                 osMutexRelease(xGpsLock);
                 eResult = GPS_RESULT_NO_POWER;
                 break;
+            }
+
+            /* 5 s poll tick — wall-clock TTFF fallback.
+             *
+             * GNSS_vOnSolution() (the only place that normally raises
+             * FIX_OK/FIX_TIMEOUT) is only invoked once a full RMC+GSV epoch
+             * has been parsed (GPS_bOnRxByte). Under poor signal the module
+             * can stop emitting one of those sentences (commonly GSV when 0
+             * SVs are tracked) entirely — GnssSession.u16TtffTmr then never
+             * advances and the TTFF check inside GNSS_vOnSolution() is never
+             * reached, so FIX_TIMEOUT_BIT is never set and this loop would
+             * otherwise spin forever (while POWER_CLASS_NORMAL holds).
+             *
+             * Enforce the TTFF deadline here too, purely from the RTC tick
+             * count, independent of NMEA reception. GNSS_TTFF_NO_TIMEOUT
+             * (FIX_HELD / bAutoShutdown==false sessions) is exempt — those
+             * are allowed to run indefinitely until GPS_vShutdown(). */
+            if (GnssSession.u16TtffTimeout != GNSS_TTFF_NO_TIMEOUT)
+            {
+                osMutexAcquire(xGpsLock, osWaitForever);
+                if (!bCallerNotified)
+                {
+                    uint16_t u16SessionTmr =
+                        (uint16_t)((uint32_t)RTC_u64GetTicks() - GnssSession.u32StartTime);
+
+                    if (u16SessionTmr >= GnssSession.u16TtffTimeout)
+                    {
+                        bCallerNotified = true;
+                        DBG_LOG("gps: FIX TIMEOUT (wall-clock) t=%us/%us, no NMEA epoch completed\r\n",
+                            u16SessionTmr, GnssSession.u16TtffTimeout);
+                    }
+                }
+                osMutexRelease(xGpsLock);
+
+                if (bCallerNotified)
+                {
+                    eResult = GPS_RESULT_FIX_TIMEOUT;
+                    break;
+                }
             }
         }
 
