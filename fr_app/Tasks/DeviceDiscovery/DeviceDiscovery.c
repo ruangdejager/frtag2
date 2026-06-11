@@ -51,7 +51,9 @@ uint32_t                  u32DreqId;
 static volatile ProductionState_e eProductionState = PRODUCTION_READY;
 
 /* ---- Forward declarations ---- */
+#ifdef ENABLE_LOW_POWER_RECOVERY
 static void DEVICE_DISCOVERY_vRecoveryMode(void);
+#endif
 static void DEVICE_DISCOVERY_vSendTS(void);
 static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters);
 
@@ -326,6 +328,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             osDelay(5000);
         }
 
+#ifdef ENABLE_LOW_POWER_RECOVERY
         /* ---- Recovery mode check (secondary only) ---- */
         {
             uint64_t now        = HAL_RTC_u64GetValue();
@@ -339,6 +342,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 DEVICE_DISCOVERY_vRecoveryMode();
             }
         }
+#endif /* ENABLE_LOW_POWER_RECOVERY */
 #endif /* LISTENER_MODE */
 
         } /* end if (!bKernelWakeup) */
@@ -553,6 +557,7 @@ ProductionState_e DEVICE_DISCOVERY_eGetProductionState(void)
     return eProductionState;
 }
 
+#ifdef ENABLE_LOW_POWER_RECOVERY
 /* --------------------------------------------------------------------------
  * DEVICE_DISCOVERY_vRecoveryMode  — tiered low-duty-cycle recovery
  *
@@ -785,3 +790,4 @@ static void DEVICE_DISCOVERY_vRecoveryMode(void)
         EVTLOG(LOG_DISCOVERY_RECOVER, 3);
     }
 }
+#endif /* ENABLE_LOW_POWER_RECOVERY */

@@ -76,6 +76,7 @@
 									<listOptionValue builtIn="false" value="_ENABLE_RADIO_TEST"/>
 									<listOptionValue builtIn="false" value="_ENABLE_GPS"/>
 									<listOptionValue builtIn="false" value="_LISTENER_MODE"/>
+									<listOptionValue builtIn="false" value="_ENABLE_LOW_POWER_RECOVERY"/>
 									<listOptionValue builtIn="false" value="LEDS_ALLOWED"/>
 									<listOptionValue builtIn="false" value="ENABLE_DBG_UART"/>
 									<listOptionValue builtIn="false" value="ENABLE_GPS"/>

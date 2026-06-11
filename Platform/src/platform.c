@@ -26,6 +26,7 @@
 #include "DeviceDiscovery.h"
 #include "radio_driver.h"
 #include "LoraRadio_Driver.h"
+#include "Battery.h"
 
 #include <time.h>
 #include <limits.h>
