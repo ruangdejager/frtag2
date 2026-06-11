@@ -9,13 +9,14 @@
  *   1. GPIO (board direction, charger enable)
  *   2. Device-role detection (primary vs secondary)
  *   3. UART (required by DBG macros)
- *   4. ADC, TIM2 tick counter
- *   5. Platform (creates heartbeat task — must come before HAL_RTC_vInit)
- *   6. Settings
- *   7. RTC  (starts 1 Hz wakeup interrupt — heartbeat task must exist)
- *   8. LoRa radio stack
- *   9. Role-specific subsystems
- *  10. Time, battery, power management
+ *   4. DbgLog, ext-flash, text log
+ *   5. ADC, TIM2 tick counter
+ *   6. Platform (creates heartbeat task — must come before HAL_RTC_vInit)
+ *   7. Settings
+ *   8. RTC  (starts 1 Hz wakeup interrupt — heartbeat task must exist)
+ *   9. LoRa radio stack
+ *  10. Role-specific subsystems
+ *  11. Time, battery, power management
  */
 
 #include "init.h"
@@ -27,7 +28,6 @@
 #include "hal_gpio.h"
 #include "hal_adc.h"
 #include "hal_wdt.h"
-#include "debug_uart_output.h"
 #include "settings.h"
 #include "main.h"
 
@@ -43,9 +43,14 @@
 #  include "RadioTest.h"
 #endif
 #include "Battery.h"
+#include "SolarPower.h"
 #include "Power.h"
+#include "FrKernel.h"
 
 #include "flashLog.h"
+#include "Flash.h"
+#include "Log.h"
+#include "DbgLog.h"
 
 #include "cmsis_os2.h"
 
@@ -65,12 +70,25 @@ void INIT_vInitialization(void *parameters)
 
     HAL_UART_vInit();
 
+    /* Both SPI peripherals (ACC + flash) must be up before FLASH_vInit and any
+     * DBG_LOG call that writes to ext-flash.  Single call covers both. */
+    HAL_SPI_vInit();
+
 #ifdef LISTENER_MODE
-    FARMRANGER_vInit();   /* must be first — DBG() routes through this */
-#elif defined(ENABLE_DBG_UART)
-    DBG_UART_vInit();
-    FLASHLOG_vDump();
+    FARMRANGER_vInit();   /* must be first — DBG_LOG() routes through this */
 #endif
+    DBGLOG_vInit();
+
+    FLASH_vInit();
+    LOG_vInit();
+
+    /* Ask the DbgLog consumer to stream the external-flash log over the debug
+     * UART once it runs — this replays everything DBG_LOG()/LOG() persisted in
+     * the previous run (the ext-flash readback test). Routed through the
+     * consumer so the dump never interleaves with live log output. */
+    DBGLOG_vRequestDump();
+
+    FLASHLOG_vDump();     /* no-op unless ENABLE_FLASH_LOG + DEBUG_OUTPUT_UART both defined */
 
     HAL_WDT_vReset();
 
@@ -87,13 +105,14 @@ void INIT_vInitialization(void *parameters)
     osDelay(100);
 
     LORARADIO_vInit();
+    FRKERNEL_vInit();
 
 #ifdef ENABLE_RADIO_TEST
     /*
      * Radio smoke-test mode: transmit "Blink!\r\n" at 0.5 Hz and confirm
      * the TX-done IRQ fires.  MeshNetwork and DeviceDiscovery are skipped
      * because they also drive the radio and would interfere.
-     * Enable ENABLE_DBG_UART (or LISTENER_MODE) alongside this define to
+     * Enable DEBUG_OUTPUT_UART (or LISTENER_MODE) alongside this define to
      * see the output on the debug UART.
      */
     RADIO_TEST_vInit();
@@ -103,8 +122,8 @@ void INIT_vInitialization(void *parameters)
 
     if (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY)
     {
+        SOLAR_vInit();
 #ifdef ENABLE_MOVE
-        HAL_SPI_vInit();
         ACC_vInit();
         MOVE_vInit();
 #endif

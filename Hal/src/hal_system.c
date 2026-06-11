@@ -9,6 +9,7 @@
 #include "hal_system.h"
 #include "hal_spi.h"
 #include "hal_adc.h"
+#include "hal_rtc.h"
 #include "tag_hal.h"
 #include "dbg_log.h"
 #include "init.h"
@@ -16,7 +17,8 @@
 #include "cmsis_os2.h"
 #include "DeviceDiscovery.h"
 
-static bool bSleepActive = true;
+#define MS_PER_DAY   86400000U
+
 static volatile uint32_t gSleepLockCount = 0;
 
 void SystemClock_Config(void)
@@ -61,51 +63,123 @@ void SystemClock_Config(void)
     }
 }
 
-void HAL_SYSTEM_vSleepWakeOnRtc(void)
+/* --------------------------------------------------------------------------
+ * HAL_SYSTEM_vEnterStop2
+ * Parks the core in STOP2 and restores clocks/peripherals on wake. Assumes
+ * the caller already holds a critical section (interrupts masked) and has
+ * decided that deep sleep is permitted. The pending wake interrupt (RTC
+ * heartbeat, radio, UART, accel) fires once the caller re-enables interrupts.
+ *
+ * SystemClock_Config() runs here with interrupts masked; its oscillator-ready
+ * polls exit on the ready flags (which set within microseconds), not on the
+ * HAL tick, so the frozen SysTick during this window is not a problem.
+ * -------------------------------------------------------------------------- */
+void HAL_SYSTEM_vEnterStop2(void)
 {
+    /* Red LED off while in STOP2; back on the moment we wake. The LED is
+     * therefore a direct visual indicator of the power mode: off == STOP2,
+     * on == running in any other mode. */
+    BSP_LED_Off(LED_RED);
+
     HAL_GPIO_vOnSleep();
 
-    HAL_SuspendTick();
     HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
-    HAL_ResumeTick();
 
     SystemClock_Config();
+
+    /* Restore peripherals after STOP2.  Called with interrupts still masked
+     * (cpsid i in vPortSuppressTicksAndSleep) so there is no race with any task.
+     *
+     * Order matters: HAL_GPIO_OnWake() must run first so that GPIOA/B/C clocks
+     * are enabled before HAL_SPI_vInit() calls HAL_GPIO_Init() for SPI pins.
+     * HAL_GPIO_vOnSleep() only gated the AHB clock — it did NOT modify MODER/AFR —
+     * so the pin configuration is intact; we just need the bus clock restored.
+     *
+     * USART2 needs no explicit re-init: STOP2 retains both the APB1ENR clock-
+     * enable bit and the full USART2 register state (BRR, CR1, CR2, CR3).
+     * SystemClock_Config() above restores the APB bus, so USART2 is already live
+     * with its pre-sleep baud-rate and interrupt settings.  Calling HAL_UART_vInit()
+     * here would be actively harmful — it ends with __HAL_RCC_USART2_CLK_DISABLE()
+     * (boot-time design: clock off until vSetup/vEnable) which silences the TX path. */
     HAL_GPIO_OnWake();
+    HAL_SPI_vInit();    /* SPI1 (ACC) + SPI2 (flash) */
+    HAL_ADC_vInit();
+
+    BSP_LED_On(LED_RED);
 }
 
-/* PreSleepProcessing / PostSleepProcessing are defined in
- * Core/Src/app_freertos.c (the CubeIDE FreeRTOS hook location).
- * They call HAL_SYSTEM_vOnPreSleep() / HAL_SYSTEM_vOnPostWake() below.
- */
-
-/* HAL_SYSTEM_vOnPreSleep — called by PreSleepProcessing in app_freertos.c.
- * Enters STOP2 and restores clocks/peripherals on wake. */
-void HAL_SYSTEM_vOnPreSleep(void)
+/* --------------------------------------------------------------------------
+ * vPortSuppressTicksAndSleep
+ * Custom tickless-idle hook overriding the weak ARM_CM3 port implementation.
+ *
+ * The stock implementation reprograms SysTick as the wake timer, but SysTick
+ * is stopped in STOP2, so it cannot be used here. Instead:
+ *
+ *   DEEP path  (deep-sleep active, no sleep-lock held, init complete):
+ *     stop SysTick → snapshot RTC → STOP2 → snapshot RTC on wake →
+ *     advance the FreeRTOS tick by the elapsed RTC time → restart SysTick.
+ *     The 1 Hz RTC heartbeat (or any peripheral IRQ) ends the sleep, so the
+ *     effective sleep ceiling is one heartbeat (≤ 1 s).
+ *
+ *   LIGHT path (anything else — active radio/GPS/ADC windows):
+ *     a plain WFI with SysTick left running, so all sub-second FreeRTOS
+ *     timing (osDelay, software timers) stays exact.
+ *
+ * The tick rate is 1000 Hz, so 1 RTC millisecond == 1 FreeRTOS tick.
+ * -------------------------------------------------------------------------- */
+void vPortSuppressTicksAndSleep(TickType_t xExpectedIdleTime)
 {
-    if (!INIT_bIsSleepReady()) return;
+    /* Enter a critical section without masking the interrupts that must still
+     * be able to wake the core (cpsid i, not basepri). */
+    __asm volatile("cpsid i" ::: "memory");
+    __asm volatile("dsb");
+    __asm volatile("isb");
 
-    if (bSleepActive)
+    /* A task may have become ready between the idle check and here. */
+    if (eTaskConfirmSleepModeStatus() == eAbortSleep)
     {
-        BSP_LED_Off(LED_RED);
-        HAL_GPIO_vOnSleep();
-        HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
-        SystemClock_Config();
+        __asm volatile("cpsie i" ::: "memory");
+        return;
+    }
 
-        /* Re-init SPI for secondary devices with accelerometer after STOP2 wake.
-         * SPI clocks are stopped in STOP2 and must be reconfigured. */
-#ifdef ENABLE_MOVE
-        if (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY)
-            HAL_SPI_vInit();
-#endif
+    bool bDeep = INIT_bIsSleepReady()
+              && (gSleepLockCount == 0U);
 
-        HAL_ADC_vInit();
-        HAL_GPIO_OnWake();
-        BSP_LED_On(LED_RED);
+    if (bDeep)
+    {
+        /* ---- DEEP path: STOP2, reconcile tick from the RTC ---- */
+        SysTick->CTRL &= ~SysTick_CTRL_ENABLE_Msk;     /* stop the kernel tick */
+
+        uint32_t u32T0 = HAL_RTC_u32GetMsOfDay();
+
+        HAL_SYSTEM_vEnterStop2();
+
+        uint32_t u32T1      = HAL_RTC_u32GetMsOfDay();
+        uint32_t u32Elapsed = (u32T1 >= u32T0)
+                            ? (u32T1 - u32T0)
+                            : (MS_PER_DAY - u32T0 + u32T1);   /* midnight wrap */
+
+        /* Never step past the next scheduled FreeRTOS event. */
+        if (u32Elapsed > (uint32_t)xExpectedIdleTime)
+            u32Elapsed = (uint32_t)xExpectedIdleTime;
+
+        /* Restart the kernel tick cleanly, then book the slept time. */
+        SysTick->VAL   = 0U;
+        SysTick->CTRL |= SysTick_CTRL_ENABLE_Msk;
+
+        vTaskStepTick((TickType_t)u32Elapsed);
+
+        __asm volatile("cpsie i" ::: "memory");
+    }
+    else
+    {
+        /* ---- LIGHT path: core-gated WFI, SysTick keeps running ---- */
+        __asm volatile("dsb" ::: "memory");
+        __asm volatile("wfi");
+        __asm volatile("isb");
+        __asm volatile("cpsie i" ::: "memory");
     }
 }
-
-/* HAL_SYSTEM_vOnPostWake — called by PostSleepProcessing in app_freertos.c. */
-__attribute__((weak)) void HAL_SYSTEM_vOnPostWake(void) {}
 
 bool SYSTEM_bCheckSleepModeStatus(void)
 {
@@ -125,21 +199,6 @@ void SYSTEM_vSleepLockRelease(void)
     if (gSleepLockCount > 0)
         gSleepLockCount--;
     taskEXIT_CRITICAL();
-}
-
-void SYSTEM_vActivateDeepSleep(void)
-{
-    bSleepActive = true;
-}
-
-void SYSTEM_vDeactivateDeepSleep(void)
-{
-    bSleepActive = false;
-}
-
-bool SYSTEM_bIsDeepSleepActive(void)
-{
-    return bSleepActive;
 }
 
 void Error_Handler(void)

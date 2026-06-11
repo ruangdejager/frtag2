@@ -30,7 +30,8 @@ typedef enum {
     MeshPktType_DReq     = 1,
     MeshPktType_DBeacon  = 2,
     MeshPktType_DAck     = 3,
-    MeshPktType_TimeSync = 4
+    MeshPktType_TimeSync = 4,
+    MeshPktType_FrKernel = 5    /* FrKernel command / response */
 } MeshPktType_e;
 
 /* ---- Wake-up interval enum ---- */
@@ -134,7 +135,12 @@ void          MESHNETWORK_vSetWakeupInterval(WakeupInterval tNewInterval);
 WakeupInterval MESHNETWORK_tGetWakeupInterval(void);
 uint8_t       MESHNETWORK_u8GetWakeupInterval(void);
 
+/* Called by the parser when a FrKernel packet arrives.
+ * Override in FrKernel.c when FRKERNEL_INTERFACE_LORA is defined. */
+void MESHNETWORK_vOnFrKernelPacket(const uint8_t *buf, uint8_t len);
+
 uint32_t MESHNETWORK_u32GetLastBeaconHeardTick(void);
+uint32_t MESHNETWORK_u32GetLastDiscoveryPktTick(void);  /* any DReq/DBeacon/DAck/TimeSync */
 
 uint64_t MESHNETWORK_u64GetLastPrimaryHeardTick(void);
 void     MESHNETWORK_vUpdatePrimaryLastSeen(void);

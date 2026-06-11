@@ -11,8 +11,8 @@
 #include "hal_gpio.h"
 #include "hal_adc.h"
 
-#define BAT_DRIVER_vEnableBiasCircuit()     HAL_GPIO_WritePin(BSP_BAT_BIAS_ENABLE_PORT, BSP_BAT_BIAS_ENABLE_PIN, RESET)
-#define BAT_DRIVER_vDisableBiasCircuit()    HAL_GPIO_WritePin(BSP_BAT_BIAS_ENABLE_PORT, BSP_BAT_BIAS_ENABLE_PIN, SET)
+#define BAT_DRIVER_vEnableBiasCircuit()     HAL_GPIO_WritePin(BSP_BAT_BIAS_ENABLE_PORT, BSP_BAT_BIAS_ENABLE_PIN, SET)
+#define BAT_DRIVER_vDisableBiasCircuit()    HAL_GPIO_WritePin(BSP_BAT_BIAS_ENABLE_PORT, BSP_BAT_BIAS_ENABLE_PIN, RESET)
 
 #define BAT_DRIVER_vEnable()                HAL_ADC_vEnable()
 #define BAT_DRIVER_bIsEnabled()             HAL_ADC_bIsEnabled()

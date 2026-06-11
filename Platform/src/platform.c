@@ -24,11 +24,9 @@
 #include "LoraRadio.h"
 #include "MeshNetwork.h"
 #include "DeviceDiscovery.h"
-#include "Movement.h"
 #include "radio_driver.h"
 #include "LoraRadio_Driver.h"
 
-#include <time.h>
 #include <limits.h>
 
 typedef struct {
@@ -50,7 +48,7 @@ void PLATFORM_vInit(void)
 {
     static const osThreadAttr_t heartbeat_attr = {
         .name       = "Heartbeat",
-        .stack_size = configMINIMAL_STACK_SIZE * 4 * sizeof(uint32_t),
+        .stack_size = configMINIMAL_STACK_SIZE * 4 * sizeof(StackType_t),
         .priority   = osPriorityNormal,
     };
 
@@ -80,12 +78,6 @@ void PLATFORM_vHeartbeatDispatchTask(void *parameters)
 
         /* Housekeeping ---------------------------------------------------- */
         TIME_vTick();
-        if (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY)
-        {
-#ifdef ENABLE_MOVE
-            MOVE_bTick();
-#endif
-        }
         /* ------------------------------------------------------------------ */
 
         /* Notify all enabled subscribers ----------------------------------- */
@@ -99,13 +91,12 @@ void PLATFORM_vHeartbeatDispatchTask(void *parameters)
         osMutexRelease(SubMutex);
         /* ------------------------------------------------------------------ */
 
-        /* Print current UTC time to debug output */
-        time_t rawtime = (time_t)RTC_u64GetUTC();
-        struct tm ts;
-        char buf[32];
-        ts = *localtime(&rawtime);
-        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ts);
-        DBG("%s\r\n", buf);
+        /* Mark the 1 Hz tick in the external-flash log (useful as a timeline
+         * during the preproduction phase). DBG_LOG prefixes every line with
+         * the current date/time and battery voltage, which is exactly this
+         * heartbeat's payload. Enqueues asynchronously; the flash write
+         * happens off-path. */
+        DBG_LOG("\r\n");
     }
 }
 
