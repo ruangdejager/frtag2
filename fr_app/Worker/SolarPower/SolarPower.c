@@ -35,7 +35,7 @@
 #define SOLAR_NOTIFY_SAMPLE     (1UL << 0)
 
 /* ---- Task stack / priority ---- */
-#define SOLAR_SAMPLETASK_STACK_SIZE     (configMINIMAL_STACK_SIZE * 2)
+#define SOLAR_SAMPLETASK_STACK_SIZE     (configMINIMAL_STACK_SIZE * 3)
 #define SOLAR_SCHEDTASK_STACK_SIZE      (configMINIMAL_STACK_SIZE)
 
 /* ---- CMSIS-RTOS v2 handles ---- */

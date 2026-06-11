@@ -475,7 +475,7 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             DBG("DeviceDiscovery: GPS pre-trigger\r\n");
             /* auto-shutdown on completion, bounded to GPS_PRETRIGGER_S so it
              * can never run forever */
-            GPS_vRequestFix(true, 120);
+            GPS_vRequestFix(true, 60);
         }
 #endif
     }

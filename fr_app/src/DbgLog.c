@@ -20,6 +20,9 @@
 #include "Farmranger.h"
 #endif
 
+#include "platform_rtc.h"
+#include "Battery.h"
+
 #include "stm32wlxx.h"     /* __get_IPSR() */
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"
@@ -28,6 +31,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <time.h>
 
 /* ---- Ring buffer (power-of-two size for cheap masking) ---- */
 #define DBGLOG_RING_SIZE   4096U
@@ -108,6 +112,30 @@ void DBGLOG_vPut(uint8_t dest, const char *format, ...)
     osMutexRelease(xFmtMutex);
 
     osThreadFlagsSet(xConsumer, DBGLOG_WAKE_FLAG);
+}
+
+/* -------------------------------------------------------------------------- */
+
+void DBGLOG_vPutVerbose(uint8_t dest, const char *format, ...)
+{
+    /* Same restrictions as DBGLOG_vPut (vsnprintf/localtime are not ISR-safe;
+     * DBGLOG_vPut below re-checks and is the actual gate). */
+    if (__get_IPSR() != 0U)  return;
+    if (xConsumer == NULL)   return;
+
+    char    acMsg[DBGLOG_MSG_MAX + 1];
+    va_list ap;
+    va_start(ap, format);
+    int len = vsnprintf(acMsg, sizeof(acMsg), format, ap);
+    va_end(ap);
+    if (len < 0) return;
+
+    time_t    rawtime = (time_t)RTC_u64GetUTC();
+    struct tm ts      = *localtime(&rawtime);
+    char      acTime[20];
+    strftime(acTime, sizeof(acTime), "%Y-%m-%d %H:%M:%S", &ts);
+
+    DBGLOG_vPut(dest, "%s %umV %s", acTime, BAT_u16GetVoltage(), acMsg);
 }
 
 /* -------------------------------------------------------------------------- */

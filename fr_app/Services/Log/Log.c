@@ -32,73 +32,104 @@ static bool     bWrapped;
 /* -------------------------------------------------------------------------- */
 
 /*
- * Binary search over [0..FLASH_NUM_SECTORS) to locate the first sector whose
- * first byte is 0xFF (erased). Returns the sector index, or FLASH_NUM_SECTORS
- * if all sectors have data.
+ * Returns the byte at offset (FLASH_SECTOR_SIZE_BYTES - 1) of the given
+ * sector — i.e. its last byte.
  */
-static uint32_t LOG_u32FindFirstErasedSector(void)
+static uint8_t LOG_u8ReadSectorTailByte(uint32_t sector)
 {
-    uint32_t lo = 0U;
-    uint32_t hi = FLASH_NUM_SECTORS;
+    uint8_t  byte;
+    uint32_t addr = LOG_FLASH_START_ADDR + sector * FLASH_SECTOR_SIZE_BYTES
+                  + (FLASH_SECTOR_SIZE_BYTES - 1U);
+    FLASH_vRead(addr, &byte, 1);
+    return byte;
+}
 
-    while (lo < hi)
+/*
+ * Find the FIFO write-head sector: the one (and only) sector that still has
+ * unused 0xFF padding at its tail. All other sectors — whether holding the
+ * current generation's data or an older, not-yet-overwritten generation —
+ * are filled right to their last byte. Returns FLASH_NUM_SECTORS if no such
+ * sector is found (the degenerate case where every sector is filled to
+ * exactly its last byte).
+ */
+static uint32_t LOG_u32FindHeadByTailPadding(void)
+{
+    for (uint32_t sector = 0U; sector < FLASH_NUM_SECTORS; sector++)
     {
-        uint32_t mid  = (lo + hi) / 2U;
-        uint32_t addr = LOG_FLASH_START_ADDR + mid * FLASH_SECTOR_SIZE_BYTES;
-        uint8_t  byte;
-        FLASH_vRead(addr, &byte, 1);
-        if (byte == 0xFFU)
-            hi = mid;
-        else
-            lo = mid + 1U;
+        if (LOG_u8ReadSectorTailByte(sector) == 0xFFU)
+            return sector;
     }
-    return lo;
+    return FLASH_NUM_SECTORS;
 }
 
 /* -------------------------------------------------------------------------- */
 
 void LOG_vInit(void)
 {
-    uint32_t sectorIdx = LOG_u32FindFirstErasedSector();
+    /* Pass 1: first byte of every sector. A sector whose first byte is
+     * 0xFF is virgin — never written since the last chip erase. */
+    uint32_t u32FirstVirgin  = FLASH_NUM_SECTORS;
+    uint32_t u32VirginCount  = 0U;
 
-    if (sectorIdx == 0U)
+    for (uint32_t sector = 0U; sector < FLASH_NUM_SECTORS; sector++)
     {
-        /* Log is empty */
-        u32WriteAddr = LOG_FLASH_START_ADDR;
-        u32StartAddr = LOG_FLASH_START_ADDR;
-        bWrapped     = false;
+        uint8_t  byte;
+        FLASH_vRead(LOG_FLASH_START_ADDR + sector * FLASH_SECTOR_SIZE_BYTES, &byte, 1);
+        if (byte == 0xFFU)
+        {
+            if (u32FirstVirgin == FLASH_NUM_SECTORS)
+                u32FirstVirgin = sector;
+            u32VirginCount++;
+        }
     }
-    else if (sectorIdx == FLASH_NUM_SECTORS)
+
+    uint32_t u32HeadSector;
+    uint32_t u32TailSector;
+
+    if ((u32FirstVirgin != FLASH_NUM_SECTORS) &&
+        (u32VirginCount == (FLASH_NUM_SECTORS - u32FirstVirgin)))
     {
-        /* All sectors have data — log has fully wrapped */
-        u32WriteAddr = LOG_FLASH_START_ADDR;
-        u32StartAddr = LOG_FLASH_START_ADDR;
-        bWrapped     = true;
+        /* The virgin sectors form a clean suffix [u32FirstVirgin, 128) — the
+         * FIFO has never wrapped. The write head is the last *written*
+         * sector (or sector 0 if the log is completely empty); the tail
+         * (oldest data) is fixed at sector 0. */
+        u32HeadSector = (u32FirstVirgin == 0U) ? 0U : (u32FirstVirgin - 1U);
+        u32TailSector = 0U;
+        bWrapped      = false;
     }
     else
     {
-        /* Fine-scan the last *written* sector (sectorIdx - 1) for the exact
-         * byte boundary.  The binary search found the first erased sector
-         * (where byte[0] == 0xFF) — scanning *that* sector would immediately
-         * hit 0xFF on byte 0 and set u32WriteAddr to the sector's start,
-         * which includes the unwritten 0xFF tail of the previous sector in
-         * LOG_u32GetUsedBytes() and therefore in the dump output. */
-        uint32_t sectorStart = LOG_FLASH_START_ADDR + (sectorIdx - 1U) * FLASH_SECTOR_SIZE_BYTES;
-        uint32_t sectorEnd   = sectorStart + FLASH_SECTOR_SIZE_BYTES;
-        uint32_t addr        = sectorStart;
-        uint8_t  byte;
-
-        while (addr < sectorEnd)
+        /* The FIFO has wrapped at least once: every sector holds data from
+         * some generation, so the write head can no longer be identified by
+         * its first byte. Find it instead by its trailing 0xFF padding. The
+         * sector right after it holds the oldest surviving data. */
+        u32HeadSector = LOG_u32FindHeadByTailPadding();
+        if (u32HeadSector == FLASH_NUM_SECTORS)
         {
-            FLASH_vRead(addr, &byte, 1);
-            if (byte == 0xFFU) break;
-            addr++;
+            /* Degenerate: every sector filled to its last byte. Fall back to
+             * sector 0 — the next write will erase it and re-establish a
+             * normal FIFO layout. */
+            u32HeadSector = 0U;
         }
-
-        u32WriteAddr = addr;
-        u32StartAddr = LOG_FLASH_START_ADDR;
-        bWrapped     = false;
+        u32TailSector = (u32HeadSector + 1U) % FLASH_NUM_SECTORS;
+        bWrapped      = true;
     }
+
+    /* Fine-scan the head sector for the exact write-pointer byte offset. */
+    uint32_t sectorStart = LOG_FLASH_START_ADDR + u32HeadSector * FLASH_SECTOR_SIZE_BYTES;
+    uint32_t sectorEnd   = sectorStart + FLASH_SECTOR_SIZE_BYTES;
+    uint32_t addr        = sectorStart;
+    uint8_t  byte;
+
+    while (addr < sectorEnd)
+    {
+        FLASH_vRead(addr, &byte, 1);
+        if (byte == 0xFFU) break;
+        addr++;
+    }
+
+    u32WriteAddr = addr;
+    u32StartAddr = LOG_FLASH_START_ADDR + u32TailSector * FLASH_SECTOR_SIZE_BYTES;
 }
 
 /* -------------------------------------------------------------------------- */

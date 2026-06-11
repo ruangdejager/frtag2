@@ -26,9 +26,7 @@
 #include "DeviceDiscovery.h"
 #include "radio_driver.h"
 #include "LoraRadio_Driver.h"
-#include "Battery.h"
 
-#include <time.h>
 #include <limits.h>
 
 typedef struct {
@@ -93,15 +91,12 @@ void PLATFORM_vHeartbeatDispatchTask(void *parameters)
         osMutexRelease(SubMutex);
         /* ------------------------------------------------------------------ */
 
-        /* Print current UTC time — DBG_LOG so the 1 Hz tick is persisted to the
-         * external-flash log (useful as a timeline during the preproduction
-         * phase). Enqueues asynchronously; the flash write happens off-path. */
-        time_t rawtime = (time_t)RTC_u64GetUTC();
-        struct tm ts;
-        char buf[32];
-        ts = *localtime(&rawtime);
-        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ts);
-        DBG_LOG("%s %dmV\r\n", buf, BAT_u16GetVoltage());
+        /* Mark the 1 Hz tick in the external-flash log (useful as a timeline
+         * during the preproduction phase). DBG_LOG prefixes every line with
+         * the current date/time and battery voltage, which is exactly this
+         * heartbeat's payload. Enqueues asynchronously; the flash write
+         * happens off-path. */
+        DBG_LOG("\r\n");
     }
 }
 
