@@ -41,6 +41,9 @@
 #include <stdbool.h>
 
 #include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
+
 #include "Battery.h"
 #include "MeshNetwork.h"
 #include "LoraRadio.h"
@@ -69,11 +72,32 @@ static char    s_lineBuf[FRKERNEL_LINE_BUF_LEN];
 static uint8_t s_lineIdx = 0U;
 #endif
 
+static void FRKERNEL_vTask(void *arg);
+
 /* -------------------------------------------------------------------------- */
 
 bool FRKERNEL_bIsConnected(void)
 {
     return s_bConnected;
+}
+
+/* --------------------------------------------------------------------------
+ * FRKERNEL_vInit
+ * -------------------------------------------------------------------------- */
+void FRKERNEL_vInit(void)
+{
+#ifdef FRKERNEL_INTERFACE_LORA
+    s_rxQueue = osMessageQueueNew(FRKERNEL_LORA_QUEUE_LEN, sizeof(FrKernelPkt_t), NULL);
+    configASSERT(s_rxQueue != NULL);
+#endif
+
+    static const osThreadAttr_t attr = {
+        .name       = "FrKernel",
+        .stack_size = configMINIMAL_STACK_SIZE * 6U,
+        .priority   = osPriorityLow,
+    };
+    s_taskHandle = osThreadNew(FRKERNEL_vTask, NULL, &attr);
+    configASSERT(s_taskHandle != NULL);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -275,22 +299,4 @@ static void FRKERNEL_vTask(void *arg)
         }
     }
 #endif
-}
-
-/* -------------------------------------------------------------------------- */
-
-void FRKERNEL_vInit(void)
-{
-#ifdef FRKERNEL_INTERFACE_LORA
-    s_rxQueue = osMessageQueueNew(FRKERNEL_LORA_QUEUE_LEN, sizeof(FrKernelPkt_t), NULL);
-    configASSERT(s_rxQueue != NULL);
-#endif
-
-    static const osThreadAttr_t attr = {
-        .name       = "FrKernel",
-        .stack_size = configMINIMAL_STACK_SIZE * 4U,
-        .priority   = osPriorityLow,
-    };
-    s_taskHandle = osThreadNew(FRKERNEL_vTask, NULL, &attr);
-    configASSERT(s_taskHandle != NULL);
 }

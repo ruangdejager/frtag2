@@ -342,6 +342,26 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 #endif /* LISTENER_MODE */
 
         } /* end if (!bKernelWakeup) */
+        else
+        {
+            /* Kernel wakeup (shake-sequence): give the user a window to start
+             * a FrKernel session before falling back to sleep. Without this,
+             * FRKERNEL_bIsConnected() below is still false at the instant we
+             * wake (no command has been sent yet) and we'd go straight back
+             * to sleep. */
+            DBG_LOG("DeviceDiscovery: Kernel wakeup - waiting up to %u s for FrKernel session...\r\n",
+                DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS / 1000U);
+
+            uint32_t u32WaitedMs = 0U;
+            while (!FRKERNEL_bIsConnected() && u32WaitedMs < DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS)
+            {
+                osDelay(500);
+                u32WaitedMs += 500U;
+            }
+
+            if (!FRKERNEL_bIsConnected())
+                DBG_LOG("DeviceDiscovery: Kernel wakeup window expired, no session - sleeping\r\n");
+        }
 
         /* ---- Deep sleep ---- */
         MESHNETWORK_vResetNodeRole();
@@ -474,7 +494,12 @@ void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
     /* Hold off deep sleep until the resulting (no-op) campaign completes —
      * released at the end of DEVICE_DISCOVERY_vAppTask's loop. */
     SYSTEM_vSleepLockAcquire();
+#ifdef FRKERNEL_INTERFACE_LORA
     LORARADIO_vWakeUp();
+#else
+    HAL_UART_vInit();
+    DEBUG_vInit();
+#endif
     DBG("\r\n--- KERNEL WAKEUP ---\r\n");
     osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
 }

@@ -57,7 +57,7 @@ void FLASH_vInit(void)
     else
         DBG("FLASH: JEDEC ID %02X %02X %02X OK\r\n", id[0], id[1], id[2]);
 
-    FLASH_vChipErase();
+//    FLASH_vChipErase();
 
 }
 

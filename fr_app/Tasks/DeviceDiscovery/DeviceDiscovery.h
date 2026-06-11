@@ -25,6 +25,11 @@
  * asynchronously; the AppTask never blocks waiting for it. */
 #define DEVICE_DISCOVERY_GPS_PRETRIGGER_S   180U          /* 3 minutes              */
 
+/* Kernel wakeup (shake-sequence): how long to wait for the user to start a
+ * FrKernel session (send any "tag ..." command) before giving up and letting
+ * the device return to deep sleep. */
+#define DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS  (60 * 1000)  /* 60 seconds */
+
 #define LOST_PRIMARY_TIMEOUT_MIN            480           /* ~8 hours before recovery    */
 
 /* osEventFlags bit — set by wakeup-schedule task to start a campaign */

@@ -115,7 +115,7 @@
 /* Gravity sequence detector */
 #define MOVE_SEQ_GRAV_TH              50    /* |dcLevel| > this → axis carries gravity  */
 #define MOVE_SEQ_GRAV_NULL            10    /* |dcLevel| < this → axis is free          */
-#define MOVE_SEQ_HOLD_TICKS           2U   /* consecutive 1 Hz ticks to accept a step  */
+#define MOVE_SEQ_HOLD_TICKS           1U   /* consecutive 1 Hz ticks to accept a step  */
 #define MOVE_SEQ_TRANSITION_TICKS     6U   /* grace ticks to move into the next position
                                              * before the sequence resets               */
 
