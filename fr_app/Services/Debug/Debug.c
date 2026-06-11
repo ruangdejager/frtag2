@@ -45,6 +45,11 @@ void DEBUG_vPutBuffer(const uint8_t *buf, uint16_t len)
     HAL_UART_vTxPutBuffer(&sDriverData, buf, len);
 }
 
+void DEBUG_vPutBufferBlocking(const uint8_t *buf, uint16_t len)
+{
+    HAL_UART_vTxPutBufferBlocking(&sDriverData, buf, len);
+}
+
 bool DEBUG_bRxDataAvailable(void)
 {
     return HAL_UART_bRxDataAvailable(&sDriverData);
@@ -63,5 +68,6 @@ void DEBUG_vStart(void)                                 {}
 void DEBUG_vStop(void)                                  {}
 void DEBUG_vPutByte(uint8_t byte)                       { (void)byte; }
 void DEBUG_vPutBuffer(const uint8_t *buf, uint16_t len) { (void)buf; (void)len; }
+void DEBUG_vPutBufferBlocking(const uint8_t *buf, uint16_t len) { (void)buf; (void)len; }
 
 #endif /* DEBUG_OUTPUT_UART */

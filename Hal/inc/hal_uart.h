@@ -68,6 +68,7 @@ bool HAL_UART_u8TxFreeSpace(hal_uart_t *drv);
 bool HAL_UART_u8TxBufferEmpty(hal_uart_t *drv);
 bool HAL_UART_vTxPutByte(hal_uart_t *drv, uint8_t data);
 void HAL_UART_vTxPutBuffer(hal_uart_t *drv, const uint8_t *data, uint16_t length);
+void HAL_UART_vTxPutBufferBlocking(hal_uart_t *drv, const uint8_t *data, uint16_t length);
 bool HAL_UART_bRxDataAvailable(hal_uart_t *drv);
 bool UART_bReadByte(hal_uart_t *pHandle, uint8_t *pu8Byte);
 void HAL_UART_vEnableTXInterrupt(hal_uart_t *drv);

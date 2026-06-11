@@ -225,6 +225,23 @@ void HAL_UART_vTxPutBuffer(hal_uart_t *drv, const uint8_t *data, uint16_t length
     }
 }
 
+/*
+ * HAL_UART_vTxPutBufferBlocking
+ *
+ * Polling transmit that bypasses the TX ring buffer and its IRQ entirely —
+ * safe to call with global interrupts disabled or from a fault/overflow
+ * handler where the scheduler and the TX-complete ISR will never run again.
+ */
+void HAL_UART_vTxPutBufferBlocking(hal_uart_t *drv, const uint8_t *data, uint16_t length)
+{
+    for (uint16_t idx = 0; idx < length; idx++)
+    {
+        while (!LL_USART_IsActiveFlag_TXE(drv->usart));
+        LL_USART_TransmitData8(drv->usart, data[idx]);
+    }
+    while (!LL_USART_IsActiveFlag_TC(drv->usart));
+}
+
 bool HAL_UART_bRxDataAvailable(hal_uart_t *usart_data)
 {
     usart_buf_ptr_t tempHead = usart_data->buffer.RX_Head;
