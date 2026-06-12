@@ -173,12 +173,15 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 EVTLOG(LOG_DISCOVERY_COUNT, u16NeighborCount);
                 for (uint16_t i = 0; i < u16NeighborCount; i++)
                 {
-                    DBG_LOG("  ID:%X  Hops:%X  RSSI:%d  Bat:%d  Wave:%d\r\n",
+                    DBG_LOG("  ID:%X  Hops:%X  RSSI:%d  Bat:%d  Wave:%d  Move:%u  Lat:%ld  Lon:%ld\r\n",
                         tNeighbors[i].u32DeviceId,
                         tNeighbors[i].u8HopCount,
                         tNeighbors[i].i16Rssi,
                         tNeighbors[i].u16BatMv,
-                        tNeighbors[i].u8Wave);
+                        tNeighbors[i].u8Wave,
+                        tNeighbors[i].u8MoveState,
+                        tNeighbors[i].bGpsValid ? (long)tNeighbors[i].i32LatUDeg : 0L,
+                        tNeighbors[i].bGpsValid ? (long)tNeighbors[i].i32LonUDeg : 0L);
                 }
             }
             else
@@ -276,12 +279,15 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 EVTLOG(LOG_DISCOVERY_COUNT, u16NeighborCount);
                 for (uint16_t i = 0; i < u16NeighborCount; i++)
                 {
-                    DBG_LOG("  ID:%X  Hops:%X  RSSI:%d  Bat:%d  Wave:%d\r\n",
+                    DBG_LOG("  ID:%X  Hops:%X  RSSI:%d  Bat:%d  Wave:%d  Move:%u  Lat:%ld  Lon:%ld\r\n",
                         tNeighbors[i].u32DeviceId,
                         tNeighbors[i].u8HopCount,
                         tNeighbors[i].i16Rssi,
                         tNeighbors[i].u16BatMv,
-                        tNeighbors[i].u8Wave);
+                        tNeighbors[i].u8Wave,
+                        tNeighbors[i].u8MoveState,
+                        tNeighbors[i].bGpsValid ? (long)tNeighbors[i].i32LatUDeg : 0L,
+                        tNeighbors[i].bGpsValid ? (long)tNeighbors[i].i32LonUDeg : 0L);
                 }
             }
             else
@@ -469,10 +475,21 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
          * the AppTask runs. The AppTask never blocks on a GPS result. */
         if (eDeviceRole == DEVICE_ROLE_SECONDARY &&
             u32IntervalS > DEVICE_DISCOVERY_GPS_PRETRIGGER_S &&
-            u32Phase == (u32IntervalS - DEVICE_DISCOVERY_GPS_PRETRIGGER_S))
+            u32Phase == (u32IntervalS - DEVICE_DISCOVERY_GPS_PRETRIGGER_S) &&
+            (POWER_tGetState() & POWER_CLASS_NORMAL))
         {
             /* Hold off deep sleep until GPS auto-shuts-down, times out, or is
-             * otherwise turned off — released inside GPS_vPowerOff(). */
+             * otherwise turned off — released inside GPS_vPowerOff().
+             *
+             * The power-class check above is required, not just an
+             * optimisation: GPS_vRequestFix() refuses outright with
+             * GPS_RESULT_NO_POWER when the board isn't in POWER_CLASS_NORMAL,
+             * and on that path it returns without ever calling
+             * GPS_vPowerOff(). If we acquired the lock unconditionally, that
+             * refusal would leak it forever — gSleepLockCount would never
+             * return to 0, deep sleep would be permanently disabled, and
+             * every subsequent pre-trigger would silently refuse the same
+             * way (no "session armed" line ever again). */
             SYSTEM_vSleepLockAcquire();
             HAL_UART_vInit();
             DEBUG_vInit();

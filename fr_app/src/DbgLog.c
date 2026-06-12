@@ -72,6 +72,35 @@ void DBGLOG_vInit(void)
 
 /* -------------------------------------------------------------------------- */
 
+/* Frame and publish the first `len` bytes of the shared acFmt scratch buffer
+ * into the ring as one [dest][len][payload] message. Caller MUST hold
+ * xFmtMutex (the scratch buffer and this push share the same lock). */
+static void DBGLOG_vPushFmtLocked(uint8_t dest, int len)
+{
+    if (len <= 0) return;
+    if (len > (int)DBGLOG_MSG_MAX) len = (int)DBGLOG_MSG_MAX;
+
+    uint16_t u16Used = (uint16_t)((u16Head - u16Tail) & DBGLOG_RING_MASK);
+    uint16_t u16Free = (uint16_t)(DBGLOG_RING_SIZE - 1U - u16Used);
+
+    /* All-or-nothing: only enqueue if the whole framed message fits. */
+    if (u16Free >= (uint16_t)(2 + len))
+    {
+        uint16_t h = u16Head;
+        au8Ring[h] = dest;              h = (uint16_t)((h + 1) & DBGLOG_RING_MASK);
+        au8Ring[h] = (uint8_t)len;      h = (uint16_t)((h + 1) & DBGLOG_RING_MASK);
+        for (int i = 0; i < len; i++)
+        {
+            au8Ring[h] = (uint8_t)acFmt[i];
+            h = (uint16_t)((h + 1) & DBGLOG_RING_MASK);
+        }
+        u16Head = h;                   /* publish atomically */
+    }
+    /* else: ring full — drop this message */
+}
+
+/* -------------------------------------------------------------------------- */
+
 void DBGLOG_vPut(uint8_t dest, const char *format, ...)
 {
     /* vsnprintf + mutex are not ISR-safe; drop ISR-context lines. Also skip
@@ -86,28 +115,7 @@ void DBGLOG_vPut(uint8_t dest, const char *format, ...)
     int len = vsnprintf(acFmt, sizeof(acFmt), format, ap);
     va_end(ap);
 
-    if (len > 0)
-    {
-        if (len > (int)DBGLOG_MSG_MAX) len = (int)DBGLOG_MSG_MAX;
-
-        uint16_t u16Used = (uint16_t)((u16Head - u16Tail) & DBGLOG_RING_MASK);
-        uint16_t u16Free = (uint16_t)(DBGLOG_RING_SIZE - 1U - u16Used);
-
-        /* All-or-nothing: only enqueue if the whole framed message fits. */
-        if (u16Free >= (uint16_t)(2 + len))
-        {
-            uint16_t h = u16Head;
-            au8Ring[h] = dest;              h = (uint16_t)((h + 1) & DBGLOG_RING_MASK);
-            au8Ring[h] = (uint8_t)len;      h = (uint16_t)((h + 1) & DBGLOG_RING_MASK);
-            for (int i = 0; i < len; i++)
-            {
-                au8Ring[h] = (uint8_t)acFmt[i];
-                h = (uint16_t)((h + 1) & DBGLOG_RING_MASK);
-            }
-            u16Head = h;                   /* publish atomically */
-        }
-        /* else: ring full — drop this message */
-    }
+    DBGLOG_vPushFmtLocked(dest, len);
 
     osMutexRelease(xFmtMutex);
 
@@ -118,24 +126,40 @@ void DBGLOG_vPut(uint8_t dest, const char *format, ...)
 
 void DBGLOG_vPutVerbose(uint8_t dest, const char *format, ...)
 {
-    /* Same restrictions as DBGLOG_vPut (vsnprintf/localtime are not ISR-safe;
-     * DBGLOG_vPut below re-checks and is the actual gate). */
+    /* Same restrictions as DBGLOG_vPut. */
     if (__get_IPSR() != 0U)  return;
     if (xConsumer == NULL)   return;
 
-    char    acMsg[DBGLOG_MSG_MAX + 1];
-    va_list ap;
-    va_start(ap, format);
-    int len = vsnprintf(acMsg, sizeof(acMsg), format, ap);
-    va_end(ap);
-    if (len < 0) return;
-
+    /* Build the "<date> <time> <mv>mV " prefix on a small local buffer, then
+     * format the caller's message *directly after it* into the shared acFmt
+     * scratch under the mutex. The old code put a full DBGLOG_MSG_MAX+1 (256B)
+     * buffer on the *caller's* stack and formatted twice; that 256-byte frame
+     * is what overflowed the 1KB Timer-Service ("Tmr Svc") task when a software
+     * timer callback (e.g. the beacon TX) logged. Prefixing in place keeps the
+     * caller's stack footprint to ~acTime[20] + struct tm, with no large
+     * intermediate message buffer. */
     time_t    rawtime = (time_t)RTC_u64GetUTC();
     struct tm ts      = *localtime(&rawtime);
     char      acTime[20];
     strftime(acTime, sizeof(acTime), "%Y-%m-%d %H:%M:%S", &ts);
+    unsigned  uMv = (unsigned)BAT_u16GetVoltage();
 
-    DBGLOG_vPut(dest, "%s %umV %s", acTime, BAT_u16GetVoltage(), acMsg);
+    osMutexAcquire(xFmtMutex, osWaitForever);
+
+    int pfx = snprintf(acFmt, sizeof(acFmt), "%s %umV ", acTime, uMv);
+    if (pfx < 0) pfx = 0;
+    if (pfx > (int)DBGLOG_MSG_MAX) pfx = (int)DBGLOG_MSG_MAX;
+
+    va_list ap;
+    va_start(ap, format);
+    int body = vsnprintf(acFmt + pfx, sizeof(acFmt) - (size_t)pfx, format, ap);
+    va_end(ap);
+
+    DBGLOG_vPushFmtLocked(dest, (body > 0) ? (pfx + body) : pfx);
+
+    osMutexRelease(xFmtMutex);
+
+    osThreadFlagsSet(xConsumer, DBGLOG_WAKE_FLAG);
 }
 
 /* -------------------------------------------------------------------------- */

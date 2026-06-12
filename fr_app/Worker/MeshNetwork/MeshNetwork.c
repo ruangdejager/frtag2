@@ -34,14 +34,51 @@
 #include "Battery.h"
 #include "flashLog.h"
 
+#ifdef ENABLE_GPS
+#include "GPS.h"
+#endif
+#ifdef ENABLE_MOVE
+#include "Movement.h"
+#endif
+
 /* ---- Local config aliases ---- */
 #define MESH_BEACON_INTERVAL_MS_CFG      MESH_BEACON_INTERVAL_MS
 #define MESH_PRIMARY_ACK_INTERVAL_MS_CFG MESH_PRIMARY_ACK_INTERVAL_MS
+
+/* ---- DBeacon flags byte (byte 15) ---- */
+#define MESH_BEACON_FLAG_STILL      0x01U   /* bit0: 1 = still, 0 = moving */
+#define MESH_BEACON_FLAG_GPS_VALID  0x02U   /* bit1: 1 = lat/lon present   */
+
+/* DBeacon on-wire sizes */
+#define MESH_BEACON_LEN_BASE        16U     /* through the flags byte      */
+#define MESH_BEACON_LEN_GPS         24U     /* with lat/lon appended       */
+
+/* Maximum age of a GPS fix that may be stamped into an originated beacon.
+ * The GPS pre-trigger fires DEVICE_DISCOVERY_GPS_PRETRIGGER_S (180 s) before
+ * each scheduled wake, so a fix taken during it is ~120-180 s old by the time
+ * the beacon goes out. A fix older than 5 minutes therefore came from an
+ * earlier cycle (the last pre-trigger failed) and is stale — drop it and send
+ * the beacon with no GPS rather than a position that no longer reflects where
+ * the animal is. */
+#define MESH_GPS_FIX_MAX_AGE_S      300U
 #define MESH_DISCOVERY_IDLE_MS_CFG       MESH_DISCOVERY_IDLE_MS
 
 /* ---- TX queue item ---- */
 #define MESH_TX_QUEUE_LEN        24
 #define MESH_TX_MAX_PACKET_SIZE  128
+
+/* ---- MeshTx task thread flags ----
+ * The periodic beacon/ack software-timer callbacks run in the FreeRTOS Timer
+ * Service ("Tmr Svc") task, which has only a small stack. Building a packet
+ * there (struct + encode + verbose DBG_LOG -> vsnprintf/localtime/strftime,
+ * which carry hundreds of bytes of library stack frames) overflows it. So the
+ * callbacks do nothing but set one of these flags; the MeshTx task — which has
+ * a full-size stack — does the actual construction and enqueue. */
+#define MESH_TX_FLAG_QUEUE       0x0001U   /* an item was put on xMeshTxQueue   */
+#define MESH_TX_FLAG_BEACON      0x0002U   /* build + enqueue this node's beacon*/
+#define MESH_TX_FLAG_ACK         0x0004U   /* build + enqueue a primary D-Ack   */
+#define MESH_TX_FLAG_ANY         (MESH_TX_FLAG_QUEUE | MESH_TX_FLAG_BEACON | \
+                                  MESH_TX_FLAG_ACK)
 
 typedef struct {
     uint8_t  u8Buf[MESH_TX_MAX_PACKET_SIZE];
@@ -163,7 +200,9 @@ static void FORWARD_vAdd(uint32_t u32MsgId)
  * -------------------------------------------------------------------------- */
 static void NEIGHBOR_vAddOrUpdate(uint32_t u32DeviceId, uint8_t u8HopCount,
                                    int16_t i16Rssi, uint16_t u16BatMv,
-                                   uint8_t u8DreqWaveDisc)
+                                   uint8_t u8DreqWaveDisc,
+                                   uint8_t u8MoveState, bool bGpsValid,
+                                   int32_t i32LatUDeg, int32_t i32LonUDeg)
 {
     if (osMutexAcquire(xNeighborTableMutex, 100) == osOK)
     {
@@ -175,6 +214,14 @@ static void NEIGHBOR_vAddOrUpdate(uint32_t u32DeviceId, uint8_t u8HopCount,
                 tNeighborTable[i].u16BatMv             = u16BatMv;
                 tNeighborTable[i].i16Rssi              = i16Rssi;
                 tNeighborTable[i].u8DreqWaveDiscovered = u8DreqWaveDisc;
+                tNeighborTable[i].u8MoveState          = u8MoveState;
+                /* Keep the last known fix if this beacon carries none. */
+                if (bGpsValid)
+                {
+                    tNeighborTable[i].bGpsValid  = true;
+                    tNeighborTable[i].i32LatUDeg = i32LatUDeg;
+                    tNeighborTable[i].i32LonUDeg = i32LonUDeg;
+                }
                 if (tNeighborTable[i].bAcked) tNeighborTable[i].bAcked = false;
                 osMutexRelease(xNeighborTableMutex);
                 tLastBeaconHeardTick = osKernelGetTickCount();
@@ -188,6 +235,10 @@ static void NEIGHBOR_vAddOrUpdate(uint32_t u32DeviceId, uint8_t u8HopCount,
             tNeighborTable[u16NeighborCount].u16BatMv             = u16BatMv;
             tNeighborTable[u16NeighborCount].i16Rssi              = i16Rssi;
             tNeighborTable[u16NeighborCount].u8DreqWaveDiscovered = u8DreqWaveDisc;
+            tNeighborTable[u16NeighborCount].u8MoveState          = u8MoveState;
+            tNeighborTable[u16NeighborCount].bGpsValid            = bGpsValid;
+            tNeighborTable[u16NeighborCount].i32LatUDeg           = i32LatUDeg;
+            tNeighborTable[u16NeighborCount].i32LonUDeg           = i32LonUDeg;
             tNeighborTable[u16NeighborCount].bAcked               = false;
             u16NeighborCount++;
             tLastBeaconHeardTick = osKernelGetTickCount();
@@ -230,7 +281,10 @@ static bool MESHNETWORK_bEncodeDBeacon(const MeshPktDBeacon_t *ptBeacon,
                                         size_t u32BufLen,
                                         size_t *pu32Written)
 {
-    if (u32BufLen < 15) return false;
+    size_t u32Needed = ptBeacon->bGpsValid ? MESH_BEACON_LEN_GPS
+                                            : MESH_BEACON_LEN_BASE;
+    if (u32BufLen < u32Needed) return false;
+
     pBuf[0] = (uint8_t)MeshPktType_DBeacon;
     write_u32_be(&pBuf[1],  ptBeacon->u32DreqId);
     write_u16_be(&pBuf[5],  ptBeacon->u16BatMv);
@@ -238,7 +292,20 @@ static bool MESHNETWORK_bEncodeDBeacon(const MeshPktDBeacon_t *ptBeacon,
     write_s16_be(&pBuf[8],  ptBeacon->i16Rssi);
     write_u32_be(&pBuf[10], ptBeacon->u32BeaconMsgId);
     pBuf[14] = ptBeacon->dreqWaveDisc;
-    *pu32Written = 15;
+
+    /* Flags byte + optional GPS payload (omitted when no fix, for airtime). */
+    uint8_t u8Flags = 0U;
+    if (ptBeacon->u8MoveState != 0U) u8Flags |= MESH_BEACON_FLAG_STILL;
+    if (ptBeacon->bGpsValid)         u8Flags |= MESH_BEACON_FLAG_GPS_VALID;
+    pBuf[15] = u8Flags;
+
+    if (ptBeacon->bGpsValid)
+    {
+        write_u32_be(&pBuf[16], (uint32_t)ptBeacon->i32LatUDeg);
+        write_u32_be(&pBuf[20], (uint32_t)ptBeacon->i32LonUDeg);
+    }
+
+    *pu32Written = u32Needed;
     return true;
 }
 
@@ -296,9 +363,11 @@ static uint32_t MESHNETWORK_u32GetTxJitterMs(void)
 /* --------------------------------------------------------------------------
  * Timer callbacks (CMSIS-RTOS v2 signature: void cb(void *arg))
  * -------------------------------------------------------------------------- */
-static void MESHNETWORK_vBeaconTimerCallback(void *arg)
+/* Build this node's discovery beacon and hand it to the TX queue. Runs in the
+ * MeshTx task context (NOT the timer callback) so the heavy locals and the
+ * verbose DBG_LOG live on a full-size stack. */
+static void MESHNETWORK_vBuildAndQueueBeacon(void)
 {
-    (void)arg;
     if (!bNodeBeaconing) return;
 
     MeshPktDBeacon_t tBeacon;
@@ -310,7 +379,34 @@ static void MESHNETWORK_vBeaconTimerCallback(void *arg)
     tBeacon.u32BeaconMsgId = MESHNETWORK_u32GenerateGlobalMsgID();
     tBeacon.dreqWaveDisc   = u8PrimaryDreqWaveCnt;
 
-    DBG_LOG("MeshNetwork: Sending Beacon %08X\r\n", tBeacon.u32BeaconMsgId);
+    /* Stamp this node's own movement state and last-known GPS fix. */
+    tBeacon.u8MoveState = 0U;     /* default: moving */
+    tBeacon.bGpsValid   = false;
+    tBeacon.i32LatUDeg  = 0;
+    tBeacon.i32LonUDeg  = 0;
+    uint32_t u32GpsAgeS = UINT32_MAX;   /* age of the fix we evaluated (for log) */
+#ifdef ENABLE_MOVE
+    tBeacon.u8MoveState = (MOVE_eGetState() == MOVE_STATE_STILL) ? 1U : 0U;
+#endif
+#ifdef ENABLE_GPS
+    {
+        gnss_coord_deg_t tLat, tLon;
+        /* Only stamp a fix from the most recent pre-trigger: it must exist AND
+         * be within MESH_GPS_FIX_MAX_AGE_S. An older fix is from a previous
+         * cycle and no longer valid, so the beacon goes out with no GPS. */
+        if (GPS_bGetLastKnownFix(&tLat, &tLon, &u32GpsAgeS) &&
+            u32GpsAgeS <= MESH_GPS_FIX_MAX_AGE_S)
+        {
+            tBeacon.bGpsValid  = true;
+            tBeacon.i32LatUDeg = tLat.i32MicroDeg;
+            tBeacon.i32LonUDeg = tLon.i32MicroDeg;
+        }
+    }
+#endif
+
+    DBG_LOG("MeshNetwork: Sending Beacon %08X move=%u gps=%u age=%lus\r\n",
+        tBeacon.u32BeaconMsgId, tBeacon.u8MoveState, tBeacon.bGpsValid,
+        (unsigned long)u32GpsAgeS);
     EVTLOG(LOG_TX_BEACON, 1);
 
     uint8_t u8Buf[64];
@@ -320,9 +416,18 @@ static void MESHNETWORK_vBeaconTimerCallback(void *arg)
     MESHNETWORK_bSendPacket(u8Buf, u32Len);
 }
 
-static void MESHNETWORK_vPrimaryAckTimerCallback(void *arg)
+/* Timer callback (Tmr Svc context): stay tiny — just wake the MeshTx task. */
+static void MESHNETWORK_vBeaconTimerCallback(void *arg)
 {
     (void)arg;
+    if (bNodeBeaconing && xMeshTxTaskHandle != NULL)
+        osThreadFlagsSet(xMeshTxTaskHandle, MESH_TX_FLAG_BEACON);
+}
+
+/* Build a primary D-Ack from the neighbor table and hand it to the TX queue.
+ * Runs in the MeshTx task context (NOT the timer callback). */
+static void MESHNETWORK_vBuildAndQueueAck(void)
+{
     MeshPktDAck_t tAck;
     memset(&tAck, 0, sizeof(tAck));
     tAck.u32AckMsgId = MESHNETWORK_u32GenerateGlobalMsgID();
@@ -359,6 +464,14 @@ static void MESHNETWORK_vPrimaryAckTimerCallback(void *arg)
     }
 }
 
+/* Timer callback (Tmr Svc context): stay tiny — just wake the MeshTx task. */
+static void MESHNETWORK_vPrimaryAckTimerCallback(void *arg)
+{
+    (void)arg;
+    if (xMeshTxTaskHandle != NULL)
+        osThreadFlagsSet(xMeshTxTaskHandle, MESH_TX_FLAG_ACK);
+}
+
 /* --------------------------------------------------------------------------
  * MESHNETWORK_bSendPacket — enqueue with TX jitter
  * -------------------------------------------------------------------------- */
@@ -379,6 +492,10 @@ static bool MESHNETWORK_bSendPacket(const uint8_t *pBuf, size_t u32Len)
         DBG_LOG("MeshNetwork: TX queue full, dropping packet\r\n");
         return false;
     }
+
+    /* Wake the TX worker to drain the queue. */
+    if (xMeshTxTaskHandle != NULL)
+        osThreadFlagsSet(xMeshTxTaskHandle, MESH_TX_FLAG_QUEUE);
 
     DBG_LOG("MeshNetwork: Queued TX (len=%u, jitter=%lu ms)\r\n",
         (unsigned)u32Len, jitterMs);
@@ -466,9 +583,28 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
     tBeacon.u32DeviceId    = tBeacon.u32BeaconMsgId >> 16;
     tBeacon.dreqWaveDisc   = pBuf[14];
 
-    DBG_LOG("MeshNetwork: Beacon: dev=%04X dreq=%08X hop=%u wave=%X bat=%u rssi=%d\r\n",
+    /* Flags + optional GPS payload. Absent on legacy 15-byte beacons. */
+    tBeacon.u8MoveState = 0U;     /* default: moving */
+    tBeacon.bGpsValid   = false;
+    tBeacon.i32LatUDeg  = 0;
+    tBeacon.i32LonUDeg  = 0;
+    if (u32Len >= MESH_BEACON_LEN_BASE)
+    {
+        uint8_t u8Flags = pBuf[15];
+        tBeacon.u8MoveState = (u8Flags & MESH_BEACON_FLAG_STILL) ? 1U : 0U;
+        if ((u8Flags & MESH_BEACON_FLAG_GPS_VALID) &&
+            (u32Len >= MESH_BEACON_LEN_GPS))
+        {
+            tBeacon.bGpsValid  = true;
+            tBeacon.i32LatUDeg = (int32_t)read_u32_be(&pBuf[16]);
+            tBeacon.i32LonUDeg = (int32_t)read_u32_be(&pBuf[20]);
+        }
+    }
+
+    DBG_LOG("MeshNetwork: Beacon: dev=%04X dreq=%08X hop=%u wave=%X bat=%u rssi=%d move=%u gps=%u\r\n",
         tBeacon.u32DeviceId, tBeacon.u32DreqId, tBeacon.u8HopCount,
-        tBeacon.dreqWaveDisc, tBeacon.u16BatMv, tBeacon.i16Rssi);
+        tBeacon.dreqWaveDisc, tBeacon.u16BatMv, tBeacon.i16Rssi,
+        tBeacon.u8MoveState, tBeacon.bGpsValid);
 
     uint32_t u32LogValue;
     FLASHLOG_vEncodeRXLogValue(&u32LogValue, (uint16_t)tBeacon.u32DeviceId,
@@ -491,7 +627,9 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
     {
         NEIGHBOR_vAddOrUpdate(tBeacon.u32DeviceId, tBeacon.u8HopCount,
                               tBeacon.i16Rssi, tBeacon.u16BatMv,
-                              tBeacon.dreqWaveDisc);
+                              tBeacon.dreqWaveDisc, tBeacon.u8MoveState,
+                              tBeacon.bGpsValid, tBeacon.i32LatUDeg,
+                              tBeacon.i32LonUDeg);
         tLastBeaconHeardTick = osKernelGetTickCount();
         return;
     }
@@ -686,16 +824,26 @@ static void MESHNETWORK_vTxTask(void *pvParameters)
 
     for (;;)
     {
-        if (osMessageQueueGet(xMeshTxQueue, &tItem, NULL, osWaitForever) == osOK)
+        /* Block until something needs doing: a periodic timer asked us to build
+         * a beacon/ack, or a packet was queued for transmission. Blocking on
+         * flags (not a busy poll) keeps the device asleep between events. */
+        uint32_t u32Flags = osThreadFlagsWait(MESH_TX_FLAG_ANY,
+                                              osFlagsWaitAny, osWaitForever);
+        if (u32Flags & osFlagsError) continue;
+
+        /* Heavy packet construction runs here, on this task's full-size stack —
+         * never on the tiny Tmr Svc stack the timer callbacks run in. */
+        if (u32Flags & MESH_TX_FLAG_BEACON) MESHNETWORK_vBuildAndQueueBeacon();
+        if (u32Flags & MESH_TX_FLAG_ACK)    MESHNETWORK_vBuildAndQueueAck();
+
+        /* Drain everything currently queued (including anything the builders
+         * above just enqueued), honouring each item's jitter delay. */
+        while (osMessageQueueGet(xMeshTxQueue, &tItem, NULL, 0) == osOK)
         {
             uint32_t now = osKernelGetTickCount();
             if (tItem.u32ReadyTick > now)
-            {
-                /* Not ready yet — requeue and wait */
-                osMessageQueuePut(xMeshTxQueue, &tItem, 0, 0);
-                osDelay(10);
-                continue;
-            }
+                osDelay(tItem.u32ReadyTick - now);   /* wait out the TX jitter */
+
             DBG_LOG("MeshNetwork: TX (len=%u)\r\n", tItem.u16Len);
             MESHNETWORK_bTxSendRaw(tItem.u8Buf, tItem.u16Len);
         }
@@ -833,6 +981,10 @@ bool MESHNETWORK_bGetDiscoveredNeighbors(MeshDiscoveredNeighbor_t *pBuffer,
         pBuffer[i].i16Rssi     = tNeighborTable[i].i16Rssi;
         pBuffer[i].u16BatMv    = tNeighborTable[i].u16BatMv;
         pBuffer[i].u8Wave      = tNeighborTable[i].u8DreqWaveDiscovered;
+        pBuffer[i].u8MoveState = tNeighborTable[i].u8MoveState;
+        pBuffer[i].bGpsValid   = tNeighborTable[i].bGpsValid;
+        pBuffer[i].i32LatUDeg  = tNeighborTable[i].i32LatUDeg;
+        pBuffer[i].i32LonUDeg  = tNeighborTable[i].i32LonUDeg;
     }
     *pu16ActualEntries = u16Count;
     osMutexRelease(xNeighborTableMutex);

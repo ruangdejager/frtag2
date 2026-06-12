@@ -97,7 +97,7 @@ void MOVE_vInit(void)
 
     static const osThreadAttr_t attr = {
         .name       = "Movement",
-        .stack_size = configMINIMAL_STACK_SIZE * 6U,
+        .stack_size = configMINIMAL_STACK_SIZE * 8U,
         .priority   = osPriorityLow,
     };
     osThreadNew(MOVE_vTask, NULL, &attr);

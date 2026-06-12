@@ -96,7 +96,7 @@ void PLATFORM_vHeartbeatDispatchTask(void *parameters)
          * the current date/time and battery voltage, which is exactly this
          * heartbeat's payload. Enqueues asynchronously; the flash write
          * happens off-path. */
-        DBG_LOG("\r\n");
+        DBG("\r\n");
     }
 }
 
