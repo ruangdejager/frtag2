@@ -1107,9 +1107,9 @@ bool GPS_bParseNmeaMsgRmc(char *pNmeaMsg, gnss_sol_t *pSol)
         for (i = 0; i < 6; i++)
             if (isdigit((unsigned char)*(p+5+i))) u8LetLongDecimalCnt++;
         memset(acGnssStrBuf, 0, sizeof(acGnssStrBuf));
-        strncpy(acGnssStrBuf, (p+0), 2); pSol->Lat.Ddm.i16Degrees = atoi(acGnssStrBuf);
-        strncpy(acGnssStrBuf, (p+2), 2); pSol->Lat.Ddm.u8Minutes  = atoi(acGnssStrBuf);
-        memset(acGnssStrBuf, '0', 6);
+        strncpy(acGnssStrBuf, (p+0), 2); acGnssStrBuf[2] = '\0'; pSol->Lat.Ddm.i16Degrees = atoi(acGnssStrBuf);
+        strncpy(acGnssStrBuf, (p+2), 2); acGnssStrBuf[2] = '\0'; pSol->Lat.Ddm.u8Minutes  = atoi(acGnssStrBuf);
+        memset(acGnssStrBuf, '0', 6); acGnssStrBuf[6] = '\0';
         strncpy(acGnssStrBuf, (p+5), u8LetLongDecimalCnt);
         pSol->Lat.Ddm.u32MicroMinutes = atol(acGnssStrBuf);
     }
@@ -1129,9 +1129,9 @@ bool GPS_bParseNmeaMsgRmc(char *pNmeaMsg, gnss_sol_t *pSol)
         for (i = 0; i < 6; i++)
             if (isdigit((unsigned char)*(p+6+i))) u8LetLongDecimalCnt++;
         memset(acGnssStrBuf, 0, sizeof(acGnssStrBuf));
-        strncpy(acGnssStrBuf, (p+0), 3); pSol->Long.Ddm.i16Degrees = atoi(acGnssStrBuf);
-        strncpy(acGnssStrBuf, (p+3), 2); pSol->Long.Ddm.u8Minutes  = atoi(acGnssStrBuf);
-        memset(acGnssStrBuf, '0', 6);
+        strncpy(acGnssStrBuf, (p+0), 3); acGnssStrBuf[3] = '\0'; pSol->Long.Ddm.i16Degrees = atoi(acGnssStrBuf);
+        strncpy(acGnssStrBuf, (p+3), 2); acGnssStrBuf[2] = '\0'; pSol->Long.Ddm.u8Minutes  = atoi(acGnssStrBuf);
+        memset(acGnssStrBuf, '0', 6); acGnssStrBuf[6] = '\0';
         strncpy(acGnssStrBuf, (p+6), u8LetLongDecimalCnt);
         pSol->Long.Ddm.u32MicroMinutes = atol(acGnssStrBuf);
     }
