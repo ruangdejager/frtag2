@@ -405,19 +405,27 @@ uint8_t FARMRANGER_u8RequestInterval(void)
  * -------------------------------------------------------------------------- */
 bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
 {
-    static char logBuffer[2048];
+    /* Sized to fit within the 64K RAM budget alongside the wider
+     * NeighborEntry_t table (now carrying GPS/movement); ~45 rows at the
+     * new CSV row width. */
+    static char logBuffer[2560];
     size_t pos = 0;
 
     for (uint16_t i = 0; i < count; i++)
     {
+        /* CSV row: DeviceId,Hops,Rssi,BatMv,Wave,Move,Lat,Lon
+         * Lat/Lon are microdegrees (10^-6 deg); 0/0 when no GPS fix. */
         int n = snprintf(&logBuffer[pos],
                          sizeof(logBuffer) - pos,
-                         "%X,%u,%d,%u,%u\t",
+                         "%X,%u,%d,%u,%u,%u,%ld,%ld\t",
                          neighbors[i].u32DeviceId,
                          neighbors[i].u8HopCount,
                          neighbors[i].i16Rssi,
                          neighbors[i].u16BatMv,
-                         neighbors[i].u8Wave);
+                         neighbors[i].u8Wave,
+                         neighbors[i].u8MoveState,
+                         (long)neighbors[i].i32LatUDeg,
+                         (long)neighbors[i].i32LonUDeg);
 
         if (n <= 0 || n >= (int)(sizeof(logBuffer) - pos))
             return false;

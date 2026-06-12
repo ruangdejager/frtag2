@@ -59,6 +59,10 @@ typedef struct {
     int16_t  i16Rssi;
     uint32_t u32BeaconMsgId;
     uint8_t  dreqWaveDisc;
+    uint8_t  u8MoveState;    /* 0 = moving, 1 = still */
+    bool     bGpsValid;      /* true if i32Lat/Lon hold a real fix */
+    int32_t  i32LatUDeg;     /* latitude  in microdegrees (10^-6 deg) */
+    int32_t  i32LonUDeg;     /* longitude in microdegrees (10^-6 deg) */
 } MeshPktDBeacon_t;
 
 #define MESH_MAX_ACK_IDS_PER_PACKET 8
@@ -82,13 +86,20 @@ typedef struct {
     uint8_t  u8Count;
 } ForwardRing_t;
 
-/* ---- Neighbor entry (internal) ---- */
+/* ---- Neighbor entry (internal) ----
+ * Field order and the u8MoveState/bGpsValid bitfields keep this at 20 bytes
+ * (vs. 24 with naive ordering) — tNeighborTable[MESH_MAX_NEIGHBORS] makes
+ * every byte here cost 128x in a 64K-RAM part. */
 typedef struct {
     uint32_t u32DeviceId;
-    uint8_t  u8HopCount;
+    int32_t  i32LatUDeg;     /* latitude  in microdegrees */
+    int32_t  i32LonUDeg;     /* longitude in microdegrees */
     int16_t  i16Rssi;
     uint16_t u16BatMv;
+    uint8_t  u8HopCount;
     uint8_t  u8DreqWaveDiscovered;
+    uint8_t  u8MoveState : 1;  /* 0 = moving, 1 = still */
+    uint8_t  bGpsValid   : 1;  /* 1 = i32Lat/LonUDeg hold a fix */
     bool     bAcked;
 } NeighborEntry_t;
 
@@ -113,6 +124,10 @@ typedef struct {
     int16_t  i16Rssi;
     uint16_t u16BatMv;
     uint8_t  u8Wave;
+    uint8_t  u8MoveState;    /* 0 = moving, 1 = still */
+    bool     bGpsValid;
+    int32_t  i32LatUDeg;     /* latitude  in microdegrees */
+    int32_t  i32LonUDeg;     /* longitude in microdegrees */
 } MeshDiscoveredNeighbor_t;
 
 /* ---- Public API ---- */
