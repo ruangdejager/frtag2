@@ -381,7 +381,7 @@ static void GPS_vMaybeSyncRtc(uint32_t u32GpsUnixTime)
 
     if ((uint64_t)i64Delta > (uint64_t)GPS_RTC_SYNC_MIN_ERROR_S)
     {
-        RTC_vSetUTC((uint64_t)u32GpsUnixTime);
+//        RTC_vSetUTC((uint64_t)u32GpsUnixTime);
         DBG("gps: RTC synced from GPS (delta=%lds)\r\n", (long)i64Delta);
     }
     else
