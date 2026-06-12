@@ -5,17 +5,17 @@
  *
  * Two tasks:
  *   SOLAR_vSampleTask            — triggered by thread flag; performs one
- *                                  VSOLAR + RSENSE ADC sample and accumulates
- *                                  coulombs.
+ *                                  VSOLAR ADC sample (plus RSENSE and coulomb
+ *                                  accumulation when ENABLE_SOLAR_POWER_SENSE).
  *   SOLAR_vCheckSampleScheduleTask — subscribes to the 1-second heartbeat;
  *                                  triggers a sample every 10 ticks.
  *
  * The ADC is shared with the Battery worker. HAL_ADC_vLock / vUnlock
  * serialize access so only one measurement runs at a time.
  *
- * No averaging buffer — VSOLAR and RSENSE change faster than a sliding
- * window would be useful. The last measured value is always available
- * via the public getters.
+ * RSENSE-based current/power/coulomb counting is compiled out unless
+ * ENABLE_SOLAR_POWER_SENSE is defined (see SolarPower_Config.h — the shunt
+ * front-end is non-functional on this board revision). Vsolar is always read.
  */
 
 #include "SolarPower.h"
@@ -44,10 +44,12 @@ static osThreadId_t SOLAR_vCheckSampleScheduleTask_handle;
 
 /* ---- Last measured values (mV) ---- */
 static volatile uint16_t u16VsolarLastMV;
+#ifdef ENABLE_SOLAR_POWER_SENSE
 static volatile uint16_t u16RsenseLastMV;
 
 /* ---- Coulomb accumulator ---- */
 static float fCoulombs;
+#endif
 
 /* ---- Forward declarations ---- */
 static void SOLAR_vSampleTask(void *pvParameters);
@@ -109,8 +111,10 @@ static void SOLAR_vSampleTask(void *pvParameters)
     (void)pvParameters;
 
     uint16_t u16RawVsolar = 0;
-    uint16_t u16RawRsense = 0;
     uint16_t u16RawVref   = 0;
+#ifdef ENABLE_SOLAR_POWER_SENSE
+    uint16_t u16RawRsense = 0;
+#endif
 
     for (;;)
     {
@@ -121,10 +125,13 @@ static void SOLAR_vSampleTask(void *pvParameters)
 
         SOLAR_DRIVER_vEnable();
 
-        /* Read VSOLAR, RSENSE and VREFINT in one enabled window. VREFINT gives
-         * the true VDDA so both results are independent of the 1.8 V rail. */
+        /* Read VSOLAR (and RSENSE when enabled) plus VREFINT in one enabled
+         * window. VREFINT gives the true VDDA so results are independent of the
+         * 1.8 V rail. */
         bool bConvOk = SOLAR_bConvert(VSOLAR_VOLTAGE_CHANNEL, &u16RawVsolar)
+#ifdef ENABLE_SOLAR_POWER_SENSE
                     && SOLAR_bConvert(RSENSE_VOLTAGE_CHANNEL, &u16RawRsense)
+#endif
                     && SOLAR_bConvert(VREFINT_CHANNEL,        &u16RawVref);
 
         SOLAR_DRIVER_vDisable();
@@ -146,6 +153,7 @@ static void SOLAR_vSampleTask(void *pvParameters)
             (((uint64_t)u16RawVsolar * u16Vdda * SOLAR_VSOLAR_DIV_NUM)
              / ((uint64_t)SOLAR_ADC_FULL_SCALE * SOLAR_VSOLAR_DIV_DEN));
 
+#ifdef ENABLE_SOLAR_POWER_SENSE
         /* Vrsense = adc * VDDA / full_scale (no divider) */
         u16RsenseLastMV = (uint16_t)
             (((uint32_t)u16RawRsense * u16Vdda) / SOLAR_ADC_FULL_SCALE);
@@ -158,6 +166,9 @@ static void SOLAR_vSampleTask(void *pvParameters)
         taskENTER_CRITICAL();
         fCoulombs += (SOLAR_i32GetCurrentMA() / 1000.0f) * SOLAR_SAMPLE_INTERVAL;
         taskEXIT_CRITICAL();
+#else
+        DBG_LOG("solar: Vsolar=%u mV  Vdda=%u mV\r\n", u16VsolarLastMV, u16Vdda);
+#endif
     }
 }
 
@@ -193,6 +204,7 @@ uint16_t SOLAR_u16GetVSolarMV(void)
     return u16VsolarLastMV;
 }
 
+#ifdef ENABLE_SOLAR_POWER_SENSE
 uint16_t SOLAR_u16GetVRSenseMV(void)
 {
     return u16RsenseLastMV;
@@ -224,3 +236,4 @@ void SOLAR_vResetCoulombs(void)
     fCoulombs = 0.0f;
     taskEXIT_CRITICAL();
 }
+#endif /* ENABLE_SOLAR_POWER_SENSE */

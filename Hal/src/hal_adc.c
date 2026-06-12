@@ -99,6 +99,12 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef *adcHandle)
         GPIO_InitStruct.Pin  = BSP_VSOLAR_MEAS_PIN;
         HAL_GPIO_Init(BSP_VSOLAR_MEAS_PORT, &GPIO_InitStruct);
 
+        /* RSENSE (PB4) is no longer sampled (see SolarPower — the shunt front-end
+         * is non-functional on this board revision, Rsense fitted as 0 Ω). It is
+         * still parked here as ANALOG / NOPULL: that is the zero-static-current
+         * state for an unused pin, and crucially it disables PB4's reset-default
+         * NJTRST pull-up — which would otherwise leak ~VDD/Rpull through the 0 Ω
+         * link to GND. Do not remove this init. */
         GPIO_InitStruct.Pin  = BSP_RSENSE_MEAS_PIN;
         HAL_GPIO_Init(BSP_RSENSE_MEAS_PORT, &GPIO_InitStruct);
 

@@ -428,6 +428,7 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
         /* ---- ProductionSleep: secondary only — primary has no solar panel ---- */
         if (eDeviceRole == DEVICE_ROLE_SECONDARY && eProductionState == PRODUCTION_SLEEP)
         {
+#ifdef ENABLE_SOLAR_POWER_SENSE
             if (SOLAR_u32GetPowerMW() >= SOLAR_ACTIVATION_POWER_MW)
             {
                 eProductionState = PRODUCTION_ACTIVE;
@@ -438,6 +439,20 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                 SYSTEM_vSleepLockAcquire();
                 osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_WAKEUP_BIT);
             }
+#else
+            /* Panel power sensing is disabled (broken RSENSE front-end); gate
+             * ProductionSleep exit on panel VOLTAGE instead. */
+            if (SOLAR_u16GetVSolarMV() >= SOLAR_ACTIVATION_VSOLAR_MV)
+            {
+                eProductionState = PRODUCTION_ACTIVE;
+                DBG_LOG("DeviceDiscovery: Solar activation (%u mV) — exiting ProductionSleep\r\n",
+                    SOLAR_u16GetVSolarMV());
+                /* Hold off deep sleep until the resulting campaign completes
+                 * (released at the end of DEVICE_DISCOVERY_vAppTask's loop). */
+                SYSTEM_vSleepLockAcquire();
+                osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_WAKEUP_BIT);
+            }
+#endif
             continue;
         }
 
