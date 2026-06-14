@@ -15,14 +15,22 @@
 #include <stdbool.h>
 
 /* ---- Timing constants ---- */
-#define MESH_BEACON_INTERVAL_MS       5000U
+#define MESH_BEACON_INTERVAL_MS       3500U   /* beacon retry period while awaiting ACK */
 #define MESH_PRIMARY_ACK_INTERVAL_MS  2000U
 #define MESH_DISCOVERY_IDLE_MS        7000U
-#define FORWARD_RING_SIZE             32
+#define FORWARD_RING_SIZE             64       /* dedup window (64 fits uint8 head/count) */
 #define MESH_MAX_NEIGHBORS            128
 
-#define MESH_TX_JITTER_MIN_MS         0U
-#define MESH_TX_JITTER_MAX_MS         500U
+/* A beaconing node gives up (becomes forwarder) after whichever comes first —
+ * bounds airtime if its D-Ack is silently lost. */
+#define MESH_MAX_BEACONS_PER_CAMPAIGN 6U
+#define MESH_MAX_BEACON_DURATION_MS   30000U
+
+/* TX jitter window — wide enough to de-correlate many nodes answering one DReq.
+ * Max stays well under MESH_BEACON_INTERVAL_MS so a jittered beacon never slips
+ * past the next interval. */
+#define MESH_TX_JITTER_MIN_MS         20U
+#define MESH_TX_JITTER_MAX_MS         1500U
 
 /* ---- Packet types (wire, first byte) ---- */
 typedef enum {
@@ -139,6 +147,8 @@ void MESHNETWORK_vSendTimeSync(uint32_t u32UtcTimestamp,
                                WakeupInterval tWakeupInterval);
 
 void MESHNETWORK_vStopBeaconing(uint32_t u32DreqId);
+bool MESHNETWORK_bIsBeaconing(void);     /* true while this node is beaconing */
+void MESHNETWORK_vFlushTxQueue(void);    /* drop any pending TX (call on campaign wake) */
 bool MESHNETWORK_bGetDiscoveredNeighbors(MeshDiscoveredNeighbor_t *pBuffer,
                                          uint16_t u16MaxEntries,
                                          uint16_t *pu16ActualEntries);
