@@ -14,9 +14,28 @@
 #include "dbg_log.h"
 #include "cmsis_os2.h"
 
+/* Deep-power-down state. The flash is parked in DPD whenever idle (the DbgLog
+ * consumer issues FLASH_vDeepPowerDown() after draining its queue) so it draws
+ * ~µA through the long STOP2 sleep periods instead of standby current. Any
+ * access transparently wakes it first via FLASH_vEnsureAwake(). */
+static bool bInDpd = false;
+
 /* --------------------------------------------------------------------------
  * Internal helpers
  * -------------------------------------------------------------------------- */
+
+/* Resume from deep-power-down on demand. No-op when already awake, so only the
+ * first access after a DPD pays the resume command + tRES settling delay. */
+static void FLASH_vEnsureAwake(void)
+{
+    if (!bInDpd) return;
+    uint8_t cmd = FLASH_CMD_RESUME;
+    FLASH_DRIVER_vSelect();
+    FLASH_DRIVER_vWrite(&cmd, 1);
+    FLASH_DRIVER_vDeselect();
+    osDelay(1);            /* tRES — device ready after resume */
+    bInDpd = false;
+}
 
 static void FLASH_vWaitReady(void)
 {
@@ -68,6 +87,7 @@ bool FLASH_bDeviceBusy(void)
 
 uint8_t FLASH_u8ReadStatusReg(void)
 {
+    FLASH_vEnsureAwake();   /* chokepoint: every read/write/erase polls here */
     uint8_t cmd = FLASH_CMD_READ_STATUS;
     uint8_t status;
     FLASH_DRIVER_vSelect();
@@ -79,6 +99,7 @@ uint8_t FLASH_u8ReadStatusReg(void)
 
 bool FLASH_bVerifyDevice(void)
 {
+    FLASH_vEnsureAwake();
     uint8_t cmd    = FLASH_CMD_JEDEC_ID;
     uint8_t id[3]  = {0};
     FLASH_DRIVER_vSelect();
@@ -162,10 +183,12 @@ void FLASH_vChipErase(void)
 
 void FLASH_vDeepPowerDown(void)
 {
+    if (bInDpd) return;     /* already parked — don't churn SPI */
     uint8_t cmd = FLASH_CMD_DEEP_PWR_DOWN;
     FLASH_DRIVER_vSelect();
     FLASH_DRIVER_vWrite(&cmd, 1);
     FLASH_DRIVER_vDeselect();
+    bInDpd = true;
 }
 
 void FLASH_vReleaseDeepPowerDown(void)
@@ -174,4 +197,5 @@ void FLASH_vReleaseDeepPowerDown(void)
     FLASH_DRIVER_vSelect();
     FLASH_DRIVER_vWrite(&cmd, 1);
     FLASH_DRIVER_vDeselect();
+    bInDpd = false;
 }

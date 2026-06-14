@@ -16,6 +16,7 @@
 #include "DbgLog.h"
 #include "Debug.h"
 #include "Log.h"
+#include "Flash.h"
 #ifdef LISTENER_MODE
 #include "Farmranger.h"
 #endif
@@ -241,5 +242,12 @@ static void DBGLOG_vConsumerTask(void *arg)
                 LOG_vWrite((const char *)au8Msg, len);
             }
         }
+
+        /* Queue drained — park the NOR flash in deep-power-down for the idle/
+         * STOP2 period that follows. No-op if it was never woken; the next
+         * flash access transparently resumes it. This is the consumer's last
+         * act before it blocks again, so the flash is in DPD by the time the
+         * system reaches STOP2. */
+        FLASH_vDeepPowerDown();
     }
 }
