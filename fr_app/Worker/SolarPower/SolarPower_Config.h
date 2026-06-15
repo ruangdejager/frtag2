@@ -27,6 +27,16 @@
 /* Sample rate (s) — one measurement per heartbeat cycle */
 #define SOLAR_SAMPLE_INTERVAL           10
 
+/*
+ * The 10 s sample task can also write a "solar: ..." line to the flash log on
+ * every sample. On a PRIMARY that line lands in the middle of every discovery
+ * campaign and fills the log with periodic noise. Off by default — a single
+ * solar reading is logged once per production wake instead (see
+ * DeviceDiscovery.c). Define this to restore the old per-sample logging for
+ * bench debugging.
+ */
+// #define LOG_SOLAR_PERIODIC
+
 #ifdef ENABLE_SOLAR_POWER_SENSE
 /* Sense resistor: 1.5 Ω, 1% — stored ×100 for integer arithmetic */
 #define SOLAR_RSENSE_OHM_X100           150

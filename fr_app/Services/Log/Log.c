@@ -134,14 +134,29 @@ void LOG_vInit(void)
 
 /* -------------------------------------------------------------------------- */
 
+/*
+ * Writes are batched into page-aligned chunks (one FLASH_vPageWrite per
+ * chunk) instead of one SPI page-program transaction per byte. A 50-byte
+ * log line used to mean 50 separate select/cmd/wait-ready SPI transactions
+ * — each one a window in which a campaign burst could preempt the consumer
+ * task past the SPI timeout and leave a truncated command on the bus. One
+ * (or, across a page boundary, two) transactions per line closes almost all
+ * of that window. If a chunk write fails (device busy/unresponsive beyond
+ * the bounded wait), the remainder of this call is dropped rather than
+ * risking a write at a stale address.
+ */
 void LOG_vWrite(const char *buf, uint16_t len)
 {
-    for (uint16_t i = 0U; i < len; i++)
+    uint16_t off = 0U;
+
+    while (off < len)
     {
         /* Erase the sector when crossing into a new one */
         if ((u32WriteAddr % FLASH_SECTOR_SIZE_BYTES) == 0U)
         {
-            FLASH_vSectorErase(u32WriteAddr);
+            if (!FLASH_vSectorErase(u32WriteAddr))
+                return;
+
             if (bWrapped)
             {
                 /* Advance tail past the freshly-erased sector */
@@ -151,8 +166,19 @@ void LOG_vWrite(const char *buf, uint16_t len)
             }
         }
 
-        FLASH_vPageWrite(u32WriteAddr, (const uint8_t *)&buf[i], 1U);
-        u32WriteAddr++;
+        uint32_t u32ToPageEnd   = FLASH_PAGE_SIZE_BYTES   - (u32WriteAddr % FLASH_PAGE_SIZE_BYTES);
+        uint32_t u32ToSectorEnd = FLASH_SECTOR_SIZE_BYTES - (u32WriteAddr % FLASH_SECTOR_SIZE_BYTES);
+        uint32_t u32Max         = (u32ToPageEnd < u32ToSectorEnd) ? u32ToPageEnd : u32ToSectorEnd;
+
+        uint16_t u16Chunk = (uint16_t)(len - off);
+        if (u16Chunk > u32Max)
+            u16Chunk = (uint16_t)u32Max;
+
+        if (!FLASH_vPageWrite(u32WriteAddr, (const uint8_t *)&buf[off], u16Chunk))
+            return;
+
+        u32WriteAddr += u16Chunk;
+        off          += u16Chunk;
 
         if (u32WriteAddr >= LOG_FLASH_END_ADDR)
         {

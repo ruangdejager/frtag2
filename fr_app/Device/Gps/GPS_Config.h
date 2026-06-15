@@ -7,6 +7,14 @@
 #ifndef DEVICE_GPS_GPS_CONFIG_H_
 #define DEVICE_GPS_GPS_CONFIG_H_
 
+/*
+ * Per-sample GNSS telemetry CSV (see GPS.c). One flash-log line per second of
+ * every fix session — useful for bench TTFF/convergence tuning, but pure noise
+ * in production (the per-session FIX OK / FIX TIMEOUT lines already capture the
+ * outcome). Off by default; define to restore it.
+ */
+// #define LOG_GPS_PERIODIC
+
 /* Default TTFF timeout [s] — aided start */
 #define GNSS_TTFF_TIMEOUT_1_AID_ASSIST      UINT16_C(60)
 

@@ -45,8 +45,9 @@ void HAL_SPI_FLASH_vDeInit(void);
 
 /* Full-duplex read: clocks out 0xFF dummies to clock in 'len' bytes. Required
  * because HAL_SPI_Receive() does NOT generate clock in 2-line master mode
- * (it waits for RXNE that never arrives). */
-void HAL_SPI_FLASH_vReadPacket(uint8_t *rx, uint16_t len);
+ * (it waits for RXNE that never arrives). Returns HAL_OK only if every
+ * chunk transferred without error/timeout. */
+HAL_StatusTypeDef HAL_SPI_FLASH_vReadPacket(uint8_t *rx, uint16_t len);
 
 #define HAL_SPI_FLASH_vSpiWritePacket(tx, len)      HAL_SPI_Transmit(&hFlashSpi, (uint8_t *)(tx), (len), SPI_TIMEOUT)
 #define HAL_SPI_FLASH_vSpiReadPacket(rx, len)       HAL_SPI_FLASH_vReadPacket((rx), (len))

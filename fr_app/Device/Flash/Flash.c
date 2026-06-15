@@ -18,10 +18,33 @@
  * Internal helpers
  * -------------------------------------------------------------------------- */
 
-static void FLASH_vWaitReady(void)
+/* Normal "ready before issuing a command" wait. Bounded so a wedged/garbled
+ * status read can never hang the DbgLog consumer forever (the old unbounded
+ * `while busy` loop is what turned a single bad SPI transaction into
+ * "logging just stopped"). */
+#define FLASH_WAIT_READY_TIMEOUT_MS   3000U
+
+/* Chip erase of the full 512 KB device can legitimately take several
+ * seconds, so its post-erase wait gets its own, much longer, budget. */
+#define FLASH_CHIP_ERASE_TIMEOUT_MS   30000U
+
+static bool FLASH_bWaitReadyTimeout(uint32_t u32TimeoutMs)
 {
-    while (FLASH_bDeviceBusy())
+    for (uint32_t u32Elapsed = 0U; FLASH_bDeviceBusy(); u32Elapsed++)
+    {
+        if (u32Elapsed >= u32TimeoutMs)
+        {
+            DBG("FLASH: busy >%lu ms - aborting operation\r\n", (unsigned long)u32TimeoutMs);
+            return false;
+        }
         osDelay(1);
+    }
+    return true;
+}
+
+static bool FLASH_bWaitReady(void)
+{
+    return FLASH_bWaitReadyTimeout(FLASH_WAIT_READY_TIMEOUT_MS);
 }
 
 static void FLASH_vWriteEnable(void)
@@ -30,6 +53,69 @@ static void FLASH_vWriteEnable(void)
     FLASH_DRIVER_vSelect();
     FLASH_DRIVER_vWrite(&cmd, 1);
     FLASH_DRIVER_vDeselect();
+}
+
+/* Clear the Write Enable Latch (WRDI). Program, Erase and Write-Status-Register
+ * are ONLY accepted while WEL=1, so the chip must never be left idle with WEL
+ * set: a single failed/garbled command transaction otherwise leaves the device
+ * armed, and any subsequent stray WRSR on a glitchy bus could latch SRP0/BP -
+ * which, because WP# is grounded on this board, permanently bricks the part for
+ * writes. Calling this on every write error path keeps the armed window down to
+ * the few microseconds between our WREN and our own command. */
+static void FLASH_vWriteDisable(void)
+{
+    uint8_t cmd = FLASH_CMD_WRITE_DISABLE;
+    FLASH_DRIVER_vSelect();
+    FLASH_DRIVER_vWrite(&cmd, 1);
+    FLASH_DRIVER_vDeselect();
+}
+
+/* Clear all non-volatile block protection (Global Unprotect): WREN, then write
+ * 00h to both Status Register 1 and 2 in one CS-bracketed WRSR (01h) - clearing
+ * BP0..BP4, SRP0 and CMP. Without this a chip whose protection bits ever got
+ * set - e.g. SRP0/BP latched by a garbled SPI command - rejects every program
+ * and erase forever while reads still work, so its log freezes and even
+ * chip-erase is silently ignored.
+ *
+ * NOTE: this only succeeds while the status register is writable. If SRP0=1 and
+ * the hardwired WP# pin is held low the device is in Hardware-Protected mode and
+ * the WRSR is ignored - WP# must be driven high (it has no MCU GPIO on this
+ * board) before recovery is possible. Returns true once the device reports
+ * unprotected. */
+static bool FLASH_bGlobalUnprotect(void)
+{
+    uint8_t cmd[3] = { FLASH_CMD_WRITE_STATUS,
+                       FLASH_STATUS_UNPROTECT,   /* SR1: BP, SRP0 */
+                       FLASH_STATUS_UNPROTECT }; /* SR2: CMP, SRP1 */
+    if (!FLASH_bWaitReady())
+        return false;
+
+    FLASH_vWriteEnable();
+    FLASH_DRIVER_vSelect();
+    bool bOk = (FLASH_DRIVER_vWrite(cmd, 3) == HAL_OK);
+    FLASH_DRIVER_vDeselect();
+    if (!bOk)
+    {
+        FLASH_vWriteDisable();    /* never leave the device armed (WEL=1) */
+        return false;
+    }
+
+    if (!FLASH_bWaitReady())      /* WRSR is itself a self-timed write */
+        return false;
+
+    return (FLASH_u8ReadStatusReg() & FLASH_STATUS_PROTECTED) == 0U;
+}
+
+/* Read Status Register 2 (35h) - SRP1 / QE / CMP. Diagnostic only. */
+static uint8_t FLASH_u8ReadStatusReg2(void)
+{
+    uint8_t cmd = FLASH_CMD_READ_STATUS2;
+    uint8_t sr2 = 0U;
+    FLASH_DRIVER_vSelect();
+    FLASH_DRIVER_vWrite(&cmd, 1);
+    (void)FLASH_DRIVER_vRead(&sr2, 1);
+    FLASH_DRIVER_vDeselect();
+    return sr2;
 }
 
 /* --------------------------------------------------------------------------
@@ -57,6 +143,38 @@ void FLASH_vInit(void)
     else
         DBG("FLASH: JEDEC ID %02X %02X %02X OK\r\n", id[0], id[1], id[2]);
 
+    /* Report protection state and self-heal a chip stuck write-protected.
+     * Block protection (BP0..BP4) and SRP0 are non-volatile and block
+     * program/erase while leaving reads working, so a device that got into
+     * this state would otherwise freeze its log and ignore chip-erase forever.
+     * SR2 (SRP1/CMP) distinguishes the recoverable Hardware-Protected case
+     * from the permanent OTP case, and is needed to interpret BP. */
+    uint8_t sr1 = FLASH_u8ReadStatusReg();
+    uint8_t sr2 = FLASH_u8ReadStatusReg2();
+    DBG("FLASH: SR1=%02X (BP=%02X SRP0=%u) SR2=%02X (SRP1=%u QE=%u CMP=%u)\r\n",
+        sr1,
+        (unsigned)((sr1 & FLASH_SR1_BP_MASK) >> 2),
+        (unsigned)((sr1 & FLASH_SR1_SRP0) ? 1U : 0U),
+        sr2,
+        (unsigned)((sr2 & FLASH_SR2_SRP1) ? 1U : 0U),
+        (unsigned)((sr2 & FLASH_SR2_QE)   ? 1U : 0U),
+        (unsigned)((sr2 & FLASH_SR2_CMP)  ? 1U : 0U));
+
+    if (sr1 & FLASH_STATUS_PROTECTED)
+    {
+        DBG("FLASH: write-protected - performing global unprotect\r\n");
+        if (FLASH_bGlobalUnprotect())
+            DBG("FLASH: unprotected, SR1=%02X\r\n", FLASH_u8ReadStatusReg());
+        else
+            DBG("FLASH: unprotect FAILED, SR1=%02X - SR hardware-locked, "
+                "drive WP# pin HIGH and retry\r\n", FLASH_u8ReadStatusReg());
+    }
+
+    /* Start from a known-safe, disarmed state: with WP# grounded the only thing
+     * standing between us and a permanent write-lock is never accepting a stray
+     * WRSR, which requires WEL=0 at idle. */
+    FLASH_vWriteDisable();
+
 //    FLASH_vChipErase();
 
 }
@@ -69,10 +187,14 @@ bool FLASH_bDeviceBusy(void)
 uint8_t FLASH_u8ReadStatusReg(void)
 {
     uint8_t cmd = FLASH_CMD_READ_STATUS;
-    uint8_t status;
+    /* Default to "busy" so that a failed/short SPI read can never be
+     * mistaken for "ready" — FLASH_bWaitReady would otherwise issue the
+     * next command onto a device that might still be mid-program/erase. */
+    uint8_t status = FLASH_STATUS_WIP;
     FLASH_DRIVER_vSelect();
     FLASH_DRIVER_vWrite(&cmd, 1);
-    FLASH_DRIVER_vRead(&status, 1);
+    if (FLASH_DRIVER_vRead(&status, 1) != HAL_OK)
+        status = FLASH_STATUS_WIP;
     FLASH_DRIVER_vDeselect();
     return status;
 }
@@ -88,7 +210,7 @@ bool FLASH_bVerifyDevice(void)
     return id[0] == FLASH_MANUFACTURER_ID;
 }
 
-void FLASH_vRead(uint32_t addr, uint8_t *buf, uint16_t len)
+bool FLASH_vRead(uint32_t addr, uint8_t *buf, uint16_t len)
 {
     uint8_t cmd[4] = {
         FLASH_CMD_READ,
@@ -96,14 +218,17 @@ void FLASH_vRead(uint32_t addr, uint8_t *buf, uint16_t len)
         (uint8_t)((addr >>  8) & 0xFFU),
         (uint8_t)((addr      ) & 0xFFU),
     };
-    FLASH_vWaitReady();
+    if (!FLASH_bWaitReady())
+        return false;
+
     FLASH_DRIVER_vSelect();
-    FLASH_DRIVER_vWrite(cmd, 4);
-    FLASH_DRIVER_vRead(buf, len);
+    bool bOk = (FLASH_DRIVER_vWrite(cmd, 4) == HAL_OK) &&
+               (FLASH_DRIVER_vRead(buf, len) == HAL_OK);
     FLASH_DRIVER_vDeselect();
+    return bOk;
 }
 
-void FLASH_vPageWrite(uint32_t addr, const uint8_t *buf, uint16_t len)
+bool FLASH_vPageWrite(uint32_t addr, const uint8_t *buf, uint16_t len)
 {
     uint8_t cmd[4] = {
         FLASH_CMD_PAGE_PROGRAM,
@@ -111,15 +236,20 @@ void FLASH_vPageWrite(uint32_t addr, const uint8_t *buf, uint16_t len)
         (uint8_t)((addr >>  8) & 0xFFU),
         (uint8_t)((addr      ) & 0xFFU),
     };
-    FLASH_vWaitReady();
+    if (!FLASH_bWaitReady())
+        return false;
+
     FLASH_vWriteEnable();
     FLASH_DRIVER_vSelect();
-    FLASH_DRIVER_vWrite(cmd, 4);
-    FLASH_DRIVER_vWrite(buf, len);
+    bool bOk = (FLASH_DRIVER_vWrite(cmd, 4) == HAL_OK) &&
+               (FLASH_DRIVER_vWrite(buf, len) == HAL_OK);
     FLASH_DRIVER_vDeselect();
+    if (!bOk)
+        FLASH_vWriteDisable();   /* never leave the device armed (WEL=1) */
+    return bOk;
 }
 
-void FLASH_vSectorErase(uint32_t addr)
+bool FLASH_vSectorErase(uint32_t addr)
 {
     uint8_t cmd[4] = {
         FLASH_CMD_SECTOR_ERASE,
@@ -127,14 +257,19 @@ void FLASH_vSectorErase(uint32_t addr)
         (uint8_t)((addr >>  8) & 0xFFU),
         (uint8_t)((addr      ) & 0xFFU),
     };
-    FLASH_vWaitReady();
+    if (!FLASH_bWaitReady())
+        return false;
+
     FLASH_vWriteEnable();
     FLASH_DRIVER_vSelect();
-    FLASH_DRIVER_vWrite(cmd, 4);
+    bool bOk = (FLASH_DRIVER_vWrite(cmd, 4) == HAL_OK);
     FLASH_DRIVER_vDeselect();
+    if (!bOk)
+        FLASH_vWriteDisable();   /* never leave the device armed (WEL=1) */
+    return bOk;
 }
 
-void FLASH_vBlockErase(uint32_t addr)
+bool FLASH_vBlockErase(uint32_t addr)
 {
     uint8_t cmd[4] = {
         FLASH_CMD_BLOCK_ERASE,
@@ -142,22 +277,42 @@ void FLASH_vBlockErase(uint32_t addr)
         (uint8_t)((addr >>  8) & 0xFFU),
         (uint8_t)((addr      ) & 0xFFU),
     };
-    FLASH_vWaitReady();
+    if (!FLASH_bWaitReady())
+        return false;
+
     FLASH_vWriteEnable();
     FLASH_DRIVER_vSelect();
-    FLASH_DRIVER_vWrite(cmd, 4);
+    bool bOk = (FLASH_DRIVER_vWrite(cmd, 4) == HAL_OK);
     FLASH_DRIVER_vDeselect();
+    if (!bOk)
+        FLASH_vWriteDisable();   /* never leave the device armed (WEL=1) */
+    return bOk;
 }
 
-void FLASH_vChipErase(void)
+bool FLASH_vChipErase(void)
 {
     uint8_t cmd = FLASH_CMD_CHIP_ERASE;
-    FLASH_vWaitReady();
+    if (!FLASH_bWaitReady())
+        return false;
+
+    /* A chip erase is exactly the operation used to recover a stuck device, so
+     * clear any latched block protection first - otherwise the erase is
+     * silently ignored and the old contents survive. Only touches the SR when
+     * protection is actually set, to avoid needless status-register wear. */
+    if (FLASH_u8ReadStatusReg() & FLASH_STATUS_PROTECTED)
+        (void)FLASH_bGlobalUnprotect();
+
     FLASH_vWriteEnable();
     FLASH_DRIVER_vSelect();
-    FLASH_DRIVER_vWrite(&cmd, 1);
+    bool bOk = (FLASH_DRIVER_vWrite(&cmd, 1) == HAL_OK);
     FLASH_DRIVER_vDeselect();
-    FLASH_vWaitReady();
+    if (!bOk)
+    {
+        FLASH_vWriteDisable();   /* never leave the device armed (WEL=1) */
+        return false;
+    }
+
+    return FLASH_bWaitReadyTimeout(FLASH_CHIP_ERASE_TIMEOUT_MS);
 }
 
 void FLASH_vDeepPowerDown(void)

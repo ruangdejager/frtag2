@@ -478,6 +478,20 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                 LORARADIO_vWakeUp();
 
                 DBG_LOG("\r\n--- WAKEUP ---\r\n");
+
+                /* One solar reading per production wake instead of every 10 s
+                 * (see LOG_SOLAR_PERIODIC in SolarPower_Config.h). Primary has
+                 * no solar panel. */
+                if (eDeviceRole == DEVICE_ROLE_SECONDARY)
+                {
+#ifdef ENABLE_SOLAR_POWER_SENSE
+                    DBG_LOG("solar: Vsolar=%u mV  P=%lu mW\r\n",
+                        SOLAR_u16GetVSolarMV(), SOLAR_u32GetPowerMW());
+#else
+                    DBG_LOG("solar: Vsolar=%u mV\r\n", SOLAR_u16GetVSolarMV());
+#endif
+                }
+
                 osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_WAKEUP_BIT);
 
             }
