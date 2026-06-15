@@ -48,6 +48,14 @@ static osMutexId_t       xFmtMutex   = NULL;
 static osThreadId_t      xConsumer   = NULL;
 static volatile bool     bDumpRequested = false;
 
+/* Count of whole messages dropped because the ring was full. Incremented under
+ * xFmtMutex (on the producer push path); snapshotted+cleared under the same
+ * mutex by the consumer, which then emits a single "[N lines dropped]" marker.
+ * A bounded RAM ring + a slow flash sink can always be overrun by a long enough
+ * burst, so the contract is "never silent": we preserve when we can and record
+ * precisely when we couldn't, instead of falsely promising zero loss. */
+static uint16_t          u16Dropped  = 0U;
+
 static void DBGLOG_vConsumerTask(void *arg);
 
 /* -------------------------------------------------------------------------- */
@@ -61,10 +69,15 @@ void DBGLOG_vInit(void)
     xFmtMutex = osMutexNew(NULL);
     configASSERT(xFmtMutex != NULL);
 
+    /* osPriorityLow let campaign-burst traffic (MeshNetwork TX runs at
+     * osPriorityAboveNormal) starve this task across a flash SPI
+     * transaction's 1 s HAL timeout, causing CS to be deasserted mid
+     * command/data and corrupting the flash-resident log. Match the
+     * busiest producer's priority so SPI2 transactions complete promptly. */
     static const osThreadAttr_t consumer_attr = {
         .name       = "DbgLog",
         .stack_size = configMINIMAL_STACK_SIZE * 4 * sizeof(StackType_t),
-        .priority   = osPriorityLow,
+        .priority   = osPriorityAboveNormal,
     };
     xConsumer = osThreadNew(DBGLOG_vConsumerTask, NULL, &consumer_attr);
     configASSERT(xConsumer != NULL);
@@ -96,7 +109,14 @@ static void DBGLOG_vPushFmtLocked(uint8_t dest, int len)
         }
         u16Head = h;                   /* publish atomically */
     }
-    /* else: ring full — drop this message */
+    else
+    {
+        /* Ring full — drop this whole message (never a partial line) and
+         * count it so the consumer can emit a visible marker. Saturate
+         * rather than wrap so the count never under-reports. */
+        if (u16Dropped != 0xFFFFU)
+            u16Dropped++;
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -239,6 +259,32 @@ static void DBGLOG_vConsumerTask(void *arg)
             if (dest & DBGLOG_DEST_FLASH)
             {
                 LOG_vWrite((const char *)au8Msg, len);
+            }
+        }
+
+        /* Ring drained. If producers had to drop any messages while it was
+         * full, emit one visible marker (to both transports) so the gap in
+         * the log is never silent. Snapshot+clear under the format mutex so
+         * the count can't be lost against a concurrent producer drop. */
+        osMutexAcquire(xFmtMutex, osWaitForever);
+        uint16_t u16Lost = u16Dropped;
+        u16Dropped = 0U;
+        osMutexRelease(xFmtMutex);
+
+        if (u16Lost != 0U)
+        {
+            int n = snprintf((char *)au8Msg, sizeof(au8Msg),
+                             "[%u log line%s dropped - ring full]\r\n",
+                             (unsigned)u16Lost, (u16Lost == 1U) ? "" : "s");
+            if (n > 0)
+            {
+                if (n > (int)sizeof(au8Msg)) n = (int)sizeof(au8Msg);
+#ifdef LISTENER_MODE
+                FARMRANGER_vPutString(au8Msg, (uint8_t)n);
+#else
+                DEBUG_vPutBuffer(au8Msg, (uint16_t)n);
+#endif
+                LOG_vWrite((const char *)au8Msg, (uint16_t)n);
             }
         }
     }
