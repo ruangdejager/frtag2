@@ -28,11 +28,19 @@
  * seconds, so its post-erase wait gets its own, much longer, budget. */
 #define FLASH_CHIP_ERASE_TIMEOUT_MS   30000U
 
+/* Bounded by real elapsed time, not loop iterations: FLASH_bDeviceBusy()
+ * issues two SPI transactions, each individually bounded by SPI_TIMEOUT
+ * (1000 ms). If the SPI2 bus is stalled (e.g. contention with another
+ * board's SPI sharing these lines), a single FLASH_bDeviceBusy() call can
+ * itself take ~2 s and FLASH_u8ReadStatusReg defaults to "busy" on failure
+ * - an iteration-counted loop would then take ~u32TimeoutMs * 2s to expire
+ * (3000 ms -> ~100 minutes), which looks indistinguishable from a hang. */
 static bool FLASH_bWaitReadyTimeout(uint32_t u32TimeoutMs)
 {
-    for (uint32_t u32Elapsed = 0U; FLASH_bDeviceBusy(); u32Elapsed++)
+    uint32_t u32Start = osKernelGetTickCount();
+    while (FLASH_bDeviceBusy())
     {
-        if (u32Elapsed >= u32TimeoutMs)
+        if ((osKernelGetTickCount() - u32Start) >= u32TimeoutMs)
         {
             DBG("FLASH: busy >%lu ms - aborting operation\r\n", (unsigned long)u32TimeoutMs);
             return false;
@@ -87,13 +95,15 @@ static bool FLASH_bGlobalUnprotect(void)
     uint8_t cmd[3] = { FLASH_CMD_WRITE_STATUS,
                        FLASH_STATUS_UNPROTECT,   /* SR1: BP, SRP0 */
                        FLASH_STATUS_UNPROTECT }; /* SR2: CMP, SRP1 */
+
     if (!FLASH_bWaitReady())
         return false;
-
+    BSP_LED_Off(LED_YELLOW);
     FLASH_vWriteEnable();
     FLASH_DRIVER_vSelect();
     bool bOk = (FLASH_DRIVER_vWrite(cmd, 3) == HAL_OK);
     FLASH_DRIVER_vDeselect();
+
     if (!bOk)
     {
         FLASH_vWriteDisable();    /* never leave the device armed (WEL=1) */
@@ -105,6 +115,14 @@ static bool FLASH_bGlobalUnprotect(void)
 
     return (FLASH_u8ReadStatusReg() & FLASH_STATUS_PROTECTED) == 0U;
 }
+
+/* Set once at init from the JEDEC ID read. When false (no chip fitted, or
+ * SPI2 floating with nothing attached), every operation below returns
+ * immediately without touching SPI - avoiding the bounded-but-still-3s
+ * FLASH_bWaitReady() wait on every single call (LOG_vInit alone probes
+ * every sector, so that wait multiplied by FLASH_NUM_SECTORS would turn
+ * boot into a multi-minute stall). */
+static bool bDevicePresent = false;
 
 /* Read Status Register 2 (35h) - SRP1 / QE / CMP. Diagnostic only. */
 static uint8_t FLASH_u8ReadStatusReg2(void)
@@ -137,11 +155,19 @@ void FLASH_vInit(void)
     FLASH_DRIVER_vRead(id, 3);
     FLASH_DRIVER_vDeselect();
 
-    if (id[0] != FLASH_MANUFACTURER_ID)
-        DBG("FLASH: JEDEC ID mismatch - got %02X %02X %02X (expected mfr %02X)\r\n",
+
+
+    bDevicePresent = (id[0] == FLASH_MANUFACTURER_ID);
+
+    if (!bDevicePresent)
+    {
+        DBG("FLASH: JEDEC ID mismatch - got %02X %02X %02X (expected mfr %02X) - "
+            "no flash fitted, flash logging disabled\r\n",
             id[0], id[1], id[2], FLASH_MANUFACTURER_ID);
-    else
-        DBG("FLASH: JEDEC ID %02X %02X %02X OK\r\n", id[0], id[1], id[2]);
+        return;
+    }
+
+    DBG("FLASH: JEDEC ID %02X %02X %02X OK\r\n", id[0], id[1], id[2]);
 
     /* Report protection state and self-heal a chip stuck write-protected.
      * Block protection (BP0..BP4) and SRP0 are non-volatile and block
@@ -151,6 +177,7 @@ void FLASH_vInit(void)
      * from the permanent OTP case, and is needed to interpret BP. */
     uint8_t sr1 = FLASH_u8ReadStatusReg();
     uint8_t sr2 = FLASH_u8ReadStatusReg2();
+
     DBG("FLASH: SR1=%02X (BP=%02X SRP0=%u) SR2=%02X (SRP1=%u QE=%u CMP=%u)\r\n",
         sr1,
         (unsigned)((sr1 & FLASH_SR1_BP_MASK) >> 2),
@@ -212,6 +239,9 @@ bool FLASH_bVerifyDevice(void)
 
 bool FLASH_vRead(uint32_t addr, uint8_t *buf, uint16_t len)
 {
+    if (!bDevicePresent)
+        return false;
+
     uint8_t cmd[4] = {
         FLASH_CMD_READ,
         (uint8_t)((addr >> 16) & 0xFFU),
@@ -230,6 +260,9 @@ bool FLASH_vRead(uint32_t addr, uint8_t *buf, uint16_t len)
 
 bool FLASH_vPageWrite(uint32_t addr, const uint8_t *buf, uint16_t len)
 {
+    if (!bDevicePresent)
+        return false;
+
     uint8_t cmd[4] = {
         FLASH_CMD_PAGE_PROGRAM,
         (uint8_t)((addr >> 16) & 0xFFU),
@@ -251,6 +284,9 @@ bool FLASH_vPageWrite(uint32_t addr, const uint8_t *buf, uint16_t len)
 
 bool FLASH_vSectorErase(uint32_t addr)
 {
+    if (!bDevicePresent)
+        return false;
+
     uint8_t cmd[4] = {
         FLASH_CMD_SECTOR_ERASE,
         (uint8_t)((addr >> 16) & 0xFFU),
@@ -271,6 +307,9 @@ bool FLASH_vSectorErase(uint32_t addr)
 
 bool FLASH_vBlockErase(uint32_t addr)
 {
+    if (!bDevicePresent)
+        return false;
+
     uint8_t cmd[4] = {
         FLASH_CMD_BLOCK_ERASE,
         (uint8_t)((addr >> 16) & 0xFFU),
@@ -291,6 +330,9 @@ bool FLASH_vBlockErase(uint32_t addr)
 
 bool FLASH_vChipErase(void)
 {
+    if (!bDevicePresent)
+        return false;
+
     uint8_t cmd = FLASH_CMD_CHIP_ERASE;
     if (!FLASH_bWaitReady())
         return false;
