@@ -158,16 +158,20 @@ static void SOLAR_vSampleTask(void *pvParameters)
         u16RsenseLastMV = (uint16_t)
             (((uint32_t)u16RawRsense * u16Vdda) / SOLAR_ADC_FULL_SCALE);
 
+#ifdef LOG_SOLAR_PERIODIC
         DBG_LOG("solar: Vsolar=%u mV  Vrsense=%u mV  Vdda=%u mV  I=%ld mA  P=%lu mW\r\n",
             u16VsolarLastMV, u16RsenseLastMV, u16Vdda,
             SOLAR_i32GetCurrentMA(), SOLAR_u32GetPowerMW());
+#endif
 
         /* ---- Coulomb accumulation: Q += I(A) × T(s) ---- */
         taskENTER_CRITICAL();
         fCoulombs += (SOLAR_i32GetCurrentMA() / 1000.0f) * SOLAR_SAMPLE_INTERVAL;
         taskEXIT_CRITICAL();
 #else
+#ifdef LOG_SOLAR_PERIODIC
         DBG_LOG("solar: Vsolar=%u mV  Vdda=%u mV\r\n", u16VsolarLastMV, u16Vdda);
+#endif
 #endif
     }
 }

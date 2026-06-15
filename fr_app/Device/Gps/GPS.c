@@ -784,7 +784,12 @@ void GNSS_vOnSolution(void)
         osThreadFlagsSet(GPS_vDispatcherTask_handle, GPS_DISP_FIX_TIMEOUT_BIT);
     }
 
-#ifndef SWITCH_GNSS_LOGGER
+/* Per-sample GNSS telemetry CSV — one line per second of every fix session.
+ * Off by default: it floods the flash log during a campaign (alongside the mesh
+ * burst) yet duplicates information already summarised by the per-session
+ * "FIX OK"/"FIX TIMEOUT" lines. Define LOG_GPS_PERIODIC for bench TTFF tuning.
+ * Still suppressed entirely in the dedicated SWITCH_GNSS_LOGGER build. */
+#if !defined(SWITCH_GNSS_LOGGER) && defined(LOG_GPS_PERIODIC)
     if (!GnssSession.bDbgStartFlag)
     {
         if (GnssSol.PositionError.bHasValue)

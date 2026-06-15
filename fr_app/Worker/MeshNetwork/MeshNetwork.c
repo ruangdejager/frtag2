@@ -497,8 +497,10 @@ static bool MESHNETWORK_bSendPacket(const uint8_t *pBuf, size_t u32Len)
     if (xMeshTxTaskHandle != NULL)
         osThreadFlagsSet(xMeshTxTaskHandle, MESH_TX_FLAG_QUEUE);
 
+#ifdef MESH_LOG_VERBOSE
     DBG_LOG("MeshNetwork: Queued TX (len=%u, jitter=%lu ms)\r\n",
         (unsigned)u32Len, jitterMs);
+#endif
     return true;
 }
 
@@ -549,10 +551,12 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
                     EVTLOG(LOG_TX_DREQ, 2);
                 }
             }
+#ifdef MESH_LOG_VERBOSE
             else
             {
                 DBG_LOG("MeshNetwork: DReq seen before\r\n");
             }
+#endif
         }
         else if (eNodeRole != NODE_ROLE_BEACONING)
         {
@@ -614,7 +618,9 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
     /* 1. Deduplicate */
     if (FORWARD_bHasSeen(tBeacon.u32BeaconMsgId))
     {
+#ifdef MESH_LOG_VERBOSE
         DBG_LOG("MeshNetwork: Beacon seen before\r\n");
+#endif
         tLastBeaconHeardTick = osKernelGetTickCount();
         return;
     }
@@ -678,7 +684,9 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
 
     if (FORWARD_bHasSeen(u32AckMsgId))
     {
+#ifdef MESH_LOG_VERBOSE
         DBG_LOG("MeshNetwork: Ack seen before\r\n");
+#endif
         return;
     }
     FORWARD_vAdd(u32AckMsgId);
@@ -728,7 +736,9 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
 
     if (FORWARD_bHasSeen(u32Utc))
     {
+#ifdef MESH_LOG_VERBOSE
         DBG_LOG("MeshNetwork: TimeSync seen before\r\n");
+#endif
         return;
     }
     FORWARD_vAdd(u32Utc);
@@ -759,10 +769,12 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
         if (xAppTask != NULL)
             osThreadFlagsSet(xAppTask, DEVICE_DISCOVERY_NOTIFY_TIMESYNC);
     }
+#ifdef MESH_LOG_VERBOSE
     else
     {
         DBG_LOG("MeshNetwork: TimeSync seen (already accepted this wake)\r\n");
     }
+#endif
 
 #ifndef LISTENER_MODE
     MESHNETWORK_bSendPacket(pBuf, u32Len);
@@ -844,7 +856,9 @@ static void MESHNETWORK_vTxTask(void *pvParameters)
             if (tItem.u32ReadyTick > now)
                 osDelay(tItem.u32ReadyTick - now);   /* wait out the TX jitter */
 
+#ifdef MESH_LOG_VERBOSE
             DBG_LOG("MeshNetwork: TX (len=%u)\r\n", tItem.u16Len);
+#endif
             MESHNETWORK_bTxSendRaw(tItem.u8Buf, tItem.u16Len);
         }
     }

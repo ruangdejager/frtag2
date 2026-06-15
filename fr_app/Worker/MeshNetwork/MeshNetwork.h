@@ -24,6 +24,18 @@
 #define MESH_TX_JITTER_MIN_MS         0U
 #define MESH_TX_JITTER_MAX_MS         500U
 
+/*
+ * Per-packet verbose text logging. During a campaign every node hears every
+ * neighbour's (re)transmissions, so the per-packet plumbing lines — the
+ * "Queued TX"/"TX (len=)" duplicates of "Transmitting ..." and the
+ * "... seen before" dedup hits — multiply O(N) across the fleet and are the
+ * dominant flash-log/ring-buffer noise. Off by default: the event narrative
+ * (received/forwarded/sent, beacon start/stop, timesync applied) and a single
+ * "Transmitting <type> len=" per TX are still logged. Define this for bench
+ * debugging of the TX queue / dedup behaviour.
+ */
+// #define MESH_LOG_VERBOSE
+
 /* ---- Packet types (wire, first byte) ---- */
 typedef enum {
     MeshPktType_Reserved = 0,
