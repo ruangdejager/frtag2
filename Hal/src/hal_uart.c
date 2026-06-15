@@ -66,7 +66,11 @@ void HAL_UART_vInit(void)
      * fixed at 115200. Select the baud from the role strap (BSP_ROLE_BIT0:
      * HIGH = primary) read directly here, so the port comes up at the right
      * rate from the start. (DEVICE_DISCOVERY_vConfigDeviceRole() has already
-     * read and de-inited this pin by now, so re-init it to read it again.) */
+     * read and de-inited this pin by now, so re-init it to read it again.)
+     *
+     * On a PRIMARY the pins are also TX/RX-swapped: the daughterboard wiring
+     * to the fr9 Farmranger UART crosses PB6/PB7 the opposite way to the
+     * GNSS module wiring, so the MCU-side SWAP bit corrects for it. */
     HAL_GPIO_vInitInput(BSP_ROLE_BIT0_PORT, BSP_ROLE_BIT0_PIN, GPIO_PULLDOWN);
     bool bPrimary = (HAL_GPIO_ReadPin(BSP_ROLE_BIT0_PORT, BSP_ROLE_BIT0_PIN) == GPIO_PIN_SET);
     HAL_GPIO_DeInit(BSP_ROLE_BIT0_PORT, BSP_ROLE_BIT0_PIN);
@@ -75,6 +79,8 @@ void HAL_UART_vInit(void)
     LL_USART_Init(BSP_GPS_USART_INSTANCE, &USART_InitStruct);
     LL_USART_SetHWFlowCtrl(BSP_GPS_USART_INSTANCE, LL_USART_HWCONTROL_NONE);
     LL_USART_ConfigAsyncMode(BSP_GPS_USART_INSTANCE);
+    LL_USART_SetTXRXSwap(BSP_GPS_USART_INSTANCE,
+                          bPrimary ? LL_USART_TXRX_SWAPPED : LL_USART_TXRX_STANDARD);
     LL_USART_Enable(BSP_GPS_USART_INSTANCE);
     NVIC_SetPriority(BSP_GPS_USART_IRQn,
                      NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 6, 0));

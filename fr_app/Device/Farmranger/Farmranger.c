@@ -209,9 +209,10 @@ bool FARMRANGER_bDeviceOn(void)
                             respBuf,
                             sizeof(respBuf),
                             respBuf,
-                            5000))
+                            3000))
     {
         DBG_LOG("RDY not received\r\n");
+        BSP_LED_On(LED_YELLOW);
         return false;
     }
 
