@@ -14,6 +14,7 @@
 
 #include "hal_uart.h"
 #include "hal_bsp.h"
+#include "hal_gpio.h"
 
 #include "stm32wlxx.h"
 #include "stm32wlxx_ll_usart.h"
@@ -59,8 +60,18 @@ void HAL_UART_vInit(void)
     NVIC_SetPriority(BSP_DEBUG_USART_IRQn,
                      NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 6, 0));
 
-    /* GPS / Farmranger UART (USART1) */
-    USART_InitStruct.BaudRate = BSP_GPS_UART_BAUD;
+    /* GPS / Farmranger UART (USART1), mutually exclusive by device role:
+     * a SECONDARY runs GNSS (9600, MAX-M10S default); a PRIMARY has no GPS and
+     * uses this UART as the Farmranger link to the fr9 board, whose UART is
+     * fixed at 115200. Select the baud from the role strap (BSP_ROLE_BIT0:
+     * HIGH = primary) read directly here, so the port comes up at the right
+     * rate from the start. (DEVICE_DISCOVERY_vConfigDeviceRole() has already
+     * read and de-inited this pin by now, so re-init it to read it again.) */
+    HAL_GPIO_vInitInput(BSP_ROLE_BIT0_PORT, BSP_ROLE_BIT0_PIN, GPIO_PULLDOWN);
+    bool bPrimary = (HAL_GPIO_ReadPin(BSP_ROLE_BIT0_PORT, BSP_ROLE_BIT0_PIN) == GPIO_PIN_SET);
+    HAL_GPIO_DeInit(BSP_ROLE_BIT0_PORT, BSP_ROLE_BIT0_PIN);
+
+    USART_InitStruct.BaudRate = bPrimary ? BSP_FARMRANGER_UART_BAUD : BSP_GPS_UART_BAUD;
     LL_USART_Init(BSP_GPS_USART_INSTANCE, &USART_InitStruct);
     LL_USART_SetHWFlowCtrl(BSP_GPS_USART_INSTANCE, LL_USART_HWCONTROL_NONE);
     LL_USART_ConfigAsyncMode(BSP_GPS_USART_INSTANCE);

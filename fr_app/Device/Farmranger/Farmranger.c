@@ -200,13 +200,6 @@ bool FARMRANGER_bDeviceOn(void)
     osSemaphoreAcquire(xLineReadySem, 0);   /* drain any pending token */
 
     FR_DRIVER_vEnableUart(&farmranger.UartHandle);
-
-    /* USART1 powers up at the GNSS baud (9600); the fr9 logger link is fixed
-     * at 115200. Apply it here - the UART clock is enabled and stays on after
-     * FR_DRIVER_vEnableUart(), so the BRR write is safe, and this re-applies
-     * after every wake (HAL_UART_vInit resets it to the GNSS default). */
-    HAL_UART_vSetSpeed(&farmranger.UartHandle, BSP_FARMRANGER_UART_BAUD);
-
     FR_DRIVER_vIntEnable();
 
     char respBuf[32] = {0};
