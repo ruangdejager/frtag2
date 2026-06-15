@@ -16,9 +16,6 @@
 #include "DbgLog.h"
 #include "Debug.h"
 #include "Log.h"
-#ifdef LISTENER_MODE
-#include "Farmranger.h"
-#endif
 
 #include "platform_rtc.h"
 #include "Battery.h"
@@ -62,9 +59,7 @@ static void DBGLOG_vConsumerTask(void *arg);
 
 void DBGLOG_vInit(void)
 {
-#if defined(ENABLE_DBG_UART) && !defined(LISTENER_MODE)
     DEBUG_vInit();
-#endif
 
     xFmtMutex = osMutexNew(NULL);
     configASSERT(xFmtMutex != NULL);
@@ -250,11 +245,7 @@ static void DBGLOG_vConsumerTask(void *arg)
 
             if (dest & DBGLOG_DEST_UART)
             {
-#ifdef LISTENER_MODE
-                FARMRANGER_vPutString(au8Msg, len);
-#else
                 DEBUG_vPutBuffer(au8Msg, len);
-#endif
             }
             if (dest & DBGLOG_DEST_FLASH)
             {
@@ -279,11 +270,7 @@ static void DBGLOG_vConsumerTask(void *arg)
             if (n > 0)
             {
                 if (n > (int)sizeof(au8Msg)) n = (int)sizeof(au8Msg);
-#ifdef LISTENER_MODE
-                FARMRANGER_vPutString(au8Msg, (uint8_t)n);
-#else
                 DEBUG_vPutBuffer(au8Msg, (uint16_t)n);
-#endif
                 LOG_vWrite((const char *)au8Msg, (uint16_t)n);
             }
         }

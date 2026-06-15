@@ -140,59 +140,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         osDelay(APP_WAKEUP_BUFFER_MS);
         EVTLOG(LOG_DISCOVERY_START, eDeviceRole);
 
-#ifdef LISTENER_MODE
-
-        /* Listener: passively observe the full discovery window */
-        DBG_LOG("DeviceDiscovery %X: LISTENER MODE - monitoring for %d ms\r\n",
-            LORARADIO_u32GetUniqueId(), APP_DISCOVERY_WINDOW_TIMEOUT_MS);
-
-        {
-            osThreadFlagsClear(DEVICE_DISCOVERY_NOTIFY_TIMESYNC);
-            uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
-                                           osFlagsWaitAny,
-                                           APP_DISCOVERY_WINDOW_TIMEOUT_MS);
-
-            if (!(r & osFlagsError))
-                DBG_LOG("DeviceDiscovery %X: Listener received TimeSync\r\n",
-                    LORARADIO_u32GetUniqueId());
-            else
-                DBG_LOG("DeviceDiscovery %X: Listener window timed out\r\n",
-                    LORARADIO_u32GetUniqueId());
-        }
-
-        /* Report devices observed during the listener window */
-        {
-            MeshDiscoveredNeighbor_t tNeighbors[MESH_MAX_NEIGHBORS];
-            uint16_t u16NeighborCount = 0;
-
-            if (MESHNETWORK_bGetDiscoveredNeighbors(tNeighbors, MESH_MAX_NEIGHBORS,
-                                                    &u16NeighborCount))
-            {
-                DBG_LOG("DeviceDiscovery %X: Listener observed %u device(s).\r\n",
-                    LORARADIO_u32GetUniqueId(), u16NeighborCount);
-                EVTLOG(LOG_DISCOVERY_COUNT, u16NeighborCount);
-                for (uint16_t i = 0; i < u16NeighborCount; i++)
-                {
-                    DBG_LOG("  ID:%X  Hops:%X  RSSI:%d  Bat:%d  Wave:%d  Move:%u  Lat:%ld  Lon:%ld\r\n",
-                        tNeighbors[i].u32DeviceId,
-                        tNeighbors[i].u8HopCount,
-                        tNeighbors[i].i16Rssi,
-                        tNeighbors[i].u16BatMv,
-                        tNeighbors[i].u8Wave,
-                        tNeighbors[i].u8MoveState,
-                        tNeighbors[i].bGpsValid ? (long)tNeighbors[i].i32LatUDeg : 0L,
-                        tNeighbors[i].bGpsValid ? (long)tNeighbors[i].i32LonUDeg : 0L);
-                }
-            }
-            else
-            {
-                DBG_LOG("DeviceDiscovery %X: Error retrieving neighbor table.\r\n",
-                    LORARADIO_u32GetUniqueId());
-            }
-        }
-
-#else /* normal PRIMARY / SECONDARY behavior */
-
         if (eDeviceRole == DEVICE_ROLE_PRIMARY)
         {
             bool bDiscoveryFinished = false;
@@ -256,8 +203,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             MESHNETWORK_vStopBeaconing(u32DreqId);
         }
 
-#endif /* LISTENER_MODE */
-
         /* ----------------------------------------------------------------
          * Discovery complete — log and upload (primary only)
          * ---------------------------------------------------------------- */
@@ -265,7 +210,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             LORARADIO_u32GetUniqueId());
         EVTLOG(LOG_DISCOVERY_CMPLT, eDeviceRole);
 
-#ifndef LISTENER_MODE
         if (eDeviceRole == DEVICE_ROLE_PRIMARY)
         {
             MeshDiscoveredNeighbor_t tNeighbors[MESH_MAX_NEIGHBORS];
@@ -296,8 +240,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                     LORARADIO_u32GetUniqueId());
             }
 
-#ifndef ENABLE_DBG_UART
-            /* ---- Logger connection + upload ---- */
+            /* ---- Logger connection + upload (fr9 Farmranger board) ---- */
             DEVICE_DISCOVERY_DRIVER_bConnectLogger();
 
             DBG_LOG("DeviceDiscovery %X: Logger connected.\r\n",
@@ -326,7 +269,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             else if (u8WakeInterval == 120) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_120_MIN);
 
             DEVICE_DISCOVERY_DRIVER_vDisconnectLogger();
-#endif /* ENABLE_DBG_UART */
 
             /* ---- Send TimeSync to secondaries ---- */
             DEVICE_DISCOVERY_vSendTS();
@@ -354,7 +296,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             }
         }
 #endif /* ENABLE_LOW_POWER_RECOVERY */
-#endif /* LISTENER_MODE */
 
         } /* end if (!bKernelWakeup) */
         else

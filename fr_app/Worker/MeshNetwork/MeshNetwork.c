@@ -528,7 +528,6 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
 
     u32LastDiscoveryPktTick = osKernelGetTickCount();
 
-#ifndef LISTENER_MODE
     /* Multi-primary: primaries never beacon and never forward.
      * They observe other primaries' DReqs (e.g. for RSSI tracking
      * below) but take no action on them. */
@@ -564,7 +563,6 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
             u8PrimaryDreqWaveCnt = u8WaveCnt;
         }
     }
-#endif
 
     if ((u8PrimaryDreqWaveCnt == u8WaveCnt) && (s16Rssi > i16BestDreqRssi))
         i16BestDreqRssi = s16Rssi;
@@ -640,7 +638,6 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
         return;
     }
 
-#ifndef LISTENER_MODE
     /* 4. Secondary forwarder: relay beacon */
     if (eNodeRole == NODE_ROLE_FORWARDER)
     {
@@ -654,7 +651,6 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
             EVTLOG(LOG_TX_BEACON, 2);
         }
     }
-#endif
 }
 
 static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
@@ -691,7 +687,6 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
     }
     FORWARD_vAdd(u32AckMsgId);
 
-#ifndef LISTENER_MODE
     if (eNodeRole == NODE_ROLE_FORWARDER)
     {
         MESHNETWORK_bSendPacket(pBuf, u32Len);
@@ -714,7 +709,6 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
             }
         }
     }
-#endif
 }
 
 static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
@@ -776,11 +770,9 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
     }
 #endif
 
-#ifndef LISTENER_MODE
     MESHNETWORK_bSendPacket(pBuf, u32Len);
     DBG_LOG("MeshNetwork: TimeSync forwarded\r\n");
     EVTLOG(LOG_TX_TS, 2);
-#endif
 }
 
 /* --------------------------------------------------------------------------

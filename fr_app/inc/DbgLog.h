@@ -12,7 +12,7 @@
  *
  * Two verbosity levels are available, in two families:
  *
- *   DBG(fmt, ...)      — debug transport only (UART / LISTENER, gated by flags)
+ *   DBG(fmt, ...)      — debug transport only (debug UART)
  *   LOG(fmt, ...)      — external-flash text log only
  *   DBG_LOG(fmt, ...)  — both
  *
@@ -53,16 +53,8 @@ void DBGLOG_vRequestDump(void);
 void DBGLOG_vPutDebug(const char *format, ...);
 void DBGLOG_vPutLog(const char *format, ...);
 
-#ifdef LISTENER_MODE
-#  define DBG(x, ...)    DBGLOG_vPutVerbose(DBGLOG_DEST_UART, x, ##__VA_ARGS__)
-#  define _DBG_(x, ...)  DBGLOG_vPut(DBGLOG_DEST_UART, x, ##__VA_ARGS__)
-#elif defined(ENABLE_DBG_UART)
-#  define DBG(x, ...)    DBGLOG_vPutVerbose(DBGLOG_DEST_UART, x, ##__VA_ARGS__)
-#  define _DBG_(x, ...)  DBGLOG_vPut(DBGLOG_DEST_UART, x, ##__VA_ARGS__)
-#else
-#  define DBG(x, ...)
-#  define _DBG_(x, ...)
-#endif
+#define DBG(x, ...)    DBGLOG_vPutVerbose(DBGLOG_DEST_UART, x, ##__VA_ARGS__)
+#define _DBG_(x, ...)  DBGLOG_vPut(DBGLOG_DEST_UART, x, ##__VA_ARGS__)
 
 #define LOG(x, ...)        DBGLOG_vPutVerbose(DBGLOG_DEST_FLASH, x, ##__VA_ARGS__)
 #define DBG_LOG(x, ...)    DBGLOG_vPutVerbose(DBGLOG_DEST_BOTH,  x, ##__VA_ARGS__)

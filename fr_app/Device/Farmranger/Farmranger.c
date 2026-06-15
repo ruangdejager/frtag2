@@ -35,10 +35,6 @@
 /* ---- Private defines ---- */
 #define FR_RX_TASK_STACK_SIZE         (configMINIMAL_STACK_SIZE)
 #define FR_AT_HANDLER_TASK_STACK_SIZE (configMINIMAL_STACK_SIZE * 2)
-#define FR_DBG_TX_TASK_STACK_SIZE     (configMINIMAL_STACK_SIZE)
-
-#define FR_DBG_TX_STR_LEN     128
-#define FR_DBG_TX_QUEUE_DEPTH 8
 
 /* Thread flag used by UART ISR to wake the RX task */
 #define FR_RX_FLAG              (1UL << 0)
@@ -47,8 +43,12 @@
 #define FR_AT_NOTIFY_SUCCESS    (1UL << 8)
 #define FR_AT_NOTIFY_TIMEOUT    (1UL << 9)
 
-/* ---- RX buffer ---- */
-#define FR_RX_BUF_LEN 128
+/* ---- RX buffer ----
+ * The fr9 logger's AT responses are all short fixed tokens ("RDY\r\n",
+ * "Logger ready\r\n", "OK\r\n", a 10-digit timestamp, a wake interval) -
+ * the longest is ~14 bytes. 48 keeps a >3x margin while two of these line
+ * buffers stay small (RAM here is very tight). */
+#define FR_RX_BUF_LEN 48
 static char     acFrRxBuf[FR_RX_BUF_LEN];
 static uint8_t  u8FrRxBufIdx = 0;
 static char     acFrLineBuf[FR_RX_BUF_LEN];
@@ -56,20 +56,10 @@ static char     acFrLineBuf[FR_RX_BUF_LEN];
 /* ---- CMSIS-RTOS v2 objects ---- */
 static osThreadId_t  Farmranger_vRxTask_handle;
 static osThreadId_t  Farmranger_vATHandlerTask_handle;
-static osThreadId_t  Farmranger_vDbgTxTask_handle;
 
 static osSemaphoreId_t xLineReadySem;
 static osSemaphoreId_t xUartTxDoneSem;
 static osMessageQueueId_t xATQueue;
-
-#ifdef LISTENER_MODE
-typedef struct {
-    char     str[FR_DBG_TX_STR_LEN];
-    uint16_t len;
-} DbgTxItem_t;
-
-static osMessageQueueId_t xDbgTxQueue;
-#endif
 
 /* ---- Device state ---- */
 bool bFRDeviceOn;
@@ -101,9 +91,6 @@ static bool FARMRANGER_bATSend(const char *cmd,
                                void *context,
                                uint32_t timeout);
 static void FARMRANGER_vATHandlerTask(void *args);
-#ifdef LISTENER_MODE
-static void FARMRANGER_vDbgTxTask(void *args);
-#endif
 static bool FARMRANGER_bParseTimestamp(const char *line, void *ctx);
 static bool FARMRANGER_bParseInterval(const char *line, void *ctx);
 static bool FARMRANGER_bParseLoggerReady(const char *line, void *ctx);
@@ -119,10 +106,6 @@ void FARMRANGER_vInit(void)
 
     FR_DRIVER_vInitFRDevice(&farmranger.UartHandle);
 
-#ifdef LISTENER_MODE
-    FR_DRIVER_vEnableUart(&farmranger.UartHandle);
-#endif
-
     xLineReadySem    = osSemaphoreNew(1, 0, NULL);
     xUartTxDoneSem   = osSemaphoreNew(1, 0, NULL);
     xATQueue         = osMessageQueueNew(4, sizeof(ATReq_t), NULL);
@@ -130,11 +113,6 @@ void FARMRANGER_vInit(void)
     configASSERT(xLineReadySem  != NULL);
     configASSERT(xUartTxDoneSem != NULL);
     configASSERT(xATQueue       != NULL);
-
-#ifdef LISTENER_MODE
-    xDbgTxQueue = osMessageQueueNew(FR_DBG_TX_QUEUE_DEPTH, sizeof(DbgTxItem_t), NULL);
-    configASSERT(xDbgTxQueue != NULL);
-#endif
 
     static const osThreadAttr_t rx_attr = {
         .name       = "FRRxTask",
@@ -152,16 +130,6 @@ void FARMRANGER_vInit(void)
 
     configASSERT(Farmranger_vRxTask_handle        != NULL);
     configASSERT(Farmranger_vATHandlerTask_handle  != NULL);
-
-#ifdef LISTENER_MODE
-    static const osThreadAttr_t dbtx_attr = {
-        .name       = "FRDbgTxTask",
-        .stack_size = FR_DBG_TX_TASK_STACK_SIZE * sizeof(StackType_t),
-        .priority   = osPriorityLow,
-    };
-    Farmranger_vDbgTxTask_handle = osThreadNew(FARMRANGER_vDbgTxTask, NULL, &dbtx_attr);
-    configASSERT(Farmranger_vDbgTxTask_handle != NULL);
-#endif
 }
 
 /* --------------------------------------------------------------------------
@@ -171,9 +139,6 @@ void FARMRANGER_vUartOnWake(void)
 {
     HAL_UART_vInit();
     FR_DRIVER_vInitFRDevice(&farmranger.UartHandle);
-#ifdef LISTENER_MODE
-    FR_DRIVER_vEnableUart(&farmranger.UartHandle);
-#endif
 }
 
 /* --------------------------------------------------------------------------
@@ -403,34 +368,42 @@ uint8_t FARMRANGER_u8RequestInterval(void)
 /* --------------------------------------------------------------------------
  * FARMRANGER_bLogData — sends neighbor table to logger
  * -------------------------------------------------------------------------- */
+/* One CSV row: "DeviceId,Hops,Rssi,BatMv,Wave,Move,Lat,Lon\t". Worst case
+ * is ~60 chars (8-hex id + signed micro-degree lat/lon); 80 leaves margin. */
+#define FR_CSV_ROW_MAX 80
+
+/* Format neighbor `i` into `row` (size FR_CSV_ROW_MAX). Returns the byte
+ * count, or <=0 / >=FR_CSV_ROW_MAX on error. */
+static int FARMRANGER_iFormatRow(char *row, const MeshDiscoveredNeighbor_t *n)
+{
+    return snprintf(row, FR_CSV_ROW_MAX,
+                    "%X,%u,%d,%u,%u,%u,%ld,%ld\t",
+                    (unsigned int)n->u32DeviceId,
+                    n->u8HopCount,
+                    n->i16Rssi,
+                    n->u16BatMv,
+                    n->u8Wave,
+                    n->u8MoveState,
+                    (long)n->i32LatUDeg,
+                    (long)n->i32LonUDeg);
+}
+
 bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
 {
-    /* Sized to fit within the 64K RAM budget alongside the wider
-     * NeighborEntry_t table (now carrying GPS/movement); ~45 rows at the
-     * new CSV row width. */
-    static char logBuffer[2560];
+    /* The AT+LOG protocol needs the total payload length up front, so build
+     * it in two passes over a single small row buffer rather than one large
+     * static payload buffer: pass 1 sums the byte count, pass 2 streams each
+     * row. Keeps RAM use to one ~80-byte row regardless of neighbor count. */
+    char   row[FR_CSV_ROW_MAX];
     size_t pos = 0;
 
+    /* Pass 1: compute total payload length. */
     for (uint16_t i = 0; i < count; i++)
     {
-        /* CSV row: DeviceId,Hops,Rssi,BatMv,Wave,Move,Lat,Lon
-         * Lat/Lon are microdegrees (10^-6 deg); 0/0 when no GPS fix. */
-        int n = snprintf(&logBuffer[pos],
-                         sizeof(logBuffer) - pos,
-                         "%X,%u,%d,%u,%u,%u,%ld,%ld\t",
-                         neighbors[i].u32DeviceId,
-                         neighbors[i].u8HopCount,
-                         neighbors[i].i16Rssi,
-                         neighbors[i].u16BatMv,
-                         neighbors[i].u8Wave,
-                         neighbors[i].u8MoveState,
-                         (long)neighbors[i].i32LatUDeg,
-                         (long)neighbors[i].i32LonUDeg);
-
-        if (n <= 0 || n >= (int)(sizeof(logBuffer) - pos))
+        int n = FARMRANGER_iFormatRow(row, &neighbors[i]);
+        if (n <= 0 || n >= (int)sizeof(row))
             return false;
-
-        pos += n;
+        pos += (size_t)n;
     }
 
     /* Step 1: send AT+LOG=<len> and wait for "Logger ready" */
@@ -450,14 +423,16 @@ bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
         BSP_LED_On(LED_YELLOW);
     }
 
-    if (pos > 0)
+    /* Step 2: stream the CSV payload one row at a time. */
+    for (uint16_t i = 0; i < count; i++)
     {
-        /* Step 2: stream the CSV payload */
-        HAL_UART_vTxPutBuffer(&farmranger.UartHandle,
-                              (uint8_t *)logBuffer,
-                              pos);
+        int n = FARMRANGER_iFormatRow(row, &neighbors[i]);
+        if (n <= 0 || n >= (int)sizeof(row))
+            return false;
 
-        /* Wait until TX is fully drained */
+        HAL_UART_vTxPutBuffer(&farmranger.UartHandle, (uint8_t *)row, (uint16_t)n);
+
+        /* Wait until this row's TX is fully drained before reusing `row`. */
         if (osSemaphoreAcquire(xUartTxDoneSem, 3500) != osOK)
         {
             EVTLOG(LOG_FRLOG_ERROR, 2);
@@ -550,39 +525,3 @@ static bool FARMRANGER_bParseRDY(const char *line, void *ctx)
     return (line != NULL && strstr(line, "RDY") != NULL);
 }
 
-/* --------------------------------------------------------------------------
- * Listener-mode API
- * -------------------------------------------------------------------------- */
-#ifdef LISTENER_MODE
-
-void FARMRANGER_vPutString(const uint8_t *data, uint16_t len)
-{
-    if (xDbgTxQueue == NULL || len == 0)
-        return;
-
-    DbgTxItem_t item;
-    if (len > FR_DBG_TX_STR_LEN)
-        len = FR_DBG_TX_STR_LEN;
-
-    memcpy(item.str, data, len);
-    item.len = len;
-
-    osMessageQueuePut(xDbgTxQueue, &item, 0, 0);
-}
-
-static void FARMRANGER_vDbgTxTask(void *args)
-{
-    DbgTxItem_t item;
-
-    for (;;)
-    {
-        if (osMessageQueueGet(xDbgTxQueue, &item, NULL, osWaitForever) == osOK)
-        {
-            HAL_UART_vTxPutBuffer(&farmranger.UartHandle,
-                                  (uint8_t *)item.str,
-                                  item.len);
-        }
-    }
-}
-
-#endif /* LISTENER_MODE */
