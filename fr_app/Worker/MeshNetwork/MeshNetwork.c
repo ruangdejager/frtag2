@@ -664,6 +664,18 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
     uint32_t u32AckMsgId = read_u32_be(&pBuf[1]);
     uint32_t u32DreqId   = read_u32_be(&pBuf[5]);
     uint8_t  u8AckCount  = pBuf[9];
+
+    /* The count byte is attacker/corruption-controlled. A conforming sender
+     * never emits more than MESH_MAX_ACK_IDS_PER_PACKET ids, but the RX buffer
+     * is 256 B, so a garbled frame whose count byte lands in 9..61 would still
+     * satisfy the length check below and overrun u32Ids[] on the stack (the
+     * weak XOR-8 packet CRC lets ~1/256 of corrupted frames through). Reject
+     * any over-range count before it can smash the stack. */
+    if (u8AckCount > MESH_MAX_ACK_IDS_PER_PACKET)
+    {
+        DBG_LOG("MeshNetwork: DAck dropped, bad count=%u\r\n", u8AckCount);
+        return;
+    }
     if (u32Len < (size_t)(10 + 4 * u8AckCount)) return;
 
     uint32_t u32Ids[MESH_MAX_ACK_IDS_PER_PACKET];
