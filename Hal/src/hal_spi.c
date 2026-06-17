@@ -52,11 +52,20 @@ HAL_StatusTypeDef HAL_SPI_FLASH_vReadPacket(uint8_t *rx, uint16_t len)
  *   SPI1 — accelerometer (PA1 SCK / PA6 MISO / PA7 MOSI, AF5)
  *   SPI2 — external NOR flash (PA5 MISO AF3 / PA8 SCK AF5 / PA10 MOSI AF5)
  *
- * Safe to call multiple times (e.g. after STOP2 wake — HAL_SPI_Init is
- * idempotent when the handle is already initialised).
+ * Safe to call multiple times (e.g. after STOP2 wake). Both handle states are
+ * forced to RESET first so HAL_SPI_Init() re-runs HAL_SPI_MspInit() on every
+ * call: MspInit is what restores the SPI GPIO pins to their alternate function.
+ * This matters after STOP2 because HAL_GPIO_vOnSleep() parks the SPI pins as
+ * analog Hi-Z; without re-running MspInit the pins would stay analog and the
+ * flash/ACC buses would be dead (status reads time out as "busy"). Plain
+ * HAL_SPI_Init() skips MspInit once the handle is no longer in RESET.
  * -------------------------------------------------------------------------- */
 void HAL_SPI_vInit(void)
 {
+    /* Force a full re-init (incl. MspInit -> pin restore) on every call. */
+    hAccSpi.State   = HAL_SPI_STATE_RESET;
+    hFlashSpi.State = HAL_SPI_STATE_RESET;
+
     /* --- SPI1: accelerometer --- */
     hAccSpi.Instance               = ACC_SPI;
     hAccSpi.Init.Mode              = SPI_MODE_MASTER;
