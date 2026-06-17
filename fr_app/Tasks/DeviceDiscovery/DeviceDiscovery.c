@@ -416,6 +416,13 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                 HAL_UART_vInit();
                 DEBUG_vInit();
 
+                /* Clear any node role left over from off-schedule mesh activity
+                 * (e.g. a DReq from a primary's catch-up campaign that started
+                 * this node beaconing between scheduled wakes). Done before the
+                 * radio comes up so this campaign begins from a clean UNKNOWN
+                 * role and beacons the current dreq rather than a stale one. */
+                MESHNETWORK_vResetNodeRole();
+
                 LORARADIO_vWakeUp();
 
                 DBG_LOG("\r\n--- WAKEUP ---\r\n");

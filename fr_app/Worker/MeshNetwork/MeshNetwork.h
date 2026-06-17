@@ -18,6 +18,12 @@
 #define MESH_BEACON_INTERVAL_MS       5000U
 #define MESH_PRIMARY_ACK_INTERVAL_MS  2000U
 #define MESH_DISCOVERY_IDLE_MS        7000U
+
+/* Cap on beacons originated per beaconing session. A node is normally acked
+ * out within 1-3 beacons; this stops a node that is never acked - e.g. one
+ * that latched onto a stale dreq or began beaconing from an off-schedule DReq -
+ * from beaconing indefinitely. After the cap it falls back to forwarder. */
+#define MESH_MAX_BEACONS_PER_CAMPAIGN 6U
 #define FORWARD_RING_SIZE             32
 #define MESH_MAX_NEIGHBORS            128
 

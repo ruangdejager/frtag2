@@ -104,6 +104,7 @@ static uint32_t         tLastBeaconHeardTick  = 0;
 static bool       bNodeBeaconing      = false;
 static uint32_t   u32NodeBeaconDreqId = 0;
 static uint8_t    u8NodeHopCount      = 0;
+static uint8_t    u8NodeBeaconCount   = 0;
 static NodeRole_e eNodeRole           = NODE_ROLE_UNKNOWN;
 
 /* Multi-primary: "first TimeSync per wake" gate (secondaries only).
@@ -414,6 +415,16 @@ static void MESHNETWORK_vBuildAndQueueBeacon(void)
     if (!MESHNETWORK_bEncodeDBeacon(&tBeacon, u8Buf, sizeof(u8Buf), &u32Len)) return;
     FORWARD_vAdd(tBeacon.u32BeaconMsgId);
     MESHNETWORK_bSendPacket(u8Buf, u32Len);
+
+    /* Bound the beaconing session. A node that gets acked stops via the DAck
+     * path within a beacon or two; this catches the node that is never acked
+     * (latched on a stale dreq, or beaconing from an off-schedule DReq) so it
+     * cannot beacon forever - after the cap it becomes a forwarder. */
+    if (++u8NodeBeaconCount >= MESH_MAX_BEACONS_PER_CAMPAIGN)
+    {
+        DBG_LOG("MeshNetwork: Beacon cap reached, become forwarder\r\n");
+        MESHNETWORK_vStopBeaconing(u32NodeBeaconDreqId);
+    }
 }
 
 /* Timer callback (Tmr Svc context): stay tiny — just wake the MeshTx task. */
@@ -557,10 +568,22 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
             }
 #endif
         }
-        else if (eNodeRole != NODE_ROLE_BEACONING)
+        else
         {
-            MESHNETWORK_vStartBeaconing(u32DreqId, (uint8_t)(u8SenderHopCount + 1));
-            u8PrimaryDreqWaveCnt = u8WaveCnt;
+            /* Not a forwarder: start beaconing, or re-anchor onto a newer DReq
+             * from the SAME primary. Re-anchoring is essential - a node still
+             * beaconing an earlier dreq (a primary's pre-reboot campaign, or an
+             * earlier wave) would otherwise keep emitting that stale dreq, and
+             * the current campaign's ACKs (carrying the new dreq) would never
+             * match u32NodeBeaconDreqId, so it could never be acked out. The
+             * same-primary guard keeps multi-primary behaviour intact. */
+            bool bSamePrimary = (u32OriginId == (u32NodeBeaconDreqId >> 16));
+            if (eNodeRole != NODE_ROLE_BEACONING ||
+                (u32DreqId != u32NodeBeaconDreqId && bSamePrimary))
+            {
+                MESHNETWORK_vStartBeaconing(u32DreqId, (uint8_t)(u8SenderHopCount + 1));
+                u8PrimaryDreqWaveCnt = u8WaveCnt;
+            }
         }
     }
 
