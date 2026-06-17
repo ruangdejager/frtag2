@@ -92,8 +92,12 @@ void HAL_SYSTEM_vEnterStop2(void)
      *
      * Order matters: HAL_GPIO_OnWake() must run first so that GPIOA/B/C clocks
      * are enabled before HAL_SPI_vInit() calls HAL_GPIO_Init() for SPI pins.
-     * HAL_GPIO_vOnSleep() only gated the AHB clock — it did NOT modify MODER/AFR —
-     * so the pin configuration is intact; we just need the bus clock restored.
+     * HAL_GPIO_vOnSleep() parks the peripheral AF pins (SPI/UART) and PB12 as
+     * analog before gating the clocks, so those pins ARE re-initialised on wake:
+     * HAL_GPIO_OnWake() restores the debug UART (USART2), HAL_SPI_vInit() the
+     * SPI1/SPI2 pins, HAL_ADC_vInit() the ADC pins; USART1 (GPS/Farmranger) pins
+     * stay analog until those subsystems are next powered on. All other pins
+     * (driven outputs, role strap) keep their retained MODER/level across STOP2.
      *
      * USART2 needs no explicit re-init: STOP2 retains both the APB1ENR clock-
      * enable bit and the full USART2 register state (BRR, CR1, CR2, CR3).

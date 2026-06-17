@@ -56,12 +56,19 @@ void HAL_GPIO_vInit(void)
  * NOT included (intentionally held across STOP2 to keep externals in a known
  * state): PA0 GNSS_ON=low, PA4 BAT_BIAS=low, PA9 RF_SW=low, PA11 ACC_CS=high,
  * PA15 FLASH_CS=high, PB5/PB8 LEDs=low. ADC pins (PA12/PB3/PB4) are already
- * analog. GPIO state is retained in STOP2, so driven pins keep their level. */
+ * analog. GPIO state is retained in STOP2, so driven pins keep their level.
+ *
+ * PB12 (ROLE_BIT0) is also parked analog: it is configured input-pulldown when
+ * read, and on a PRIMARY the strap is tied HIGH, so leaving it pulldown would
+ * sink ~VDD/R_pd (~80 uA) continuously. It currently ends up analog only because
+ * the last reader DeInits it - parking it here makes that guaranteed, not
+ * incidental on the wake-path ordering. */
 #define HAL_GPIO_SLEEP_ANALOG_GPIOA  (BSP_ACC_SCK_PIN  | BSP_DEBUG_UART_TX_PIN | \
                                       BSP_DEBUG_UART_RX_PIN | BSP_FLASH_MISO_PIN | \
                                       BSP_ACC_MISO_PIN | BSP_ACC_MOSI_PIN | \
                                       BSP_FLASH_SCK_PIN | BSP_FLASH_MOSI_PIN)
-#define HAL_GPIO_SLEEP_ANALOG_GPIOB  (BSP_GPS_UART_TX_PIN | BSP_GPS_UART_RX_PIN)
+#define HAL_GPIO_SLEEP_ANALOG_GPIOB  (BSP_GPS_UART_TX_PIN | BSP_GPS_UART_RX_PIN | \
+                                      BSP_ROLE_BIT0_PIN)
 
 void HAL_GPIO_vOnSleep(void)
 {
