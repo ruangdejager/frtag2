@@ -87,6 +87,8 @@ void INIT_vInitialization(void *parameters)
 
     FLASHLOG_vDump();     /* no-op unless ENABLE_FLASH_LOG + DEBUG_OUTPUT_UART both defined */
 
+    // Enable WDT
+    HAL_WDT_vInit();
     HAL_WDT_vReset();
 
     HAL_ADC_vInit();

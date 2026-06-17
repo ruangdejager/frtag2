@@ -19,7 +19,7 @@
 
 RTC_HandleTypeDef hrtc;
 
-static uint64_t hal_rtc_counter = 7200-5-180;
+static uint64_t hal_rtc_counter = 7200-5;
 static rtc_tick_callback_t       one_second_callback = NULL;
 static rtc_hourAlarm_callback_t  one_minute_callback = NULL;
 static rtc_hourAlarm_callback_t  one_hour_callback   = NULL;
