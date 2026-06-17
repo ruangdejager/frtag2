@@ -96,6 +96,11 @@ static inline void BSP_LED_Toggle(Led_TypeDef led)
 #define BSP_GPS_UART_AF             GPIO_AF7_USART1
 #define BSP_GPS_UART_BAUD           9600    /* MAX-M10S factory default; switch to 115200 via UBX-CFG-VALSET once comms established */
 
+/* On a PRIMARY, USART1 is repurposed as the Farmranger link to the fr9 board.
+ * That board's frtag UART runs at a fixed 115200, so the link must match -
+ * the GPS default (9600) above only applies to a SECONDARY running GNSS. */
+#define BSP_FARMRANGER_UART_BAUD    115200
+
 /* GNSS power enable — single pin (replaces 3-pin GPS power from frtag) */
 #define BSP_GNSS_ON_PORT            GPIOA
 #define BSP_GNSS_ON_PIN             GPIO_PIN_0

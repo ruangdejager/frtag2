@@ -23,8 +23,12 @@ SPI_HandleTypeDef hFlashSpi;
  * Reads 'len' bytes from the flash by clocking out 0xFF dummy bytes via
  * full-duplex TransmitReceive (HAL_SPI_Receive does not clock in 2-line
  * master mode). Chunked so the dummy buffer stays small.
+ *
+ * Returns HAL_OK only if every chunk transferred cleanly; on the first
+ * non-OK chunk the transfer is aborted immediately so the caller can
+ * deselect without clocking further (possibly stale) bytes into rx.
  * -------------------------------------------------------------------------- */
-void HAL_SPI_FLASH_vReadPacket(uint8_t *rx, uint16_t len)
+HAL_StatusTypeDef HAL_SPI_FLASH_vReadPacket(uint8_t *rx, uint16_t len)
 {
     uint8_t  au8Dummy[64];
     memset(au8Dummy, 0xFF, sizeof(au8Dummy));
@@ -34,9 +38,12 @@ void HAL_SPI_FLASH_vReadPacket(uint8_t *rx, uint16_t len)
     {
         uint16_t u16N = (uint16_t)((len - u16Off) > sizeof(au8Dummy)
                                    ? sizeof(au8Dummy) : (len - u16Off));
-        HAL_SPI_TransmitReceive(&hFlashSpi, au8Dummy, rx + u16Off, u16N, SPI_TIMEOUT);
+        HAL_StatusTypeDef status = HAL_SPI_TransmitReceive(&hFlashSpi, au8Dummy, rx + u16Off, u16N, SPI_TIMEOUT);
+        if (status != HAL_OK)
+            return status;
         u16Off = (uint16_t)(u16Off + u16N);
     }
+    return HAL_OK;
 }
 
 /* --------------------------------------------------------------------------

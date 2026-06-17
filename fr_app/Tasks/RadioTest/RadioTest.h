@@ -11,7 +11,7 @@
  *   - The LoRa radio task logs "LoraRadio: TX done IRQ" on every successful TX.
  *   - DeviceDiscovery and MeshNetwork are NOT initialised (they also use the radio).
  *
- * Pair with ENABLE_DBG_UART (or LISTENER_MODE) so DBG output is visible.
+ * DBG output is visible on the debug UART (always enabled).
  */
 
 #ifndef FR_APP_TASKS_RADIOTEST_RADIOTEST_H_

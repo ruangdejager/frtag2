@@ -36,8 +36,4 @@ uint64_t FARMRANGER_u64RequestTimestamp(void);
 uint8_t  FARMRANGER_u8RequestInterval(void);
 bool     FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count);
 
-#ifdef LISTENER_MODE
-void FARMRANGER_vPutString(const uint8_t *data, uint16_t len);
-#endif
-
 #endif /* DEVICE_FARMRANGER_FARMRANGER_H_ */

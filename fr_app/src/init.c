@@ -74,9 +74,6 @@ void INIT_vInitialization(void *parameters)
      * DBG_LOG call that writes to ext-flash.  Single call covers both. */
     HAL_SPI_vInit();
 
-#ifdef LISTENER_MODE
-    FARMRANGER_vInit();   /* must be first — DBG_LOG() routes through this */
-#endif
     DBGLOG_vInit();
 
     FLASH_vInit();
@@ -90,6 +87,8 @@ void INIT_vInitialization(void *parameters)
 
     FLASHLOG_vDump();     /* no-op unless ENABLE_FLASH_LOG + DEBUG_OUTPUT_UART both defined */
 
+    // Enable WDT
+    HAL_WDT_vInit();
     HAL_WDT_vReset();
 
     HAL_ADC_vInit();
@@ -112,8 +111,7 @@ void INIT_vInitialization(void *parameters)
      * Radio smoke-test mode: transmit "Blink!\r\n" at 0.5 Hz and confirm
      * the TX-done IRQ fires.  MeshNetwork and DeviceDiscovery are skipped
      * because they also drive the radio and would interfere.
-     * Enable DEBUG_OUTPUT_UART (or LISTENER_MODE) alongside this define to
-     * see the output on the debug UART.
+     * DBG output is visible on the debug UART (always enabled).
      */
     RADIO_TEST_vInit();
 #else
@@ -133,9 +131,9 @@ void INIT_vInitialization(void *parameters)
     }
     else
     {
-#if !defined(ENABLE_DBG_UART) && !defined(LISTENER_MODE)
+        /* Primary: bring up the Farmranger UART link to the fr9 logger board.
+         * (Debug UART is a separate peripheral, so the two no longer conflict.) */
         FARMRANGER_vInit();
-#endif
     }
 #endif /* ENABLE_RADIO_TEST */
 

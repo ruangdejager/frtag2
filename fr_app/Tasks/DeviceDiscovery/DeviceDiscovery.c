@@ -133,6 +133,9 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         /* ---- Prepare for new campaign ---- */
         MESHNETWORK_vClearDiscoveredNeighbors();
         MESHNETWORK_vResetDreqWaveCnt();
+        /* R6: drop any TX left over from the previous campaign (e.g. a
+         * late-jittered forward) so it can't fire at the start of this one. */
+        MESHNETWORK_vFlushTxQueue();
 
         DBG_LOG("DeviceDiscovery %X: Woke up for discovery.\r\n",
             LORARADIO_u32GetUniqueId());
@@ -140,62 +143,10 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         osDelay(APP_WAKEUP_BUFFER_MS);
         EVTLOG(LOG_DISCOVERY_START, eDeviceRole);
 
-#ifdef LISTENER_MODE
-
-        /* Listener: passively observe the full discovery window */
-        DBG_LOG("DeviceDiscovery %X: LISTENER MODE - monitoring for %d ms\r\n",
-            LORARADIO_u32GetUniqueId(), APP_DISCOVERY_WINDOW_TIMEOUT_MS);
-
-        {
-            osThreadFlagsClear(DEVICE_DISCOVERY_NOTIFY_TIMESYNC);
-            uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
-                                           osFlagsWaitAny,
-                                           APP_DISCOVERY_WINDOW_TIMEOUT_MS);
-
-            if (!(r & osFlagsError))
-                DBG_LOG("DeviceDiscovery %X: Listener received TimeSync\r\n",
-                    LORARADIO_u32GetUniqueId());
-            else
-                DBG_LOG("DeviceDiscovery %X: Listener window timed out\r\n",
-                    LORARADIO_u32GetUniqueId());
-        }
-
-        /* Report devices observed during the listener window */
-        {
-            MeshDiscoveredNeighbor_t tNeighbors[MESH_MAX_NEIGHBORS];
-            uint16_t u16NeighborCount = 0;
-
-            if (MESHNETWORK_bGetDiscoveredNeighbors(tNeighbors, MESH_MAX_NEIGHBORS,
-                                                    &u16NeighborCount))
-            {
-                DBG_LOG("DeviceDiscovery %X: Listener observed %u device(s).\r\n",
-                    LORARADIO_u32GetUniqueId(), u16NeighborCount);
-                EVTLOG(LOG_DISCOVERY_COUNT, u16NeighborCount);
-                for (uint16_t i = 0; i < u16NeighborCount; i++)
-                {
-                    DBG_LOG("  ID:%X  Hops:%X  RSSI:%d  Bat:%d  Wave:%d  Move:%u  Lat:%ld  Lon:%ld\r\n",
-                        tNeighbors[i].u32DeviceId,
-                        tNeighbors[i].u8HopCount,
-                        tNeighbors[i].i16Rssi,
-                        tNeighbors[i].u16BatMv,
-                        tNeighbors[i].u8Wave,
-                        tNeighbors[i].u8MoveState,
-                        tNeighbors[i].bGpsValid ? (long)tNeighbors[i].i32LatUDeg : 0L,
-                        tNeighbors[i].bGpsValid ? (long)tNeighbors[i].i32LonUDeg : 0L);
-                }
-            }
-            else
-            {
-                DBG_LOG("DeviceDiscovery %X: Error retrieving neighbor table.\r\n",
-                    LORARADIO_u32GetUniqueId());
-            }
-        }
-
-#else /* normal PRIMARY / SECONDARY behavior */
-
         if (eDeviceRole == DEVICE_ROLE_PRIMARY)
         {
-            bool bDiscoveryFinished = false;
+            bool    bDiscoveryFinished = false;
+            uint8_t u8WaveCount        = 0;
             DBG_LOG("DeviceDiscovery: Primary starting discovery campaign\r\n");
 
             while (!bDiscoveryFinished)
@@ -205,6 +156,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
                 MESHNETWORK_vIncrDreqWaveCnt();
                 MESHNETWORK_bStartDiscoveryRound(u32DreqId);
+                u8WaveCount++;
 
                 uint32_t tLastBeaconTick = MESHNETWORK_u32GetLastBeaconHeardTick();
 
@@ -225,8 +177,11 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                         break;
                 }
 
-                if (!bBeaconSeenThisWave)
+                if (!bBeaconSeenThisWave || u8WaveCount >= APP_PRIMARY_MAX_WAVES)
                 {
+                    if (bBeaconSeenThisWave)
+                        DBG_LOG("DeviceDiscovery: Primary wave cap (%u) reached\r\n",
+                            APP_PRIMARY_MAX_WAVES);
                     bDiscoveryFinished = true;
                     MESHNETWORK_vStopPrimaryAck();
                 }
@@ -242,21 +197,52 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 LORARADIO_u32GetUniqueId());
 
             osThreadFlagsClear(DEVICE_DISCOVERY_NOTIFY_TIMESYNC);
-            uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
-                                           osFlagsWaitAny,
-                                           APP_DISCOVERY_WINDOW_TIMEOUT_MS);
 
-            if (!(r & osFlagsError))
+            /* R3: end the campaign on the FIRST of:
+             *   - TimeSync received (clean end),
+             *   - 10 s of mesh radio silence while NOT beaconing (UNKNOWN that
+             *     heard nothing, or FORWARDER once the mesh goes quiet),
+             *   - the 180 s hard cap.
+             * While beaconing the silence rule is suppressed; that path ends via
+             * MeshNetwork's beacon cap, which flips the node to FORWARDER, after
+             * which the silence rule resumes. u32SilenceRef starts at the
+             * campaign start (fair first window) and advances to the latest
+             * discovery packet from ANY primary (multi-primary safe). */
+            uint32_t u32CampaignStart = osKernelGetTickCount();
+            uint32_t u32SilenceRef    = u32CampaignStart;
+            bool     bTimeSync        = false;
+
+            for (;;)
+            {
+                uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
+                                               osFlagsWaitAny,
+                                               APP_SECONDARY_POLL_MS);
+                if (!(r & osFlagsError)) { bTimeSync = true; break; }
+
+                uint32_t u32Now = osKernelGetTickCount();
+
+                /* advance the silence reference to the newest discovery packet */
+                uint32_t u32LastPkt = MESHNETWORK_u32GetLastDiscoveryPktTick();
+                if ((int32_t)(u32LastPkt - u32SilenceRef) > 0)
+                    u32SilenceRef = u32LastPkt;
+
+                if ((uint32_t)(u32Now - u32CampaignStart) >= APP_DISCOVERY_WINDOW_TIMEOUT_MS)
+                    break;   /* hard cap */
+
+                if (!MESHNETWORK_bIsBeaconing() &&
+                    (uint32_t)(u32Now - u32SilenceRef) >= APP_SECONDARY_SILENCE_MS)
+                    break;   /* radio silence, not beaconing */
+            }
+
+            if (bTimeSync)
                 DBG_LOG("DeviceDiscovery: Secondary %04X: TimeSync received\r\n",
                     LORARADIO_u32GetUniqueId());
             else
-                DBG_LOG("DeviceDiscovery: Secondary %04X: TimeSync timed out\r\n",
+                DBG_LOG("DeviceDiscovery: Secondary %04X: campaign end (silence/cap)\r\n",
                     LORARADIO_u32GetUniqueId());
 
             MESHNETWORK_vStopBeaconing(u32DreqId);
         }
-
-#endif /* LISTENER_MODE */
 
         /* ----------------------------------------------------------------
          * Discovery complete — log and upload (primary only)
@@ -265,7 +251,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             LORARADIO_u32GetUniqueId());
         EVTLOG(LOG_DISCOVERY_CMPLT, eDeviceRole);
 
-#ifndef LISTENER_MODE
         if (eDeviceRole == DEVICE_ROLE_PRIMARY)
         {
             MeshDiscoveredNeighbor_t tNeighbors[MESH_MAX_NEIGHBORS];
@@ -296,8 +281,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                     LORARADIO_u32GetUniqueId());
             }
 
-#ifndef ENABLE_DBG_UART
-            /* ---- Logger connection + upload ---- */
+            /* ---- Logger connection + upload (fr9 Farmranger board) ---- */
             DEVICE_DISCOVERY_DRIVER_bConnectLogger();
 
             DBG_LOG("DeviceDiscovery %X: Logger connected.\r\n",
@@ -326,7 +310,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             else if (u8WakeInterval == 120) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_120_MIN);
 
             DEVICE_DISCOVERY_DRIVER_vDisconnectLogger();
-#endif /* ENABLE_DBG_UART */
 
             /* ---- Send TimeSync to secondaries ---- */
             DEVICE_DISCOVERY_vSendTS();
@@ -354,7 +337,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             }
         }
 #endif /* ENABLE_LOW_POWER_RECOVERY */
-#endif /* LISTENER_MODE */
 
         } /* end if (!bKernelWakeup) */
         else
@@ -475,9 +457,30 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                 HAL_UART_vInit();
                 DEBUG_vInit();
 
+                /* Clear any node role left over from off-schedule mesh activity
+                 * (e.g. a DReq from a primary's catch-up campaign that started
+                 * this node beaconing between scheduled wakes). Done before the
+                 * radio comes up so this campaign begins from a clean UNKNOWN
+                 * role and beacons the current dreq rather than a stale one. */
+                MESHNETWORK_vResetNodeRole();
+
                 LORARADIO_vWakeUp();
 
                 DBG_LOG("\r\n--- WAKEUP ---\r\n");
+
+                /* One solar reading per production wake instead of every 10 s
+                 * (see LOG_SOLAR_PERIODIC in SolarPower_Config.h). Primary has
+                 * no solar panel. */
+                if (eDeviceRole == DEVICE_ROLE_SECONDARY)
+                {
+#ifdef ENABLE_SOLAR_POWER_SENSE
+                    DBG_LOG("solar: Vsolar=%u mV  P=%lu mW\r\n",
+                        SOLAR_u16GetVSolarMV(), SOLAR_u32GetPowerMW());
+#else
+                    DBG_LOG("solar: Vsolar=%u mV\r\n", SOLAR_u16GetVSolarMV());
+#endif
+                }
+
                 osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_WAKEUP_BIT);
 
             }
