@@ -94,6 +94,10 @@ static osTimerId_t        xBeaconTimer         = NULL;
 static osTimerId_t        xPrimaryAckTimer     = NULL;
 static osMutexId_t        xForwardRingMutex    = NULL;
 static osMutexId_t        xNeighborTableMutex  = NULL;
+/* Guards the beacon/role scalar state (bNodeBeaconing, eNodeRole,
+ * u32NodeBeaconDreqId, u8NodeHopCount, R2 beacon counters). Timer/flag calls
+ * are always done OUTSIDE this lock (they take kernel locks of their own). */
+static osMutexId_t        xRoleMutex           = NULL;
 
 /* ---- Protocol state ---- */
 static ForwardRing_t    tForwardRing;
@@ -104,15 +108,18 @@ static uint32_t         tLastBeaconHeardTick  = 0;
 static bool       bNodeBeaconing      = false;
 static uint32_t   u32NodeBeaconDreqId = 0;
 static uint8_t    u8NodeHopCount      = 0;
-static uint8_t    u8NodeBeaconCount   = 0;
 static NodeRole_e eNodeRole           = NODE_ROLE_UNKNOWN;
+
+/* R2: bound beaconing so a lost D-Ack can't keep a node beaconing all campaign. */
+static uint8_t    u8NodeBeaconCount      = 0;
+static uint32_t   u32NodeBeaconStartTick = 0;
 
 /* Multi-primary: "first TimeSync per wake" gate (secondaries only).
  * Reset by DeviceDiscovery at the start of each wake cycle. */
 static bool       bTimeSyncAcceptedThisWake = false;
 
 /* ---- Wakeup interval ---- */
-static WakeupInterval tCurrentWakeupInterval = WAKEUP_INTERVAL_15_MIN;
+static WakeupInterval tCurrentWakeupInterval = WAKEUP_INTERVAL_60_MIN;
 static const uint8_t u8CurrentWakeupIntervalMin[] = {
     [WAKEUP_INTERVAL_15_MIN]  = 15,
     [WAKEUP_INTERVAL_30_MIN]  = 30,
@@ -144,6 +151,8 @@ static uint32_t u32LastDiscoveryPktTick = 0;
 static void MESHNETWORK_vTxTask(void *pvParameters);
 static bool MESHNETWORK_bSendPacket(const uint8_t *pBuf, size_t u32Len);
 static void MESHNETWORK_vStartBeaconing(uint32_t u32DreqId, uint8_t u8HopCount);
+static NodeRole_e MESHNETWORK_eGetRole(void);
+static bool MESHNETWORK_bStopBeaconingLocked(uint32_t u32DreqId);
 
 /* --------------------------------------------------------------------------
  * Endian helpers (on-wire big-endian)
@@ -214,7 +223,9 @@ static void NEIGHBOR_vAddOrUpdate(uint32_t u32DeviceId, uint8_t u8HopCount,
                 tNeighborTable[i].u8HopCount          = u8HopCount;
                 tNeighborTable[i].u16BatMv             = u16BatMv;
                 tNeighborTable[i].i16Rssi              = i16Rssi;
-                tNeighborTable[i].u8DreqWaveDiscovered = u8DreqWaveDisc;
+                /* R7: keep the FIRST wave that discovered this node — it marks
+                 * the earliest (typically closest) contact; do not overwrite
+                 * with later waves. (u8DreqWaveDisc unused in the update path.) */
                 tNeighborTable[i].u8MoveState          = u8MoveState;
                 /* Keep the last known fix if this beacon carries none. */
                 if (bGpsValid)
@@ -369,7 +380,7 @@ static uint32_t MESHNETWORK_u32GetTxJitterMs(void)
  * verbose DBG_LOG live on a full-size stack. */
 static void MESHNETWORK_vBuildAndQueueBeacon(void)
 {
-    if (!bNodeBeaconing) return;
+    if (!MESHNETWORK_bIsBeaconing()) return;
 
     MeshPktDBeacon_t tBeacon;
     tBeacon.u32DreqId      = u32NodeBeaconDreqId;
@@ -416,18 +427,35 @@ static void MESHNETWORK_vBuildAndQueueBeacon(void)
     FORWARD_vAdd(tBeacon.u32BeaconMsgId);
     MESHNETWORK_bSendPacket(u8Buf, u32Len);
 
-    /* Bound the beaconing session. A node that gets acked stops via the DAck
-     * path within a beacon or two; this catches the node that is never acked
-     * (latched on a stale dreq, or beaconing from an off-schedule DReq) so it
-     * cannot beacon forever - after the cap it becomes a forwarder. */
-    if (++u8NodeBeaconCount >= MESH_MAX_BEACONS_PER_CAMPAIGN)
+    /* R2: bound beaconing — count this beacon; once the count or time cap is
+     * hit, stop beaconing and become a forwarder even if no D-Ack arrived (lost
+     * D-Ack safety). The campaign then ends via the secondary silence rule. */
+    bool bDoStop = false;
+    if (osMutexAcquire(xRoleMutex, 100) == osOK)
     {
+        if (bNodeBeaconing)
+        {
+            u8NodeBeaconCount++;
+            uint32_t u32Now = osKernelGetTickCount();
+            if (u8NodeBeaconCount >= MESH_MAX_BEACONS_PER_CAMPAIGN ||
+                (u32Now - u32NodeBeaconStartTick) >= MESH_MAX_BEACON_DURATION_MS)
+            {
+                bDoStop = MESHNETWORK_bStopBeaconingLocked(u32NodeBeaconDreqId);
+            }
+        }
+        osMutexRelease(xRoleMutex);
+    }
+    if (bDoStop)
+    {
+        osTimerStop(xBeaconTimer);
         DBG_LOG("MeshNetwork: Beacon cap reached, become forwarder\r\n");
-        MESHNETWORK_vStopBeaconing(u32NodeBeaconDreqId);
     }
 }
 
-/* Timer callback (Tmr Svc context): stay tiny — just wake the MeshTx task. */
+/* Timer callback (Tmr Svc context): stay tiny — just wake the MeshTx task.
+ * Reads bNodeBeaconing unlocked (atomic bool); a race at a transition only
+ * costs one spurious/missed flag, and vBuildAndQueueBeacon re-checks the role
+ * under xRoleMutex. Avoids taking a mutex from the timer daemon. */
 static void MESHNETWORK_vBeaconTimerCallback(void *arg)
 {
     (void)arg;
@@ -544,7 +572,8 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
      * below) but take no action on them. */
     if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_PRIMARY)
     {
-        if (eNodeRole == NODE_ROLE_FORWARDER)
+        NodeRole_e eRole = MESHNETWORK_eGetRole();
+        if (eRole == NODE_ROLE_FORWARDER)
         {
             if (!FORWARD_bHasSeen(u32DreqId))
             {
@@ -576,9 +605,10 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
              * earlier wave) would otherwise keep emitting that stale dreq, and
              * the current campaign's ACKs (carrying the new dreq) would never
              * match u32NodeBeaconDreqId, so it could never be acked out. The
-             * same-primary guard keeps multi-primary behaviour intact. */
+             * same-primary guard keeps multi-primary behaviour intact.
+             * vStartBeaconing re-checks the transition under xRoleMutex (R4). */
             bool bSamePrimary = (u32OriginId == (u32NodeBeaconDreqId >> 16));
-            if (eNodeRole != NODE_ROLE_BEACONING ||
+            if (eRole != NODE_ROLE_BEACONING ||
                 (u32DreqId != u32NodeBeaconDreqId && bSamePrimary))
             {
                 MESHNETWORK_vStartBeaconing(u32DreqId, (uint8_t)(u8SenderHopCount + 1));
@@ -662,7 +692,7 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
     }
 
     /* 4. Secondary forwarder: relay beacon */
-    if (eNodeRole == NODE_ROLE_FORWARDER)
+    if (MESHNETWORK_eGetRole() == NODE_ROLE_FORWARDER)
     {
         tBeacon.u8HopCount++;
         uint8_t u8Buf[64];
@@ -722,7 +752,7 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
     }
     FORWARD_vAdd(u32AckMsgId);
 
-    if (eNodeRole == NODE_ROLE_FORWARDER)
+    if (MESHNETWORK_eGetRole() == NODE_ROLE_FORWARDER)
     {
         MESHNETWORK_bSendPacket(pBuf, u32Len);
         DBG_LOG("MeshNetwork: Ack forwarded\r\n");
@@ -898,6 +928,12 @@ void MESHNETWORK_vInit(void)
 {
     xForwardRingMutex   = osMutexNew(NULL);  configASSERT(xForwardRingMutex   != NULL);
     xNeighborTableMutex = osMutexNew(NULL);  configASSERT(xNeighborTableMutex != NULL);
+    xRoleMutex          = osMutexNew(NULL);  configASSERT(xRoleMutex          != NULL);
+
+    /* E11: seed the per-message counter from the RNG instead of 0, so a node
+     * that reboots mid-deployment doesn't re-emit msg IDs that peers still hold
+     * in their dedup rings (which would silently drop its packets). */
+    u16MsgCounter = (uint16_t)LORARADIO_u32GetRandomNumber(0xFFFF);
 
     memset(&tForwardRing,   0, sizeof(tForwardRing));
     memset(tNeighborTable,  0, sizeof(tNeighborTable));
@@ -981,27 +1017,85 @@ void MESHNETWORK_vSendTimeSync(uint32_t u32UtcTimestamp,
         u32UtcTimestamp, tWakeupInterval);
 }
 
+/* Snapshot the node role under the mutex (parser task uses this instead of
+ * reading eNodeRole directly). */
+static NodeRole_e MESHNETWORK_eGetRole(void)
+{
+    NodeRole_e e = NODE_ROLE_UNKNOWN;
+    if (osMutexAcquire(xRoleMutex, 100) == osOK)
+    {
+        e = eNodeRole;
+        osMutexRelease(xRoleMutex);
+    }
+    return e;
+}
+
+bool MESHNETWORK_bIsBeaconing(void)
+{
+    bool b = false;
+    if (osMutexAcquire(xRoleMutex, 100) == osOK)
+    {
+        b = bNodeBeaconing;
+        osMutexRelease(xRoleMutex);
+    }
+    return b;
+}
+
+/* Core stop transition — assumes xRoleMutex is HELD. Returns true if it
+ * actually stopped (caller must then osTimerStop OUTSIDE the lock). */
+static bool MESHNETWORK_bStopBeaconingLocked(uint32_t u32DreqId)
+{
+    if (!bNodeBeaconing)                  return false;
+    if (u32NodeBeaconDreqId != u32DreqId) return false;
+    bNodeBeaconing      = false;
+    i16BestDreqRssi     = -256;
+    u32NodeBeaconDreqId = 0;
+    eNodeRole           = NODE_ROLE_FORWARDER;
+    return true;
+}
+
 static void MESHNETWORK_vStartBeaconing(uint32_t u32DreqId, uint8_t u8HopCount)
 {
-    if (bNodeBeaconing && u32NodeBeaconDreqId == u32DreqId) return;
-    bNodeBeaconing      = true;
-    u32NodeBeaconDreqId = u32DreqId;
-    u8NodeHopCount      = u8HopCount;
-    eNodeRole           = NODE_ROLE_BEACONING;
-    osTimerStart(xBeaconTimer, MESH_BEACON_INTERVAL_MS_CFG);
-    DBG_LOG("MeshNetwork: Start beaconing dreq=%08X\r\n", u32DreqId);
+    bool bDoStart = false;
+    if (osMutexAcquire(xRoleMutex, 100) == osOK)
+    {
+        if (!(bNodeBeaconing && u32NodeBeaconDreqId == u32DreqId))
+        {
+            bNodeBeaconing         = true;
+            u32NodeBeaconDreqId    = u32DreqId;
+            u8NodeHopCount         = u8HopCount;
+            eNodeRole              = NODE_ROLE_BEACONING;
+            u8NodeBeaconCount      = 0;
+            u32NodeBeaconStartTick = osKernelGetTickCount();
+            bDoStart               = true;
+        }
+        osMutexRelease(xRoleMutex);
+    }
+    if (bDoStart)
+    {
+        /* Periodic retries... */
+        osTimerStart(xBeaconTimer, MESH_BEACON_INTERVAL_MS_CFG);
+        /* ...plus R1: fire the FIRST beacon immediately (built on the MeshTx
+         * full stack), not after a full interval. */
+        if (xMeshTxTaskHandle != NULL)
+            osThreadFlagsSet(xMeshTxTaskHandle, MESH_TX_FLAG_BEACON);
+        DBG_LOG("MeshNetwork: Start beaconing dreq=%08X\r\n", u32DreqId);
+    }
 }
 
 void MESHNETWORK_vStopBeaconing(uint32_t u32DreqId)
 {
-    if (!bNodeBeaconing)              return;
-    if (u32NodeBeaconDreqId != u32DreqId) return;
-    bNodeBeaconing      = false;
-    i16BestDreqRssi     = -256;
-    u32NodeBeaconDreqId = 0;
-    osTimerStop(xBeaconTimer);
-    eNodeRole = NODE_ROLE_FORWARDER;
-    DBG_LOG("MeshNetwork: Stop beaconing, become forwarder\r\n");
+    bool bDoStop = false;
+    if (osMutexAcquire(xRoleMutex, 100) == osOK)
+    {
+        bDoStop = MESHNETWORK_bStopBeaconingLocked(u32DreqId);
+        osMutexRelease(xRoleMutex);
+    }
+    if (bDoStop)
+    {
+        osTimerStop(xBeaconTimer);
+        DBG_LOG("MeshNetwork: Stop beaconing, become forwarder\r\n");
+    }
 }
 
 bool MESHNETWORK_bGetDiscoveredNeighbors(MeshDiscoveredNeighbor_t *pBuffer,
@@ -1066,10 +1160,24 @@ void MESHNETWORK_vResetTimeSyncAccepted(void)
 
 void MESHNETWORK_vResetNodeRole(void)
 {
-    bNodeBeaconing      = false;
-    u32NodeBeaconDreqId = 0;
-    osTimerStop(xBeaconTimer);
-    eNodeRole = NODE_ROLE_UNKNOWN;
+    if (osMutexAcquire(xRoleMutex, 100) == osOK)
+    {
+        bNodeBeaconing      = false;
+        u32NodeBeaconDreqId = 0;
+        eNodeRole           = NODE_ROLE_UNKNOWN;
+        osMutexRelease(xRoleMutex);
+    }
+    osTimerStop(xBeaconTimer);   /* outside the lock */
+}
+
+/* R6: drop any TX still queued (e.g. a late-jittered forward from the previous
+ * campaign) so it can't fire at the start of the next one. Call on wake. */
+void MESHNETWORK_vFlushTxQueue(void)
+{
+    if (xMeshTxQueue == NULL) return;
+    MeshTxItem_t tItem;
+    while (osMessageQueueGet(xMeshTxQueue, &tItem, NULL, 0) == osOK)
+        ; /* discard */
 }
 
 void MESHNETWORK_vIncrDreqWaveCnt(void) { u8PrimaryDreqWaveCnt++; }

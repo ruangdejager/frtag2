@@ -18,7 +18,16 @@
 
 /* ---- Discovery timing ---- */
 #define APP_WAKEUP_BUFFER_MS                (5  * 1000)   /* buffer after sync wake-up   */
-#define APP_DISCOVERY_WINDOW_TIMEOUT_MS     (180 * 1000)  /* max discovery window        */
+#define APP_DISCOVERY_WINDOW_TIMEOUT_MS     (180 * 1000)  /* hard cap on a campaign      */
+
+/* Secondary campaign-end (R3): once the mesh has been silent (no discovery
+ * packet from any primary) for this long AND the node is not beaconing, end the
+ * campaign instead of waiting out the 180 s hard cap. Polled at this cadence. */
+#define APP_SECONDARY_SILENCE_MS           (10 * 1000)   /* radio-silence end window    */
+#define APP_SECONDARY_POLL_MS              250U          /* secondary wait poll cadence */
+
+/* Primary issues at most this many DReq waves per campaign (R8). */
+#define APP_PRIMARY_MAX_WAVES              5U
 
 /* GPS pre-trigger lead time: how many seconds before each scheduled wake the
  * wake-schedule task asks the GPS module for a fresh fix. The dispatcher runs

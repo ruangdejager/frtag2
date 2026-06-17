@@ -133,6 +133,9 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         /* ---- Prepare for new campaign ---- */
         MESHNETWORK_vClearDiscoveredNeighbors();
         MESHNETWORK_vResetDreqWaveCnt();
+        /* R6: drop any TX left over from the previous campaign (e.g. a
+         * late-jittered forward) so it can't fire at the start of this one. */
+        MESHNETWORK_vFlushTxQueue();
 
         DBG_LOG("DeviceDiscovery %X: Woke up for discovery.\r\n",
             LORARADIO_u32GetUniqueId());
@@ -142,7 +145,8 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
         if (eDeviceRole == DEVICE_ROLE_PRIMARY)
         {
-            bool bDiscoveryFinished = false;
+            bool    bDiscoveryFinished = false;
+            uint8_t u8WaveCount        = 0;
             DBG_LOG("DeviceDiscovery: Primary starting discovery campaign\r\n");
 
             while (!bDiscoveryFinished)
@@ -152,6 +156,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
                 MESHNETWORK_vIncrDreqWaveCnt();
                 MESHNETWORK_bStartDiscoveryRound(u32DreqId);
+                u8WaveCount++;
 
                 uint32_t tLastBeaconTick = MESHNETWORK_u32GetLastBeaconHeardTick();
 
@@ -172,8 +177,11 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                         break;
                 }
 
-                if (!bBeaconSeenThisWave)
+                if (!bBeaconSeenThisWave || u8WaveCount >= APP_PRIMARY_MAX_WAVES)
                 {
+                    if (bBeaconSeenThisWave)
+                        DBG_LOG("DeviceDiscovery: Primary wave cap (%u) reached\r\n",
+                            APP_PRIMARY_MAX_WAVES);
                     bDiscoveryFinished = true;
                     MESHNETWORK_vStopPrimaryAck();
                 }
@@ -189,15 +197,48 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 LORARADIO_u32GetUniqueId());
 
             osThreadFlagsClear(DEVICE_DISCOVERY_NOTIFY_TIMESYNC);
-            uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
-                                           osFlagsWaitAny,
-                                           APP_DISCOVERY_WINDOW_TIMEOUT_MS);
 
-            if (!(r & osFlagsError))
+            /* R3: end the campaign on the FIRST of:
+             *   - TimeSync received (clean end),
+             *   - 10 s of mesh radio silence while NOT beaconing (UNKNOWN that
+             *     heard nothing, or FORWARDER once the mesh goes quiet),
+             *   - the 180 s hard cap.
+             * While beaconing the silence rule is suppressed; that path ends via
+             * MeshNetwork's beacon cap, which flips the node to FORWARDER, after
+             * which the silence rule resumes. u32SilenceRef starts at the
+             * campaign start (fair first window) and advances to the latest
+             * discovery packet from ANY primary (multi-primary safe). */
+            uint32_t u32CampaignStart = osKernelGetTickCount();
+            uint32_t u32SilenceRef    = u32CampaignStart;
+            bool     bTimeSync        = false;
+
+            for (;;)
+            {
+                uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
+                                               osFlagsWaitAny,
+                                               APP_SECONDARY_POLL_MS);
+                if (!(r & osFlagsError)) { bTimeSync = true; break; }
+
+                uint32_t u32Now = osKernelGetTickCount();
+
+                /* advance the silence reference to the newest discovery packet */
+                uint32_t u32LastPkt = MESHNETWORK_u32GetLastDiscoveryPktTick();
+                if ((int32_t)(u32LastPkt - u32SilenceRef) > 0)
+                    u32SilenceRef = u32LastPkt;
+
+                if ((uint32_t)(u32Now - u32CampaignStart) >= APP_DISCOVERY_WINDOW_TIMEOUT_MS)
+                    break;   /* hard cap */
+
+                if (!MESHNETWORK_bIsBeaconing() &&
+                    (uint32_t)(u32Now - u32SilenceRef) >= APP_SECONDARY_SILENCE_MS)
+                    break;   /* radio silence, not beaconing */
+            }
+
+            if (bTimeSync)
                 DBG_LOG("DeviceDiscovery: Secondary %04X: TimeSync received\r\n",
                     LORARADIO_u32GetUniqueId());
             else
-                DBG_LOG("DeviceDiscovery: Secondary %04X: TimeSync timed out\r\n",
+                DBG_LOG("DeviceDiscovery: Secondary %04X: campaign end (silence/cap)\r\n",
                     LORARADIO_u32GetUniqueId());
 
             MESHNETWORK_vStopBeaconing(u32DreqId);
