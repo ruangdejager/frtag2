@@ -611,8 +611,15 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
             if (eRole != NODE_ROLE_BEACONING ||
                 (u32DreqId != u32NodeBeaconDreqId && bSamePrimary))
             {
-                MESHNETWORK_vStartBeaconing(u32DreqId, (uint8_t)(u8SenderHopCount + 1));
+                /* Seed the wave and best-RSSI baseline BEFORE starting to beacon.
+                 * R1 fires the first beacon immediately from the higher-priority
+                 * MeshTx task, which stamps i16BestDreqRssi into the beacon; if we
+                 * left the RSSI to the max-update below (which runs after
+                 * vStartBeaconing) that first beacon would carry the -256 reset
+                 * value - exactly the -256 RSSI seen at the primary. */
                 u8PrimaryDreqWaveCnt = u8WaveCnt;
+                i16BestDreqRssi      = s16Rssi;
+                MESHNETWORK_vStartBeaconing(u32DreqId, (uint8_t)(u8SenderHopCount + 1));
             }
         }
     }

@@ -28,6 +28,8 @@
 #include "init.h"
 #include "cmsis_os2.h"
 
+#include "hal_system.h"
+
 static uint32_t csr;
 
 /* --------------------------------------------------------------------------

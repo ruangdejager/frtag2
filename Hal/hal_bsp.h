@@ -22,8 +22,15 @@ typedef enum {
     LED_YELLOW = 1,
 } Led_TypeDef;
 
+/* Define to drive the status LEDs. Comment out to TERMINATE them: both pins are
+ * left in their analog reset state (Hi-Z, undriven, zero current) and every LED
+ * call becomes a no-op. Use the terminated build for production / low-power
+ * current measurement. */
+#define LEDS_ENABLED
+
 static inline void BSP_LED_Init(Led_TypeDef led)
 {
+#ifdef LEDS_ENABLED
     GPIO_InitTypeDef gpio = {0};
     gpio.Mode  = GPIO_MODE_OUTPUT_PP;
     gpio.Pull  = GPIO_NOPULL;
@@ -42,30 +49,54 @@ static inline void BSP_LED_Init(Led_TypeDef led)
         HAL_GPIO_Init(BSP_LED_YELLOW_PORT, &gpio);
         HAL_GPIO_WritePin(BSP_LED_YELLOW_PORT, BSP_LED_YELLOW_PIN, GPIO_PIN_SET);
     }
+#else
+    /* LEDs terminated: park both pins analog (reset state) regardless of which
+     * LED was requested, so they draw nothing and are never driven. */
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Mode  = GPIO_MODE_ANALOG;
+    gpio.Pull  = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    gpio.Pin = BSP_LED_RED_PIN | BSP_LED_YELLOW_PIN;
+    HAL_GPIO_Init(GPIOB, &gpio);
+    (void)led;
+#endif
 }
 
 static inline void BSP_LED_On(Led_TypeDef led)
 {
+#ifdef LEDS_ENABLED
     if (led == LED_RED)
         HAL_GPIO_WritePin(BSP_LED_RED_PORT, BSP_LED_RED_PIN, GPIO_PIN_SET);
     else
         HAL_GPIO_WritePin(BSP_LED_YELLOW_PORT, BSP_LED_YELLOW_PIN, GPIO_PIN_SET);
+#else
+    (void)led;
+#endif
 }
 
 static inline void BSP_LED_Off(Led_TypeDef led)
 {
+#ifdef LEDS_ENABLED
     if (led == LED_RED)
         HAL_GPIO_WritePin(BSP_LED_RED_PORT, BSP_LED_RED_PIN, GPIO_PIN_RESET);
     else
         HAL_GPIO_WritePin(BSP_LED_YELLOW_PORT, BSP_LED_YELLOW_PIN, GPIO_PIN_RESET);
+#else
+    (void)led;
+#endif
 }
 
 static inline void BSP_LED_Toggle(Led_TypeDef led)
 {
+#ifdef LEDS_ENABLED
     if (led == LED_RED)
         HAL_GPIO_TogglePin(BSP_LED_RED_PORT, BSP_LED_RED_PIN);
     else
         HAL_GPIO_TogglePin(BSP_LED_YELLOW_PORT, BSP_LED_YELLOW_PIN);
+#else
+    (void)led;
+#endif
 }
 
 /* -----------------------------------------------------------------------
@@ -116,6 +147,8 @@ static inline void BSP_LED_Toggle(Led_TypeDef led)
 #define BSP_ACC_MISO_PORT           GPIOA
 #define BSP_ACC_MOSI_PIN            GPIO_PIN_7
 #define BSP_ACC_MOSI_PORT           GPIOA
+#define BSP_ACC_INT_PIN            	GPIO_PIN_13
+#define BSP_ACC_INT_PORT           	GPIOC
 
 /* -----------------------------------------------------------------------
  * Battery measurement (ADC)

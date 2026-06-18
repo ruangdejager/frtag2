@@ -89,6 +89,35 @@ void ACC_vInit(void)
 }
 
 /* --------------------------------------------------------------------------
+ * ACC_vConfigIdle — low-power idle config for roles that don't track movement.
+ *
+ * The primary doesn't use movement. Three states were measured on its rail:
+ *   - unconfigured power-on default  ~115 uA (undefined I/O)
+ *   - configured active 25 Hz + FIFO  ~45 uA (FIFO fills and overruns, never
+ *     drained because there's no movement task)
+ *   - full power-down (CTRL_REG1=0)  WORSE (floating SPI inputs into the now-
+ *     idle I/O crowbar)
+ * So keep the I/O drivers active but remove the overrun source: low-power mode,
+ * low ODR, and NO FIFO (bypass) with no INT routing. CTRL_REG4=0 selects 4-wire
+ * SPI so the interface is in a defined state.
+ * -------------------------------------------------------------------------- */
+static const acc_reg_config_t AccRegConfigIdle_P[] =
+{
+    { ACC_CTRL_REG0,        0b00010000 },   /* default (SDO pull-up state)        */
+    { ACC_CTRL_REG4,        0b00000000 },   /* 4-wire SPI                          */
+    { ACC_CTRL_REG3,        0b00000000 },   /* no INT routing                      */
+    { ACC_CTRL_REG5,        0b00000000 },   /* FIFO disabled                       */
+    { ACC_FIFO_CTRL_REG,    0b00000000 },   /* bypass mode (nothing to overrun)    */
+    { ACC_CTRL_REG1,        0b00101111 },   /* low-power mode, 10 Hz, XYZ on       */
+};
+
+void ACC_vConfigIdle(void)
+{
+    _vDeviceRegsConfig(AccRegConfigIdle_P,
+                       sizeof(AccRegConfigIdle_P) / sizeof(acc_reg_config_t));
+}
+
+/* --------------------------------------------------------------------------
  * _vDeviceReadRegArray — read N sequential registers via SPI
  * -------------------------------------------------------------------------- */
 void _vDeviceReadRegArray(uint8_t u8RegAddrStart, uint8_t *pau8Buf, uint8_t u8NumBytes)

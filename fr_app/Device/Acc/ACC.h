@@ -41,6 +41,7 @@ typedef struct _acc_reg_config_t {
 } acc_reg_config_t;
 
 void    ACC_vInit(void);
+void    ACC_vConfigIdle(void);
 uint8_t ACC_u8GetDeviceId(void);
 bool    ACC_bDeviceIdOk(void);
 uint8_t ACC_u8NumSamplesInFifo(void);

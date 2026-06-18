@@ -80,6 +80,7 @@ void HAL_SYSTEM_vEnterStop2(void)
      * therefore a direct visual indicator of the power mode: off == STOP2,
      * on == running in any other mode. */
     BSP_LED_Off(LED_RED);
+    BSP_LED_Off(LED_YELLOW);
 
     HAL_GPIO_vOnSleep();
 

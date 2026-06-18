@@ -63,12 +63,20 @@ void HAL_GPIO_vInit(void)
  * sink ~VDD/R_pd (~80 uA) continuously. It currently ends up analog only because
  * the last reader DeInits it - parking it here makes that guaranteed, not
  * incidental on the wake-path ordering. */
+/* PA13/PA14 are the SWD pins (SWDIO/SWCLK). They keep their reset-default AF0
+ * with an internal pull-up (PA13) / pull-down (PA14). If the debug header carries
+ * an opposing external pull, the two form a divider that leaks continuously
+ * (~1.8V/(40k internal + 10k external) ~= 36 uA). Park them analog (no pull)
+ * for STOP2 so neither internal pull is driven. Debug still works from reset up
+ * to the first sleep; a deployed tag needs no SWD. */
 #define HAL_GPIO_SLEEP_ANALOG_GPIOA  (BSP_ACC_SCK_PIN  | BSP_DEBUG_UART_TX_PIN | \
                                       BSP_DEBUG_UART_RX_PIN | BSP_FLASH_MISO_PIN | \
                                       BSP_ACC_MISO_PIN | BSP_ACC_MOSI_PIN | \
-                                      BSP_FLASH_SCK_PIN | BSP_FLASH_MOSI_PIN)
+                                      BSP_FLASH_SCK_PIN | BSP_FLASH_MOSI_PIN | \
+                                      GPIO_PIN_13 | GPIO_PIN_14)
 #define HAL_GPIO_SLEEP_ANALOG_GPIOB  (BSP_GPS_UART_TX_PIN | BSP_GPS_UART_RX_PIN | \
                                       BSP_ROLE_BIT0_PIN)
+#define HAL_GPIO_SLEEP_ANALOG_GPIOC  (BSP_ACC_INT_PIN)
 
 void HAL_GPIO_vOnSleep(void)
 {
@@ -76,6 +84,7 @@ void HAL_GPIO_vOnSleep(void)
      * (register writes need the clock on). */
     HAL_GPIO_vInitAnalogNoPull(GPIOA, HAL_GPIO_SLEEP_ANALOG_GPIOA);
     HAL_GPIO_vInitAnalogNoPull(GPIOB, HAL_GPIO_SLEEP_ANALOG_GPIOB);
+    HAL_GPIO_vInitAnalogNoPull(GPIOC, HAL_GPIO_SLEEP_ANALOG_GPIOC);
 
     __HAL_RCC_GPIOA_CLK_DISABLE();
     __HAL_RCC_GPIOB_CLK_DISABLE();

@@ -131,6 +131,14 @@ void INIT_vInitialization(void *parameters)
     }
     else
     {
+#ifdef ENABLE_MOVE
+        /* The accelerometer is fitted and powered on primaries too, but the
+         * primary doesn't track movement. Left in its undefined power-on state
+         * its I/O drew ~115 uA; configured-but-active (25 Hz, un-drained FIFO)
+         * ~45 uA; full power-down was worse (floating SPI inputs crowbar). So
+         * use a low-power, no-FIFO idle config - I/O active, nothing to overrun. */
+        ACC_vConfigIdle();
+#endif
         /* Primary: bring up the Farmranger UART link to the fr9 logger board.
          * (Debug UART is a separate peripheral, so the two no longer conflict.) */
         FARMRANGER_vInit();
