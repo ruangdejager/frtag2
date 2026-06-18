@@ -26,12 +26,28 @@
 static hal_uart_t *uart1_buffer = NULL;
 static hal_uart_t *uart2_buffer = NULL;
 
+/* Device role, latched once at boot from the strap (HAL_UART_vSetRole) so the
+ * USART1 baud/swap can be chosen without re-reading PB12 on every HAL_UART_vInit
+ * — the strap pin is tristated right after that single read. */
+static bool s_bPrimaryRole = false;
+
 static usart_buf_ptr_t UART_u8RxBufUsedSpace(hal_uart_t *pHandle);
 static usart_buf_ptr_t UART_u8RxBufFreeSpace(hal_uart_t *pHandle);
 
 /* Weak RX-notification callbacks — override in the application. */
 __attribute__((weak)) void UART1_vNotifyOnRX(void) {}
 __attribute__((weak)) void UART2_vNotifyOnRX(void) {}
+
+/* --------------------------------------------------------------------------
+ * HAL_UART_vSetRole
+ * Latch the device role once, after it has been read from the strap at boot.
+ * Lets HAL_UART_vInit() pick the USART1 baud/swap without touching PB12 again,
+ * so the strap pin can be permanently tristated after that single read.
+ * -------------------------------------------------------------------------- */
+void HAL_UART_vSetRole(bool bPrimary)
+{
+    s_bPrimaryRole = bPrimary;
+}
 
 /* --------------------------------------------------------------------------
  * HAL_UART_vInit
@@ -63,17 +79,16 @@ void HAL_UART_vInit(void)
     /* GPS / Farmranger UART (USART1), mutually exclusive by device role:
      * a SECONDARY runs GNSS (9600, MAX-M10S default); a PRIMARY has no GPS and
      * uses this UART as the Farmranger link to the fr9 board, whose UART is
-     * fixed at 115200. Select the baud from the role strap (BSP_ROLE_BIT0:
-     * HIGH = primary) read directly here, so the port comes up at the right
-     * rate from the start. (DEVICE_DISCOVERY_vConfigDeviceRole() has already
-     * read and de-inited this pin by now, so re-init it to read it again.)
+     * fixed at 115200. The role was latched once at boot from the strap
+     * (HAL_UART_vSetRole, fed by DEVICE_DISCOVERY_vConfigDeviceRole), and the
+     * strap pin (PB12) has since been tristated — so use the cached role here
+     * instead of re-reading it. This and every wake-path re-init therefore
+     * leave PB12 untouched.
      *
      * On a PRIMARY the pins are also TX/RX-swapped: the daughterboard wiring
      * to the fr9 Farmranger UART crosses PB6/PB7 the opposite way to the
      * GNSS module wiring, so the MCU-side SWAP bit corrects for it. */
-    HAL_GPIO_vInitInput(BSP_ROLE_BIT0_PORT, BSP_ROLE_BIT0_PIN, GPIO_PULLDOWN);
-    bool bPrimary = (HAL_GPIO_ReadPin(BSP_ROLE_BIT0_PORT, BSP_ROLE_BIT0_PIN) == GPIO_PIN_SET);
-    HAL_GPIO_DeInit(BSP_ROLE_BIT0_PORT, BSP_ROLE_BIT0_PIN);
+    bool bPrimary = s_bPrimaryRole;
 
     USART_InitStruct.BaudRate = bPrimary ? BSP_FARMRANGER_UART_BAUD : BSP_GPS_UART_BAUD;
     LL_USART_Init(BSP_GPS_USART_INSTANCE, &USART_InitStruct);

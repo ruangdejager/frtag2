@@ -59,6 +59,10 @@ typedef struct Usart_and_buffer
 } hal_uart_t;
 
 void HAL_UART_vInit(void);
+/* Latch the device role (read once from the strap at boot) so HAL_UART_vInit()
+ * can choose the USART1 baud/swap without re-reading PB12. Call before the
+ * first HAL_UART_vInit(). */
+void HAL_UART_vSetRole(bool bPrimary);
 void HAL_UART_vSetup(hal_uart_t *drv, hal_uart_id_t uart_id, hal_uart_fc_t flowcontrol);
 void HAL_UART_vClearBuffer(hal_uart_t *drv);
 void HAL_UART_vSetFlowControlFunctions(hal_uart_t *drv, setRtsAssert setRtsFunction, getCTSPin getCtsFunction);

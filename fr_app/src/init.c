@@ -65,8 +65,12 @@ void INIT_vInitialization(void *parameters)
     /* Board-level GPIO */
     HAL_GPIO_vInit();
 
-    /* Determine primary / secondary role before UART init */
+    /* Determine primary / secondary role before UART init. This is the only
+     * read of the role strap (PB12); it tristates the pin immediately after, so
+     * latch the role into the UART layer here for the USART1 baud/swap choice
+     * rather than having HAL_UART_vInit() re-read the strap on every (re-)init. */
     DEVICE_DISCOVERY_vConfigDeviceRole();
+    HAL_UART_vSetRole(DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY);
 
     HAL_UART_vInit();
 

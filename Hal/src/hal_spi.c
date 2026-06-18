@@ -13,10 +13,23 @@
 #include "hal_bsp.h"
 #include "stm32wle5xx.h"
 
+#include <stdbool.h>
 #include <string.h>
 
 SPI_HandleTypeDef hAccSpi;
 SPI_HandleTypeDef hFlashSpi;
+
+/* Set true on each STOP2 wake (HAL_SPI_vMarkParked), cleared when the matching
+ * peripheral is re-initialised. STOP2 parks the SCK/MISO/MOSI pins as analog,
+ * so each bus must be restored before its next transaction — but only the bus
+ * actually used. Deferring this to the select chokepoint (HAL_SPI_*_vEnsureAwake)
+ * means an idle 1 Hz wake re-inits neither: the flash bus only wakes when
+ * something logs, the ACC bus only on a movement read. */
+static volatile bool bAccSpiParked;
+static volatile bool bFlashSpiParked;
+
+static void HAL_SPI_vInitAccHw(void);
+static void HAL_SPI_vInitFlashHw(void);
 
 /* --------------------------------------------------------------------------
  * HAL_SPI_FLASH_vReadPacket
@@ -60,13 +73,10 @@ HAL_StatusTypeDef HAL_SPI_FLASH_vReadPacket(uint8_t *rx, uint16_t len)
  * flash/ACC buses would be dead (status reads time out as "busy"). Plain
  * HAL_SPI_Init() skips MspInit once the handle is no longer in RESET.
  * -------------------------------------------------------------------------- */
-void HAL_SPI_vInit(void)
+static void HAL_SPI_vInitAccHw(void)
 {
     /* Force a full re-init (incl. MspInit -> pin restore) on every call. */
-    hAccSpi.State   = HAL_SPI_STATE_RESET;
-    hFlashSpi.State = HAL_SPI_STATE_RESET;
-
-    /* --- SPI1: accelerometer --- */
+    hAccSpi.State                  = HAL_SPI_STATE_RESET;
     hAccSpi.Instance               = ACC_SPI;
     hAccSpi.Init.Mode              = SPI_MODE_MASTER;
     hAccSpi.Init.Direction         = SPI_DIRECTION_2LINES;
@@ -82,8 +92,12 @@ void HAL_SPI_vInit(void)
     hAccSpi.Init.CRCLength         = SPI_CRC_LENGTH_DATASIZE;
     hAccSpi.Init.NSSPMode          = SPI_NSS_PULSE_ENABLE;
     HAL_SPI_Init(&hAccSpi);
+    bAccSpiParked = false;
+}
 
-    /* --- SPI2: external NOR flash --- */
+static void HAL_SPI_vInitFlashHw(void)
+{
+    hFlashSpi.State                  = HAL_SPI_STATE_RESET;
     hFlashSpi.Instance               = FLASH_SPI;
     hFlashSpi.Init.Mode              = SPI_MODE_MASTER;
     hFlashSpi.Init.Direction         = SPI_DIRECTION_2LINES;
@@ -99,6 +113,40 @@ void HAL_SPI_vInit(void)
     hFlashSpi.Init.CRCLength         = SPI_CRC_LENGTH_DATASIZE;
     hFlashSpi.Init.NSSPMode          = SPI_NSS_PULSE_ENABLE;
     HAL_SPI_Init(&hFlashSpi);
+    bFlashSpiParked = false;
+}
+
+void HAL_SPI_vInit(void)
+{
+    HAL_SPI_vInitAccHw();
+    HAL_SPI_vInitFlashHw();
+}
+
+/* --------------------------------------------------------------------------
+ * HAL_SPI_vMarkParked — note that STOP2 has torn down both SPI buses.
+ *
+ * Called from the tickless-idle wake path (interrupts masked), so it does no
+ * peripheral work — just flags that each bus owes a re-init. The actual restore
+ * happens lazily at the select chokepoint, per bus, only when used.
+ * -------------------------------------------------------------------------- */
+void HAL_SPI_vMarkParked(void)
+{
+    bAccSpiParked   = true;
+    bFlashSpiParked = true;
+}
+
+/* Restore one bus on demand. No-op unless a STOP2 sleep parked it, so only the
+ * first select after a wake pays the (cheap, register-only) re-init. */
+void HAL_SPI_ACC_vEnsureAwake(void)
+{
+    if (bAccSpiParked)
+        HAL_SPI_vInitAccHw();
+}
+
+void HAL_SPI_FLASH_vEnsureAwake(void)
+{
+    if (bFlashSpiParked)
+        HAL_SPI_vInitFlashHw();
 }
 
 /* --------------------------------------------------------------------------

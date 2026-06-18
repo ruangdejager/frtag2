@@ -553,10 +553,15 @@ void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
  * -------------------------------------------------------------------------- */
 void DEVICE_DISCOVERY_vConfigDeviceRole(void)
 {
+    /* The role strap was set up as input-pulldown by HAL_GPIO_vInit(); read it
+     * once here. After this the role is fixed for the life of the device, so the
+     * pin is no longer needed — tristate it (analog, no pull) so it draws no
+     * current (a PRIMARY ties the strap HIGH; leaving the pulldown active would
+     * sink ~VDD/R_pd continuously) and is never read again. */
     eDeviceRole = HAL_GPIO_ReadPin(BSP_ROLE_BIT0_PORT, BSP_ROLE_BIT0_PIN)
                   ? DEVICE_ROLE_PRIMARY
                   : DEVICE_ROLE_SECONDARY;
-    HAL_GPIO_DeInit(BSP_ROLE_BIT0_PORT, BSP_ROLE_BIT0_PIN);
+    HAL_GPIO_vInitAnalogNoPull(BSP_ROLE_BIT0_PORT, BSP_ROLE_BIT0_PIN);
 }
 
 /* --------------------------------------------------------------------------

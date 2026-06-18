@@ -20,6 +20,7 @@
 #include "dbg_log.h"
 #include "hal_rtc.h"
 #include "hal_wdt.h"
+#include "hal_system.h"
 
 #include "LoraRadio.h"
 #include "MeshNetwork.h"
@@ -91,12 +92,15 @@ void PLATFORM_vHeartbeatDispatchTask(void *parameters)
         osMutexRelease(SubMutex);
         /* ------------------------------------------------------------------ */
 
-        /* Mark the 1 Hz tick in the external-flash log (useful as a timeline
-         * during the preproduction phase). DBG_LOG prefixes every line with
-         * the current date/time and battery voltage, which is exactly this
-         * heartbeat's payload. Enqueues asynchronously; the flash write
-         * happens off-path. */
-        DBG("\r\n");
+        /* 1 Hz timeline marker on the debug UART. Only meaningful while the
+         * device is actively awake — a sleep lock is held, so the debug UART has
+         * been brought up by the module that took the lock. During idle wakes
+         * (no lock, about to drop back into STOP2) emitting it would format a
+         * verbose timestamped line and clock ~30 bytes out of USART2 every
+         * second for nothing, so skip it. SYSTEM_bCheckSleepModeStatus() returns
+         * true when no lock is held. */
+        if (!SYSTEM_bCheckSleepModeStatus())
+            DBG("\r\n");
     }
 }
 
