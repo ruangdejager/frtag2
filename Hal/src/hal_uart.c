@@ -232,6 +232,16 @@ bool HAL_UART_u8TxBufferEmpty(hal_uart_t *drv)
     return (drv->buffer.TX_Head == drv->buffer.TX_Tail);
 }
 
+/* True once the TX ring is drained AND the final byte has left the shift
+ * register (TC set) — i.e. the line is idle and safe to reconfigure or tear
+ * down without truncating an in-flight byte. Level-triggered, so a caller can
+ * poll this to wait out a transmission regardless of how many ring-empty
+ * events the ISR saw along the way. */
+bool HAL_UART_bTxIdle(hal_uart_t *drv)
+{
+    return HAL_UART_u8TxBufferEmpty(drv) && LL_USART_IsActiveFlag_TC(drv->usart);
+}
+
 bool HAL_UART_vTxPutByte(hal_uart_t *drv, uint8_t data)
 {
     if (!HAL_UART_u8TxFreeSpace(drv))
