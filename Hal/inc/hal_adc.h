@@ -26,6 +26,10 @@ typedef enum {
 extern ADC_HandleTypeDef hadc;
 
 void     HAL_ADC_vInit(void);
+/* Flag the ADC as torn down by STOP2; the next HAL_ADC_vLock() re-inits it
+ * lazily. Call from the wake path instead of HAL_ADC_vInit() so idle 1 Hz
+ * wakes don't pay the init + calibration cost. */
+void     HAL_ADC_vMarkParked(void);
 void     HAL_ADC_vEnable(void);
 bool     HAL_ADC_bIsEnabled(void);
 void     HAL_ADC_vDisable(void);

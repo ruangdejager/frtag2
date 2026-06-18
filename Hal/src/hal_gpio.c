@@ -58,11 +58,11 @@ void HAL_GPIO_vInit(void)
  * PA15 FLASH_CS=high, PB5/PB8 LEDs=low. ADC pins (PA12/PB3/PB4) are already
  * analog. GPIO state is retained in STOP2, so driven pins keep their level.
  *
- * PB12 (ROLE_BIT0) is also parked analog: it is configured input-pulldown when
- * read, and on a PRIMARY the strap is tied HIGH, so leaving it pulldown would
- * sink ~VDD/R_pd (~80 uA) continuously. It currently ends up analog only because
- * the last reader DeInits it - parking it here makes that guaranteed, not
- * incidental on the wake-path ordering. */
+ * PB12 (ROLE_BIT0) is also kept in the analog sleep mask: it is read once at
+ * boot (DEVICE_DISCOVERY_vConfigDeviceRole) and tristated immediately after, so
+ * it is already analog by the time we sleep. On a PRIMARY the strap is tied
+ * HIGH, so leaving it input-pulldown would sink ~VDD/R_pd (~80 uA) continuously;
+ * parking it here is belt-and-braces in case any future path re-drives it. */
 /* PA13/PA14 are the SWD pins (SWDIO/SWCLK). They keep their reset-default AF0
  * with an internal pull-up (PA13) / pull-down (PA14). If the debug header carries
  * an opposing external pull, the two form a divider that leaks continuously
@@ -94,23 +94,23 @@ void HAL_GPIO_vOnSleep(void)
 
 void HAL_GPIO_OnWake(void)
 {
+    /* Only the GPIO port clocks are restored here — the minimum the idle 1 Hz
+     * wake needs (LED indicator, role strap, and the lazy SPI restore that may
+     * follow). No peripheral pins are re-armed on the wake path: a module that
+     * needs the debug UART, SPI or ADC brings it up itself when it acquires the
+     * sleep lock (DEBUG_vInit / the SPI select chokepoints / HAL_ADC_vLock), so
+     * an idle wake that uses none of them pays nothing.
+     *
+     * The debug UART pins in particular are NOT re-armed here: while a sleep
+     * lock is held the device stays on the LIGHT WFI path (no STOP2, no pin
+     * parking), so DEBUG_vInit's pin setup survives the whole active window;
+     * and during idle the 1 Hz UART marker is suppressed, so the pins are not
+     * needed. USART1 (GPS/Farmranger) and ADC pins are likewise left to their
+     * owners. */
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE();
     __HAL_RCC_GPIOH_CLK_ENABLE();
-
-    /* Restore the debug UART (USART2) pins to AF — USART2 keeps its register
-     * state across STOP2, so restoring the pins is enough to bring TX back.
-     * SPI1/SPI2 and ADC pins are restored by HAL_SPI_vInit()/HAL_ADC_vInit()
-     * in the wake path. USART1 (GPS/Farmranger) pins stay analog; those
-     * subsystems re-init their pins when next powered on. */
-    GPIO_InitTypeDef gpio = {0};
-    gpio.Mode      = GPIO_MODE_AF_PP;
-    gpio.Pull      = GPIO_NOPULL;
-    gpio.Speed     = GPIO_SPEED_FREQ_LOW;
-    gpio.Alternate = BSP_DEBUG_UART_AF;
-    gpio.Pin       = BSP_DEBUG_UART_TX_PIN | BSP_DEBUG_UART_RX_PIN;
-    HAL_GPIO_Init(BSP_DEBUG_UART_TX_PORT, &gpio);
 }
 
 bool HAL_GPIO_bLedsAllowed(void)

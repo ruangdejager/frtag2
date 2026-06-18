@@ -92,23 +92,33 @@ void HAL_SYSTEM_vEnterStop2(void)
      * (cpsid i in vPortSuppressTicksAndSleep) so there is no race with any task.
      *
      * Order matters: HAL_GPIO_OnWake() must run first so that GPIOA/B/C clocks
-     * are enabled before HAL_SPI_vInit() calls HAL_GPIO_Init() for SPI pins.
-     * HAL_GPIO_vOnSleep() parks the peripheral AF pins (SPI/UART) and PB12 as
-     * analog before gating the clocks, so those pins ARE re-initialised on wake:
-     * HAL_GPIO_OnWake() restores the debug UART (USART2), HAL_SPI_vInit() the
-     * SPI1/SPI2 pins, HAL_ADC_vInit() the ADC pins; USART1 (GPS/Farmranger) pins
-     * stay analog until those subsystems are next powered on. All other pins
-     * (driven outputs, role strap) keep their retained MODER/level across STOP2.
+     * are enabled before any later (lazy) HAL_SPI re-init calls HAL_GPIO_Init()
+     * for the SPI pins. HAL_GPIO_vOnSleep() parks the peripheral AF pins
+     * (SPI/UART) and PB12 as analog before gating the clocks; HAL_GPIO_OnWake()
+     * restores the debug UART (USART2) here, while the SPI1/SPI2 pins are
+     * restored later by the lazy SPI re-init (see below) and the ADC pins are
+     * already analog. USART1 (GPS/Farmranger) pins stay analog until those
+     * subsystems are next powered on. All other pins (driven outputs, role
+     * strap) keep their retained MODER/level across STOP2.
      *
      * USART2 needs no explicit re-init: STOP2 retains both the APB1ENR clock-
      * enable bit and the full USART2 register state (BRR, CR1, CR2, CR3).
      * SystemClock_Config() above restores the APB bus, so USART2 is already live
      * with its pre-sleep baud-rate and interrupt settings.  Calling HAL_UART_vInit()
      * here would be actively harmful — it ends with __HAL_RCC_USART2_CLK_DISABLE()
-     * (boot-time design: clock off until vSetup/vEnable) which silences the TX path. */
+     * (boot-time design: clock off until vSetup/vEnable) which silences the TX path.
+     *
+     * SPI and ADC are NOT re-initialised here. Re-running their full init (the
+     * ADC's includes a calibration) on every 1 Hz heartbeat wake was pure waste:
+     * the ADC is sampled only every ~10 s and the flash bus only when something
+     * logs. Instead we just flag both as parked; each is restored lazily on its
+     * first use after the wake (HAL_ADC_vLock / the SPI chip-select chokepoints),
+     * so an idle wake that touches neither pays nothing. The GPIO clocks are
+     * re-enabled by HAL_GPIO_OnWake() above, so a later lazy re-init can restore
+     * the parked SPI pins. */
     HAL_GPIO_OnWake();
-    HAL_SPI_vInit();    /* SPI1 (ACC) + SPI2 (flash) */
-    HAL_ADC_vInit();
+    HAL_SPI_vMarkParked();   /* SPI1 (ACC) + SPI2 (flash): restore on first select */
+    HAL_ADC_vMarkParked();   /* ADC: restore + recalibrate on first HAL_ADC_vLock  */
 
     BSP_LED_On(LED_RED);
 }

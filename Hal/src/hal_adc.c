@@ -17,6 +17,12 @@ static volatile bool   adc_flag;
 static uint16_t        adc_value;
 static osMutexId_t     adc_mutex;
 
+/* Set true by HAL_ADC_vMarkParked() on each STOP2 wake; cleared by a full
+ * HAL_ADC_vInit(). The ADC is only used every ~10 s (battery + solar), so
+ * instead of paying the init + calibration cost on every 1 Hz wake we defer
+ * it: HAL_ADC_vLock() re-inits lazily on the first access after a sleep. */
+static volatile bool   bAdcParked;
+
 ADC_HandleTypeDef hadc;
 
 void HAL_ADC_vInit(void)
@@ -78,6 +84,22 @@ void HAL_ADC_vInit(void)
         adc_mutex = osMutexNew(NULL);
         configASSERT(adc_mutex != NULL);
     }
+
+    /* The peripheral is now fully initialised and calibrated. */
+    bAdcParked = false;
+}
+
+/* --------------------------------------------------------------------------
+ * HAL_ADC_vMarkParked — note that STOP2 has torn down the ADC.
+ *
+ * Called from the tickless-idle wake path (interrupts masked), so it must do
+ * no peripheral work — just flag that a re-init is owed. The next
+ * HAL_ADC_vLock() pays the init + calibration cost, and only when a sample is
+ * actually taken. Idle 1 Hz wakes that never sample the ADC skip it entirely.
+ * -------------------------------------------------------------------------- */
+void HAL_ADC_vMarkParked(void)
+{
+    bAdcParked = true;
 }
 
 void HAL_ADC_MspInit(ADC_HandleTypeDef *adcHandle)
@@ -185,5 +207,14 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *my_hadc)
     adc_value = (uint16_t)HAL_ADC_GetValue(&hadc);
 }
 
-void HAL_ADC_vLock(void)   { osMutexAcquire(adc_mutex, osWaitForever); }
+void HAL_ADC_vLock(void)
+{
+    osMutexAcquire(adc_mutex, osWaitForever);
+
+    /* Lazy restore after a STOP2 sleep: re-init + recalibrate only now, on the
+     * first actual access, instead of on every 1 Hz heartbeat wake. Done under
+     * the lock so the re-init cannot race a concurrent battery/solar sample. */
+    if (bAdcParked)
+        HAL_ADC_vInit();
+}
 void HAL_ADC_vUnlock(void) { osMutexRelease(adc_mutex); }
