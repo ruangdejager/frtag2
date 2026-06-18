@@ -92,7 +92,7 @@ void LORARADIO_vInit(void)
     LORARADIO_DRIVER_vInit(u8DevEUI);
     LORARADIO_vEnterDeepSleep();
 
-    DBG_LOG("\r\nLoraradio: Device ID %lX\r\n", LORARADIO_u32GetUniqueId());
+    DBG("\r\nLoraradio: Device ID %lX\r\n", LORARADIO_u32GetUniqueId());
 
     static const osThreadAttr_t radioTask_attr = {
         .name       = "LoRaRadioTask",
@@ -196,7 +196,7 @@ void LORARADIO_vRadioTask(void *arg)
         /* ---------- TX DONE ---------- */
         if (events & RADIO_EVT_TX_DONE)
         {
-            DBG_LOG("LoraRadio: TX done IRQ received\r\n");
+            DBG("LoraRadio: TX done IRQ received\r\n");
             SUBGRF_ClearIrqStatus(IRQ_TX_DONE);
             LORARADIO_DRIVER_vEnterRxMode(0);
         }
@@ -280,12 +280,12 @@ bool LORARADIO_bCarrierSense(void)
 
     if (r & RADIO_EVT_CAD_BUSY)
     {
-        DBG_LOG("Loraradio: CAD busy\r\n");
+        DBG("Loraradio: CAD busy\r\n");
         return false;
     }
     if (r & RADIO_EVT_CAD_CLEAR)
     {
-        DBG_LOG("Loraradio: CAD clear\r\n");
+        DBG("Loraradio: CAD clear\r\n");
         return true;
     }
 
@@ -315,7 +315,7 @@ bool LORARADIO_bCarrierSenseAndWait(uint32_t maxWaitMs)
         uint32_t backoffMs = CAD_BASE_BACKOFF_MS
             + LORARADIO_u32GetRandomNumber(window - CAD_BASE_BACKOFF_MS + 1);
 
-        DBG_LOG("Loraradio: CAD back-off %lu ms (fail=%lu)\r\n", backoffMs, failCount);
+        DBG("Loraradio: CAD back-off %lu ms (fail=%lu)\r\n", backoffMs, failCount);
 
         /* Back-off sleep — also uses ALL_FLAGS so any event wakes us cleanly */
         uint32_t r = osThreadFlagsWait(ALL_FLAGS, osFlagsWaitAny, backoffMs);

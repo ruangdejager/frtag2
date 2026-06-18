@@ -135,7 +135,10 @@ bool LORARADIO_DRIVER_bTransmitPayload(uint8_t *payload, uint8_t payload_length)
      * event is left in the notification word after this returns. */
     uint32_t r = osThreadFlagsWait(ALL_FLAGS, osFlagsWaitAny, 1000);
     bool bSuccess = (!(r & osFlagsError) && (r & RADIO_EVT_TX_DONE));
-    DBG_LOG("LoraRadio: TX %s\r\n", bSuccess ? "done" : "failed (timeout or error)");
+    if (bSuccess)
+        DBG("LoraRadio: TX done\r\n");
+    else
+        DBG_LOG("LoraRadio: TX failed (timeout or error)\r\n");
     return bSuccess;
 }
 

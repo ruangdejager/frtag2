@@ -47,6 +47,7 @@
 #include "Battery.h"
 #include "MeshNetwork.h"
 #include "LoraRadio.h"
+#include "DeviceDiscovery.h"
 
 #ifdef FRKERNEL_INTERFACE_UART
 #  include "Debug.h"
@@ -180,6 +181,7 @@ static void FRKERNEL_vProcessCommand(const char *line)
             "  tag -help                   list commands\r\n"
             "  tag battery                 battery voltage (mV)\r\n"
             "  tag discovery schedule      wakeup interval (min)\r\n"
+            "  tag prodsleep               enter production sleep (secondary only)\r\n"
             "  tag release                 release device for sleep\r\n"
         );
 #else
@@ -189,6 +191,7 @@ static void FRKERNEL_vProcessCommand(const char *line)
             "  tag <ID> -help              list commands\r\n"
             "  tag <ID> battery            battery voltage (mV)\r\n"
             "  tag <ID> discovery schedule wakeup interval (min)\r\n"
+            "  tag <ID> prodsleep          enter production sleep (secondary only)\r\n"
             "  tag <ID> release            release device for sleep\r\n"
         );
 #endif
@@ -203,6 +206,11 @@ static void FRKERNEL_vProcessCommand(const char *line)
         snprintf(resp, sizeof(resp), "Discovery interval: %u min\r\n",
                  MESHNETWORK_u8GetWakeupInterval());
         FRKERNEL_vRespond(resp);
+    }
+    else if (strcmp(p, "prodsleep") == 0)
+    {
+        DEVICE_DISCOVERY_vEnterProductionSleep();
+        FRKERNEL_vRespond("ProductionSleep entered — wakes on Vsolar >= 3000 mV\r\n");
     }
     else
     {
