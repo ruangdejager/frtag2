@@ -58,7 +58,6 @@ static osThreadId_t  Farmranger_vRxTask_handle;
 static osThreadId_t  Farmranger_vATHandlerTask_handle;
 
 static osSemaphoreId_t xLineReadySem;
-static osSemaphoreId_t xUartTxDoneSem;
 static osMessageQueueId_t xATQueue;
 
 /* ---- Device state ---- */
@@ -107,11 +106,9 @@ void FARMRANGER_vInit(void)
     FR_DRIVER_vInitFRDevice(&farmranger.UartHandle);
 
     xLineReadySem    = osSemaphoreNew(1, 0, NULL);
-    xUartTxDoneSem   = osSemaphoreNew(1, 0, NULL);
     xATQueue         = osMessageQueueNew(4, sizeof(ATReq_t), NULL);
 
     configASSERT(xLineReadySem  != NULL);
-    configASSERT(xUartTxDoneSem != NULL);
     configASSERT(xATQueue       != NULL);
 
     static const osThreadAttr_t rx_attr = {
@@ -373,6 +370,16 @@ uint8_t FARMRANGER_u8RequestInterval(void)
  * is ~60 chars (8-hex id + signed micro-degree lat/lon); 80 leaves margin. */
 #define FR_CSV_ROW_MAX 80
 
+/* Inter-row pacing for the CSV upload (ms). The fr9 receives into a 128-byte
+ * UART RX ring drained by a co-operative loop that echoes every byte to USB;
+ * if the whole payload is streamed back-to-back at line rate that ring
+ * overflows and the fr9 never counts the full length (→ "LOG TIMEOUT"). We
+ * therefore wait for each row to leave the wire and pause briefly, bounding
+ * the in-flight data to a single row and giving the fr9 time to drain. This is
+ * the throttle the per-byte osDelay in HAL_UART_vTxPutBuffer used to provide
+ * before that path was sped up for the (USART2) flash-log dump. */
+#define FR_LOG_ROW_GAP_MS 10U
+
 /* Format neighbor `i` into `row` (size FR_CSV_ROW_MAX). Returns the byte
  * count, or <=0 / >=FR_CSV_ROW_MAX on error. */
 static int FARMRANGER_iFormatRow(char *row, const MeshDiscoveredNeighbor_t *n)
@@ -424,7 +431,12 @@ bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
 //        BSP_LED_On(LED_YELLOW);
     }
 
-    /* Step 2: stream the CSV payload one row at a time. */
+    /* Step 2: stream the CSV payload one row at a time, paced so the fr9 keeps
+     * up. HAL_UART_vTxPutByte copies each byte into the TX ring, so `row` is
+     * reusable as soon as vTxPutBuffer returns; after queueing a row we wait
+     * for it to fully leave the wire (HAL_UART_bTxIdle) and then pause
+     * FR_LOG_ROW_GAP_MS. That bounds the in-flight data to one row so the fr9's
+     * RX ring can't overflow (see FR_LOG_ROW_GAP_MS). */
     for (uint16_t i = 0; i < count; i++)
     {
         int n = FARMRANGER_iFormatRow(row, &neighbors[i]);
@@ -433,13 +445,20 @@ bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
 
         HAL_UART_vTxPutBuffer(&farmranger.UartHandle, (uint8_t *)row, (uint16_t)n);
 
-        /* Wait until this row's TX is fully drained before reusing `row`. */
-        if (osSemaphoreAcquire(xUartTxDoneSem, 3500) != osOK)
+        /* Wait for this row to drain off the wire before sending the next. */
+        uint32_t u32TxStart = osKernelGetTickCount();
+        while (!HAL_UART_bTxIdle(&farmranger.UartHandle))
         {
-            EVTLOG(LOG_FRLOG_ERROR, 2);
-            DBG_LOG("UART TX timeout\r\n");
-            return false;
+            if ((osKernelGetTickCount() - u32TxStart) >= 3500)
+            {
+                EVTLOG(LOG_FRLOG_ERROR, 2);
+                DBG_LOG("UART TX timeout\r\n");
+                return false;
+            }
+            osDelay(1);
         }
+
+        osDelay(FR_LOG_ROW_GAP_MS);
     }
 
     /* Step 3: wait for final OK */
@@ -457,15 +476,6 @@ bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
     }
 
     return true;
-}
-
-/* --------------------------------------------------------------------------
- * HAL_UART_vTxCompleteISR — ISR callback; releases TX-done semaphore
- * -------------------------------------------------------------------------- */
-void HAL_UART_vTxCompleteISR(hal_uart_t *drv)
-{
-    if (drv == &farmranger.UartHandle)
-        osSemaphoreRelease(xUartTxDoneSem);   /* ISR-safe in CMSIS-RTOS v2 */
 }
 
 /* --------------------------------------------------------------------------

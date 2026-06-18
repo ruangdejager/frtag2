@@ -4,8 +4,9 @@
  * Farmranger device layer — UART-based AT command interface to the
  * companion logger board.
  *
- * Uses CMSIS-RTOS v2 throughout.  The HAL_UART_vTxCompleteISR callback
- * releases a semaphore (ISR-safe) to unblock the data-send path.
+ * Uses CMSIS-RTOS v2 throughout.  The data-send path streams all rows into
+ * the interrupt-driven TX ring (which copies each byte) and then polls
+ * HAL_UART_bTxIdle() once for the line to drain before tearing down the UART.
  */
 
 #ifndef DEVICE_FARMRANGER_FARMRANGER_H_
