@@ -64,7 +64,7 @@
  * Minimum Vsolar (mV) that counts as "panel illuminated / charging".
  * NOTE: tune to this board's behaviour — Vsolar tracks the charge rail, so it
  * sits near the battery voltage and rises when the panel actively drives it. */
-#define SOLAR_ACTIVATION_VSOLAR_MV      4000U
+#define SOLAR_ACTIVATION_VSOLAR_MV      3000U
 #endif
 
 #endif /* WORKER_SOLARPOWER_SOLARPOWER_CONFIG_H_ */

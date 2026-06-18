@@ -361,7 +361,7 @@ static bool MESHNETWORK_bTxSendRaw(const uint8_t *pBuf, size_t u32Len)
     if (u32Len > sizeof(tTx.buffer)) return false;
     memcpy(tTx.buffer, pBuf, u32Len);
     tTx.length = (uint16_t)u32Len;
-    DBG_LOG("MeshNetwork: Transmitting %s len=%u\r\n",
+    DBG("MeshNetwork: Transmitting %s len=%u\r\n",
         MeshPktTypeStr[pBuf[0]], (unsigned)u32Len);
     return LORARADIO_bTxPacket(&tTx);
 }
@@ -586,7 +586,7 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
                 {
                     FORWARD_vAdd(u32DreqId);
                     MESHNETWORK_bSendPacket(u8Out, u32OutLen);
-                    DBG_LOG("MeshNetwork: DReq forwarded\r\n");
+                    DBG("MeshNetwork: DReq forwarded\r\n");
                     EVTLOG(LOG_TX_DREQ, 2);
                 }
             }
@@ -707,7 +707,7 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
         if (MESHNETWORK_bEncodeDBeacon(&tBeacon, u8Buf, sizeof(u8Buf), &u32TempLen))
         {
             MESHNETWORK_bSendPacket(u8Buf, u32TempLen);
-            DBG_LOG("MeshNetwork: Forwarding Beacon\r\n");
+            DBG("MeshNetwork: Forwarding Beacon\r\n");
             EVTLOG(LOG_TX_BEACON, 2);
         }
     }
@@ -762,7 +762,7 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
     if (MESHNETWORK_eGetRole() == NODE_ROLE_FORWARDER)
     {
         MESHNETWORK_bSendPacket(pBuf, u32Len);
-        DBG_LOG("MeshNetwork: Ack forwarded\r\n");
+        DBG("MeshNetwork: Ack forwarded\r\n");
         EVTLOG(LOG_TX_ACK, 2);
     }
 
@@ -815,7 +815,7 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
      * notify — which would prematurely end this primary's campaign). */
     if (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY)
     {
-        DBG_LOG("MeshNetwork: TimeSync ignored (primary)\r\n");
+        DBG("MeshNetwork: TimeSync ignored (primary)\r\n");
         return;
     }
 
@@ -843,7 +843,7 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
 #endif
 
     MESHNETWORK_bSendPacket(pBuf, u32Len);
-    DBG_LOG("MeshNetwork: TimeSync forwarded\r\n");
+    DBG("MeshNetwork: TimeSync forwarded\r\n");
     EVTLOG(LOG_TX_TS, 2);
 }
 
@@ -975,7 +975,7 @@ void MESHNETWORK_vInit(void)
     configASSERT(xParserTaskHandle != NULL);
     configASSERT(xMeshTxTaskHandle != NULL);
 
-    DBG_LOG("MeshNetwork initialized\r\n");
+    DBG("MeshNetwork initialized\r\n");
 }
 
 /* --------------------------------------------------------------------------
