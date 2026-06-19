@@ -16,7 +16,7 @@
 #include "DbgLog.h"
 #include "Debug.h"
 #include "Log.h"
-#include "Flash.h"
+#include "storage_config.h"
 
 #include "platform_rtc.h"
 #include "Battery.h"
@@ -31,8 +31,16 @@
 #include <stdbool.h>
 #include <time.h>
 
-/* ---- Ring buffer (power-of-two size for cheap masking) ---- */
+/* ---- Ring buffer (power-of-two size for cheap masking) ----
+ * The MicroSD backend needs ~2 KB more .bss for its 512-byte block staging
+ * buffers, and this part's RAM is essentially full. Shrink the producer->
+ * consumer ring on that backend (the consumer drains it to a 16 MB SD log, so
+ * steady-state pressure is low); the flash backend keeps the larger ring. */
+#ifdef STORAGE_BACKEND_MICROSD
+#define DBGLOG_RING_SIZE   1024U
+#else
 #define DBGLOG_RING_SIZE   4096U
+#endif
 #define DBGLOG_RING_MASK   (DBGLOG_RING_SIZE - 1U)
 #define DBGLOG_MSG_MAX     255U          /* length field is one byte */
 #define DBGLOG_WAKE_FLAG   0x0001U
@@ -45,6 +53,7 @@ static char              acFmt[DBGLOG_MSG_MAX + 1];   /* shared format scratch *
 static osMutexId_t       xFmtMutex   = NULL;
 static osThreadId_t      xConsumer   = NULL;
 static volatile bool     bDumpRequested = false;
+static volatile bool     bEraseRequested = false;
 
 /* Count of whole messages dropped because the ring was full. Incremented under
  * xFmtMutex (on the producer push path); snapshotted+cleared under the same
@@ -211,6 +220,13 @@ void DBGLOG_vRequestDump(void)
         osThreadFlagsSet(xConsumer, DBGLOG_WAKE_FLAG);
 }
 
+void DBGLOG_vRequestErase(void)
+{
+    bEraseRequested = true;
+    if (xConsumer != NULL)
+        osThreadFlagsSet(xConsumer, DBGLOG_WAKE_FLAG);
+}
+
 /* -------------------------------------------------------------------------- */
 
 static void DBGLOG_vConsumerTask(void *arg)
@@ -222,7 +238,15 @@ static void DBGLOG_vConsumerTask(void *arg)
     {
         osThreadFlagsWait(DBGLOG_WAKE_FLAG, osFlagsWaitAny, osWaitForever);
 
-        /* Stream the persisted flash log on request — done here so the consumer
+        /* Erase the log on request — done here so it never races the consumer's
+         * own log writes on the shared storage device. */
+        if (bEraseRequested)
+        {
+            bEraseRequested = false;
+            LOG_vErase();
+        }
+
+        /* Stream the persisted log on request — done here so the consumer
          * remains the only writer of the debug transport. */
         if (bDumpRequested)
         {
@@ -276,11 +300,11 @@ static void DBGLOG_vConsumerTask(void *arg)
             }
         }
 
-        /* Queue (and any drop marker) now drained — park the NOR flash in
-         * deep-power-down for the idle/STOP2 period that follows. No-op if it
-         * was never woken; the next flash access transparently resumes it. This
-         * is the consumer's last act before it blocks again, so the flash is in
-         * DPD by the time the system reaches STOP2. */
-        FLASH_vDeepPowerDown();
+        /* Queue (and any drop marker) now drained — park the backing storage
+         * for the idle/STOP2 period that follows (NOR flash -> deep-power-down;
+         * MicroSD -> flush partial block + deselect). No-op if it was never
+         * woken. This is the consumer's last act before it blocks again, so the
+         * device is parked by the time the system reaches STOP2. */
+        LOG_vPark();
     }
 }

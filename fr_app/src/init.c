@@ -52,6 +52,12 @@
 #include "Log.h"
 #include "DbgLog.h"
 
+#include "storage_config.h"
+#ifdef STORAGE_BACKEND_MICROSD
+#  include "MicroSD.h"
+#  include "AccLog.h"
+#endif
+
 #include "cmsis_os2.h"
 
 volatile bool systemReadyForSleep = false;
@@ -80,7 +86,13 @@ void INIT_vInitialization(void *parameters)
 
     DBGLOG_vInit();
 
+    /* Bring up the selected storage backend (mutually exclusive HW, same SPI2
+     * bus). LOG_vInit() then recovers the text-log FIFO on whichever is fitted. */
+#ifdef STORAGE_BACKEND_MICROSD
+    MICROSD_vInit();
+#else
     FLASH_vInit();
+#endif
     LOG_vInit();
 
     /* Ask the DbgLog consumer to stream the external-flash log over the debug
@@ -127,6 +139,11 @@ void INIT_vInitialization(void *parameters)
         SOLAR_vInit();
 #ifdef ENABLE_MOVE
         ACC_vInit();
+#  ifdef STORAGE_BACKEND_MICROSD
+        /* Recover the ACC-data write head before the movement task (which feeds
+         * the logger from its 1 Hz FIFO drain) starts ticking. */
+        ACCLOG_vInit();
+#  endif
         MOVE_vInit();
 #endif
 #ifdef ENABLE_GPS

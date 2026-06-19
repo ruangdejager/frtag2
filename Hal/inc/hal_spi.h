@@ -68,6 +68,23 @@ HAL_StatusTypeDef HAL_SPI_FLASH_vReadPacket(uint8_t *rx, uint16_t len);
 #define HAL_SPI_FLASH_vDeselect()                   HAL_GPIO_WritePin(BSP_FLASH_CS_PORT, BSP_FLASH_CS_PIN, GPIO_PIN_SET)
 
 /* -----------------------------------------------------------------------
+ * SPI2 — MicroSD card (alternative population of the SPI2 footprint).
+ * The MicroSD card and the NOR flash are mutually exclusive hardware
+ * (storage_config.h) and share the same SPI2 bus + PA15 CS, so the SD path
+ * reuses the flash select/transfer primitives. The card additionally needs
+ * a software-controllable clock rate: ~250 kHz (/128) for its power-up
+ * handshake, then a faster rate (/8) for block transfers.
+ * ----------------------------------------------------------------------- */
+#define HAL_SPI_SD_vSelect()                        HAL_SPI_FLASH_vSelect()
+#define HAL_SPI_SD_vDeselect()                      HAL_SPI_FLASH_vDeselect()
+#define HAL_SPI_SD_vSpiWritePacket(tx, len)         HAL_SPI_Transmit(&hFlashSpi, (uint8_t *)(tx), (len), SPI_TIMEOUT)
+#define HAL_SPI_SD_vSpiReadPacket(rx, len)          HAL_SPI_FLASH_vReadPacket((rx), (len))
+#define HAL_SPI_SD_vSpiReadWrite(tx, rx, len)       HAL_SPI_TransmitReceive(&hFlashSpi, (uint8_t *)(tx), (rx), (len), SPI_TIMEOUT)
+
+/* Re-configure the shared SPI2 bus to a new baud prescaler (SPI_BAUDRATEPRESCALER_*). */
+void HAL_SPI_SD_vSetSpeed(uint32_t u32Prescaler);
+
+/* -----------------------------------------------------------------------
  * Shared init — call once at boot and once after every STOP2 wake.
  * Initialises both SPI1 (ACC) and SPI2 (flash) in a single call.
  * ----------------------------------------------------------------------- */

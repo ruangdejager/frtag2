@@ -49,6 +49,11 @@ void DBGLOG_vPutVerbose(uint8_t dest, const char *format, ...);
  * interleaving with live log output). */
 void DBGLOG_vRequestDump(void);
 
+/* Ask the consumer task to erase the whole text log (flash chip-erase / SD log
+ * region reset). Done from the consumer so it never races the consumer's own
+ * log writes on the shared storage device. */
+void DBGLOG_vRequestErase(void);
+
 /* Compatibility wrappers (UART-only / flash-only). */
 void DBGLOG_vPutDebug(const char *format, ...);
 void DBGLOG_vPutLog(const char *format, ...);

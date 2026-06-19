@@ -22,6 +22,11 @@ uint32_t LOG_u32GetUsedBytes(void);
 uint8_t  LOG_u8GetUsedPercent(void);
 void     LOG_vErase(void);
 
+/* Release the backing storage device for the idle/STOP2 period that follows
+ * (NOR flash -> deep-power-down; MicroSD -> flush any partial block + deselect).
+ * Called by the DbgLog consumer as its last act before it blocks. */
+void     LOG_vPark(void);
+
 /* Stream the entire log FIFO (oldest → newest) out the debug transport via
  * DEBUG_vPutBuffer. Intended as a test/readback hook; call when no task is
  * concurrently writing the log (e.g. at boot right after LOG_vInit). */
