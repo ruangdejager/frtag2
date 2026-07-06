@@ -95,7 +95,11 @@ static void HAL_SPI_vInitAccHw(void)
     bAccSpiParked = false;
 }
 
-static void HAL_SPI_vInitFlashHw(void)
+/* Configure SPI2 at the given baud prescaler. The flash runs at a fixed /64;
+ * the MicroSD card (same SPI2 bus, mutually exclusive HW) needs a slow /128
+ * for its init handshake and a faster rate for block I/O, so the prescaler is
+ * a parameter here. */
+static void HAL_SPI_vInitFlashHwPrescaled(uint32_t u32Prescaler)
 {
     hFlashSpi.State                  = HAL_SPI_STATE_RESET;
     hFlashSpi.Instance               = FLASH_SPI;
@@ -105,7 +109,7 @@ static void HAL_SPI_vInitFlashHw(void)
     hFlashSpi.Init.CLKPolarity       = SPI_POLARITY_LOW;
     hFlashSpi.Init.CLKPhase          = SPI_PHASE_1EDGE;
     hFlashSpi.Init.NSS               = SPI_NSS_SOFT;
-    hFlashSpi.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64;  /* ~0.5 MHz at 32 MHz PCLK */
+    hFlashSpi.Init.BaudRatePrescaler = u32Prescaler;
     hFlashSpi.Init.FirstBit          = SPI_FIRSTBIT_MSB;
     hFlashSpi.Init.TIMode            = SPI_TIMODE_DISABLE;
     hFlashSpi.Init.CRCCalculation    = SPI_CRCCALCULATION_DISABLE;
@@ -114,6 +118,18 @@ static void HAL_SPI_vInitFlashHw(void)
     hFlashSpi.Init.NSSPMode          = SPI_NSS_PULSE_ENABLE;
     HAL_SPI_Init(&hFlashSpi);
     bFlashSpiParked = false;
+}
+
+static void HAL_SPI_vInitFlashHw(void)
+{
+    HAL_SPI_vInitFlashHwPrescaled(SPI_BAUDRATEPRESCALER_64);  /* ~0.5 MHz at 32 MHz PCLK */
+}
+
+/* Re-configure the shared SPI2 bus to a new baud prescaler for the MicroSD
+ * driver. Clears any parked flag (the bus is live again on return). */
+void HAL_SPI_SD_vSetSpeed(uint32_t u32Prescaler)
+{
+    HAL_SPI_vInitFlashHwPrescaled(u32Prescaler);
 }
 
 void HAL_SPI_vInit(void)
@@ -187,10 +203,13 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef *spiHandle)
         HAL_GPIO_Init(BSP_FLASH_CS_PORT, &GPIO_InitStruct);
         HAL_GPIO_WritePin(BSP_FLASH_CS_PORT, BSP_FLASH_CS_PIN, GPIO_PIN_SET);
 
-        /* PA5 (MISO) — AF3 (SPI2_MISO on port A) */
+        /* PA5 (MISO) — AF3 (SPI2_MISO on port A).
+         * Pull-up keeps the line defined when neither flash nor SD card is
+         * driving it (deselected or absent); required by the SD SPI spec
+         * and harmless for the NOR flash. */
         GPIO_InitStruct.Pin       = BSP_FLASH_MISO_PIN;
         GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
-        GPIO_InitStruct.Pull      = GPIO_NOPULL;
+        GPIO_InitStruct.Pull      = GPIO_PULLUP;
         GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_LOW;
         GPIO_InitStruct.Alternate = GPIO_AF3_SPI2;
         HAL_GPIO_Init(BSP_FLASH_MISO_PORT, &GPIO_InitStruct);

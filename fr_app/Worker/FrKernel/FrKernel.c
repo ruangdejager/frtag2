@@ -49,6 +49,12 @@
 #include "LoraRadio.h"
 #include "DeviceDiscovery.h"
 
+#include "storage_config.h"
+#include "DbgLog.h"
+#ifdef STORAGE_BACKEND_MICROSD
+#  include "AccLog.h"
+#endif
+
 #ifdef FRKERNEL_INTERFACE_UART
 #  include "Debug.h"
 #endif
@@ -195,6 +201,24 @@ static void FRKERNEL_vProcessCommand(const char *line)
             "  tag <ID> release            release device for sleep\r\n"
         );
 #endif
+#if defined(STORAGE_BACKEND_FLASH) && defined(FRKERNEL_INTERFACE_UART)
+        FRKERNEL_vRespond(
+            "  tag flash clear             erase ext-flash log\r\n"
+            "  tag flash stream            stream ext-flash log\r\n");
+#elif defined(STORAGE_BACKEND_FLASH)
+        FRKERNEL_vRespond(
+            "  tag <ID> flash clear        erase ext-flash log\r\n"
+            "  tag <ID> flash stream       stream ext-flash log\r\n");
+#endif
+#if defined(STORAGE_BACKEND_MICROSD) && defined(FRKERNEL_INTERFACE_UART)
+        FRKERNEL_vRespond(
+            "  tag sd clear                wipe MicroSD (logs + acc)\r\n"
+            "  tag sd log stream           stream MicroSD log\r\n");
+#elif defined(STORAGE_BACKEND_MICROSD)
+        FRKERNEL_vRespond(
+            "  tag <ID> sd clear           wipe MicroSD (logs + acc)\r\n"
+            "  tag <ID> sd log stream      stream MicroSD log\r\n");
+#endif
     }
     else if (strcmp(p, "battery") == 0)
     {
@@ -212,6 +236,34 @@ static void FRKERNEL_vProcessCommand(const char *line)
         DEVICE_DISCOVERY_vEnterProductionSleep();
         FRKERNEL_vRespond("ProductionSleep entered — wakes on Vsolar >= 3000 mV\r\n");
     }
+#ifdef STORAGE_BACKEND_FLASH
+    else if (strcmp(p, "flash clear") == 0)
+    {
+        /* Routed through the DbgLog consumer so it can't race log writes. */
+        DBGLOG_vRequestErase();
+        FRKERNEL_vRespond("Ext-flash log erase requested\r\n");
+    }
+    else if (strcmp(p, "flash stream") == 0)
+    {
+        DBGLOG_vRequestDump();   /* consumer streams oldest -> newest */
+        FRKERNEL_vRespond("Streaming ext-flash log...\r\n");
+    }
+#endif
+#ifdef STORAGE_BACKEND_MICROSD
+    else if (strcmp(p, "sd clear") == 0)
+    {
+        /* Wipe the whole card: log FIFO (via the consumer) + ACC write head
+         * (deferred to the movement task). Both avoid racing their owners. */
+        DBGLOG_vRequestErase();
+        ACCLOG_vRequestErase();
+        FRKERNEL_vRespond("MicroSD wipe requested (logs + acc data)\r\n");
+    }
+    else if (strcmp(p, "sd log stream") == 0)
+    {
+        DBGLOG_vRequestDump();   /* log region only; no acc-data stream by design */
+        FRKERNEL_vRespond("Streaming MicroSD log...\r\n");
+    }
+#endif
     else
     {
         snprintf(resp, sizeof(resp), "Unknown: '%s'. Try 'tag -help'\r\n", p);

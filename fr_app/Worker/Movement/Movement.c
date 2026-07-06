@@ -24,6 +24,12 @@
 #include "Acc.h"
 #include "DeviceDiscovery.h"
 
+#include "storage_config.h"
+#ifdef STORAGE_BACKEND_MICROSD
+#  include "AccLog.h"
+#  include "platform_rtc.h"
+#endif
+
 /* --------------------------------------------------------------------------
  * Internal types
  * -------------------------------------------------------------------------- */
@@ -119,7 +125,24 @@ static void MOVE_vTask(void *arg)
     for (;;)
     {
         osThreadFlagsWait(0x0001U, osFlagsWaitAny, osWaitForever);
+
+#ifdef STORAGE_BACKEND_MICROSD
+        /* Log this tick's raw ACC FIFO to the MicroSD ACC region, timestamped
+         * at 1 Hz. Suppressed in production sleep (per requirement). The FIFO is
+         * drained once, inside MOVE_vEvalMovementLevel; ACCLOG_vAddSample() is
+         * called there as each raw sample is read. */
+        bool bLogAcc = (DEVICE_DISCOVERY_eGetProductionState() != PRODUCTION_SLEEP);
+        if (bLogAcc)
+            ACCLOG_vBeginTick(RTC_u64GetUTC());
+#endif
+
         MOVE_vEvalMovementLevel();
+
+#ifdef STORAGE_BACKEND_MICROSD
+        if (bLogAcc)
+            ACCLOG_vEndTick();
+#endif
+
         MOVE_vUpdateState();
         MOVE_vSequenceTick();
 
@@ -284,6 +307,13 @@ static bool MOVE_bUpdateMovementLevel(uint8_t *pu8Level)
         AccHealth.u8NoSampleErrorCnt = 0;
 
         ACC_vGetAccSample(&AccMoveDev);
+
+#ifdef STORAGE_BACKEND_MICROSD
+        /* Capture the raw XYZ sample for the MicroSD ACC log before it is
+         * scaled/clamped below for the movement algorithm. No-op unless a tick
+         * is open (ACCLOG_vBeginTick was called this 1 Hz cycle). */
+        ACCLOG_vAddSample(AccMoveDev.au8Data);
+#endif
 
         AccMoveDev.i16.i16OutX /= MOVE_ACC_RAW_SCALE_VALUE;
         AccMoveDev.i16.i16OutY /= MOVE_ACC_RAW_SCALE_VALUE;

@@ -16,6 +16,10 @@
  * then a byte-scan within it for the exact write head.
  */
 
+#include "storage_config.h"
+
+#ifdef STORAGE_BACKEND_FLASH
+
 #include "Log.h"
 #include "Flash.h"
 #include "Flash_Config.h"
@@ -253,3 +257,14 @@ void LOG_vStreamToDebug(void)
     static const char end[] = "\r\n==== EXT-FLASH LOG DUMP END ====\r\n";
     DEBUG_vPutBuffer((const uint8_t *)end, (uint16_t)(sizeof(end) - 1U));
 }
+
+/* -------------------------------------------------------------------------- */
+
+void LOG_vPark(void)
+{
+    /* Park the NOR flash in deep-power-down for the idle/STOP2 period. No-op
+     * if it was never woken; the next flash access transparently resumes it. */
+    FLASH_vDeepPowerDown();
+}
+
+#endif /* STORAGE_BACKEND_FLASH */
