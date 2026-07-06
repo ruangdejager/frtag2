@@ -23,7 +23,11 @@
  * so it stays at 32 for now - fine for the present 3-node test. Revisit with a
  * RAM reclaim before scaling the fleet. (uint8 head/count allow up to 255.) */
 #define FORWARD_RING_SIZE             32
-#define MESH_MAX_NEIGHBORS            128
+/* 120 (was 128): freed 160 B of .bss for the superOptimise fixes on a part
+ * whose RAM was byte-exact full. Still far beyond a realistic per-primary
+ * fleet — D-Acks carry 8 ids per 2 s, so even 120 nodes need ~30 s of ack
+ * airtime per campaign. */
+#define MESH_MAX_NEIGHBORS            120
 
 /* A beaconing node gives up (becomes forwarder) after whichever comes first —
  * bounds airtime if its D-Ack is silently lost. */
@@ -163,6 +167,12 @@ void MESHNETWORK_vSendTimeSync(uint32_t u32UtcTimestamp,
                                WakeupInterval tWakeupInterval);
 
 void MESHNETWORK_vStopBeaconing(uint32_t u32DreqId);
+/* Stop when the acking primary matches the beacon dreq's ORIGIN (dreq >> 16) —
+ * used by the D-Ack path so a newer-wave ack still stops an older-wave beacon. */
+void MESHNETWORK_vStopBeaconingByOrigin(uint32_t u32DreqId);
+/* Stop whatever dreq this node is currently beaconing (secondary campaign end —
+ * the caller doesn't know the node's internal beacon dreq id). */
+void MESHNETWORK_vStopBeaconingSelf(void);
 bool MESHNETWORK_bIsBeaconing(void);     /* true while this node is beaconing */
 void MESHNETWORK_vFlushTxQueue(void);    /* drop any pending TX (call on campaign wake) */
 bool MESHNETWORK_bGetDiscoveredNeighbors(MeshDiscoveredNeighbor_t *pBuffer,

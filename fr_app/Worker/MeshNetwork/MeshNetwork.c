@@ -118,6 +118,15 @@ static uint32_t   u32NodeBeaconStartTick = 0;
  * Reset by DeviceDiscovery at the start of each wake cycle. */
 static bool       bTimeSyncAcceptedThisWake = false;
 
+/* I2: TimeSync dedup. Previously the raw UTC timestamp was inserted into the
+ * shared forward ring alongside msg-ids of the form (deviceId16<<16)|ctr —
+ * epoch seconds numerically collide with msg-ids from device ids in the
+ * 0x69xx range (2026+), silently dropping that node's packets as "seen".
+ * Track TimeSync separately: only a strictly newer UTC propagates, which also
+ * drops late echoes of older TimeSyncs. */
+static uint32_t   u32LastTimeSyncUtc  = 0;
+static bool       bTimeSyncUtcValid   = false;
+
 /* ---- Wakeup interval ---- */
 static WakeupInterval tCurrentWakeupInterval = WAKEUP_INTERVAL_60_MIN;
 static const uint8_t u8CurrentWakeupIntervalMin[] = {
@@ -366,10 +375,34 @@ static bool MESHNETWORK_bTxSendRaw(const uint8_t *pBuf, size_t u32Len)
     return LORARADIO_bTxPacket(&tTx);
 }
 
+/* Fleet-decorrelated PRNG for TX jitter. libc rand() was never seeded, so
+ * every node produced the IDENTICAL jitter sequence — the jitter meant to
+ * de-correlate many nodes answering one DReq instead synchronised their
+ * collisions. xorshift32 seeded per-node (radio RNG ^ unique ID) at init;
+ * cheap enough for the parser/TX task paths and needs no radio access
+ * (SUBGRF_GetRandom would touch radio state from a non-radio task). */
+static uint32_t u32JitterRngState = 1U;
+
+static void MESHNETWORK_vSeedJitterRng(uint32_t u32Seed)
+{
+    if (u32Seed == 0U) u32Seed = 0xA5A5A5A5U;   /* xorshift must not be 0 */
+    u32JitterRngState = u32Seed;
+}
+
+static uint32_t MESHNETWORK_u32JitterRand(void)
+{
+    uint32_t x = u32JitterRngState;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    u32JitterRngState = x;
+    return x;
+}
+
 static uint32_t MESHNETWORK_u32GetTxJitterMs(void)
 {
     uint32_t u32Range = MESH_TX_JITTER_MAX_MS - MESH_TX_JITTER_MIN_MS;
-    return MESH_TX_JITTER_MIN_MS + (rand() % (u32Range + 1));
+    return MESH_TX_JITTER_MIN_MS + (MESHNETWORK_u32JitterRand() % (u32Range + 1));
 }
 
 /* --------------------------------------------------------------------------
@@ -475,16 +508,17 @@ static void MESHNETWORK_vBuildAndQueueAck(void)
 
     if (osMutexAcquire(xNeighborTableMutex, 100) == osOK)
     {
+        /* Collect un-acked ids WITHOUT marking them yet — if the encode or
+         * enqueue below fails (e.g. TX queue full mid-campaign), a premature
+         * bAcked would mean those nodes are never acked on-air and beacon
+         * until their cap. Mark only after the packet is safely queued. */
         uint8_t u8Added = 0;
         for (uint16_t i = 0;
              i < u16NeighborCount && u8Added < MESH_MAX_ACK_IDS_PER_PACKET;
              i++)
         {
             if (!tNeighborTable[i].bAcked)
-            {
                 tAck.u32AckedIds[u8Added++] = tNeighborTable[i].u32DeviceId;
-                tNeighborTable[i].bAcked    = true;
-            }
         }
         tAck.u8AckCount = u8Added;
         osMutexRelease(xNeighborTableMutex);
@@ -493,11 +527,29 @@ static void MESHNETWORK_vBuildAndQueueAck(void)
         {
             uint8_t u8Buf[128];
             size_t  u32Len = 0;
+            bool    bQueued = false;
             if (MESHNETWORK_bEncodeDAck(&tAck, u8Buf, sizeof(u8Buf), &u32Len))
             {
                 FORWARD_vAdd(tAck.u32AckMsgId);
-                MESHNETWORK_bSendPacket(u8Buf, u32Len);
-                EVTLOG(LOG_TX_ACK, 1);
+                bQueued = MESHNETWORK_bSendPacket(u8Buf, u32Len);
+                if (bQueued)
+                    EVTLOG(LOG_TX_ACK, 1);
+            }
+
+            if (bQueued && osMutexAcquire(xNeighborTableMutex, 100) == osOK)
+            {
+                for (uint8_t a = 0; a < tAck.u8AckCount; a++)
+                {
+                    for (uint16_t i = 0; i < u16NeighborCount; i++)
+                    {
+                        if (tNeighborTable[i].u32DeviceId == tAck.u32AckedIds[a])
+                        {
+                            tNeighborTable[i].bAcked = true;
+                            break;
+                        }
+                    }
+                }
+                osMutexRelease(xNeighborTableMutex);
             }
         }
     }
@@ -776,7 +828,10 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
         {
             if (u32Ids[i] == u32MyId)
             {
-                MESHNETWORK_vStopBeaconing(u32DreqId);
+                /* I1: match on the ack's origin primary, not the exact dreq —
+                 * the primary issues a new dreq per wave, and an ack carrying
+                 * a newer wave's dreq must still stop a wave-1 beaconer. */
+                MESHNETWORK_vStopBeaconingByOrigin(u32DreqId);
                 break;
             }
         }
@@ -800,14 +855,19 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
     FLASHLOG_vEncodeRXLogValue(&u32LogValue, 0, s16Rssi, 0);
     EVTLOG(LOG_RX_TS, u32LogValue);
 
-    if (FORWARD_bHasSeen(u32Utc))
+    /* I2: dedicated dedup — only a strictly newer UTC propagates (also kills
+     * late echoes of older TimeSyncs). Not the shared msg-id ring: raw UTC
+     * values alias msg-ids of nodes with device ids in the current-epoch
+     * numeric range, which would silently drop their packets. */
+    if (bTimeSyncUtcValid && (int32_t)(u32Utc - u32LastTimeSyncUtc) <= 0)
     {
 #ifdef MESH_LOG_VERBOSE
         DBG_LOG("MeshNetwork: TimeSync seen before\r\n");
 #endif
         return;
     }
-    FORWARD_vAdd(u32Utc);
+    u32LastTimeSyncUtc = u32Utc;
+    bTimeSyncUtcValid  = true;
 
     /* Multi-primary: primaries have authoritative time from the logger
      * and must not accept TimeSync from a peer primary. Drop silently
@@ -942,6 +1002,10 @@ void MESHNETWORK_vInit(void)
      * in their dedup rings (which would silently drop its packets). */
     u16MsgCounter = (uint16_t)LORARADIO_u32GetRandomNumber(0xFFFF);
 
+    /* Seed the TX-jitter PRNG per node (see MESHNETWORK_u32JitterRand). */
+    MESHNETWORK_vSeedJitterRng(LORARADIO_u32GetRandomNumber(0xFFFFFFFEU) ^
+                               (LORARADIO_u32GetUniqueId() * 2654435761U));
+
     memset(&tForwardRing,   0, sizeof(tForwardRing));
     memset(tNeighborTable,  0, sizeof(tNeighborTable));
 
@@ -1018,7 +1082,10 @@ void MESHNETWORK_vSendTimeSync(uint32_t u32UtcTimestamp,
     uint8_t u8Buf[16];
     size_t  u32Len = 0;
     if (!MESHNETWORK_bEncodeTimeSync(&tTs, u8Buf, sizeof(u8Buf), &u32Len)) return;
-    FORWARD_vAdd(u32UtcTimestamp);
+    /* I2: record in the dedicated TimeSync tracker (not the msg-id ring) so
+     * echoes of our own TimeSync are not re-forwarded. */
+    u32LastTimeSyncUtc = u32UtcTimestamp;
+    bTimeSyncUtcValid  = true;
     MESHNETWORK_bSendPacket(u8Buf, u32Len);
     DBG_LOG("MeshNetwork: TimeSync sent %u interval=%u\r\n",
         u32UtcTimestamp, tWakeupInterval);
@@ -1059,6 +1126,47 @@ static bool MESHNETWORK_bStopBeaconingLocked(uint32_t u32DreqId)
     u32NodeBeaconDreqId = 0;
     eNodeRole           = NODE_ROLE_FORWARDER;
     return true;
+}
+
+/* I1: stop when the D-Ack came from the SAME primary, even if its dreq id is
+ * a newer wave than the one this node anchored to. The primary generates a
+ * new dreq per wave, so an exact-dreq match leaves a wave-1 beaconer acked
+ * during wave 2 beaconing until its cap. Origin (dreq >> 16) is the primary's
+ * 16-bit id, so this stays multi-primary safe. */
+void MESHNETWORK_vStopBeaconingByOrigin(uint32_t u32DreqId)
+{
+    bool bDoStop = false;
+    if (osMutexAcquire(xRoleMutex, 100) == osOK)
+    {
+        if (bNodeBeaconing &&
+            (u32NodeBeaconDreqId >> 16) == (u32DreqId >> 16))
+        {
+            bDoStop = MESHNETWORK_bStopBeaconingLocked(u32NodeBeaconDreqId);
+        }
+        osMutexRelease(xRoleMutex);
+    }
+    if (bDoStop)
+    {
+        osTimerStop(xBeaconTimer);
+        DBG_LOG("MeshNetwork: Stop beaconing (acked), become forwarder\r\n");
+    }
+}
+
+/* B4: stop whatever dreq this node is currently beaconing (campaign end on a
+ * secondary — the caller doesn't know the node's internal beacon dreq). */
+void MESHNETWORK_vStopBeaconingSelf(void)
+{
+    bool bDoStop = false;
+    if (osMutexAcquire(xRoleMutex, 100) == osOK)
+    {
+        bDoStop = MESHNETWORK_bStopBeaconingLocked(u32NodeBeaconDreqId);
+        osMutexRelease(xRoleMutex);
+    }
+    if (bDoStop)
+    {
+        osTimerStop(xBeaconTimer);
+        DBG_LOG("MeshNetwork: Stop beaconing (campaign end), become forwarder\r\n");
+    }
 }
 
 static void MESHNETWORK_vStartBeaconing(uint32_t u32DreqId, uint8_t u8HopCount)
