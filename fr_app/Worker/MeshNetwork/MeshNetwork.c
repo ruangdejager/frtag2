@@ -17,16 +17,12 @@
  */
 
 #include "MeshNetwork.h"
-#include "MeshNetwork_Port.h"
 #include "LoraRadio.h"
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"   /* configMINIMAL_STACK_SIZE */
 #include "task.h"
 
 #include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <limits.h>
 
 #include "dbg_log.h"
 #include "DeviceDiscovery.h"
@@ -40,10 +36,6 @@
 #ifdef ENABLE_MOVE
 #include "Movement.h"
 #endif
-
-/* ---- Local config aliases ---- */
-#define MESH_BEACON_INTERVAL_MS_CFG      MESH_BEACON_INTERVAL_MS
-#define MESH_PRIMARY_ACK_INTERVAL_MS_CFG MESH_PRIMARY_ACK_INTERVAL_MS
 
 /* ---- DBeacon flags byte (byte 15) ---- */
 #define MESH_BEACON_FLAG_STILL      0x01U   /* bit0: 1 = still, 0 = moving */
@@ -61,11 +53,13 @@
  * the beacon with no GPS rather than a position that no longer reflects where
  * the animal is. */
 #define MESH_GPS_FIX_MAX_AGE_S      300U
-#define MESH_DISCOVERY_IDLE_MS_CFG       MESH_DISCOVERY_IDLE_MS
 
-/* ---- TX queue item ---- */
+/* ---- TX queue item ----
+ * Item buffer 64 (was 128): the largest mesh frame is a full D-Ack at
+ * 10 + 8*4 = 42 B (beacon 24, DReq 7, TimeSync 6); FrKernel responses bypass
+ * this queue entirely. 24 x 64 B saves ~1.5 KB of heap vs 128. */
 #define MESH_TX_QUEUE_LEN        24
-#define MESH_TX_MAX_PACKET_SIZE  128
+#define MESH_TX_MAX_PACKET_SIZE  64
 
 /* ---- MeshTx task thread flags ----
  * The periodic beacon/ack software-timer callbacks run in the FreeRTOS Timer
@@ -162,6 +156,7 @@ static bool MESHNETWORK_bSendPacket(const uint8_t *pBuf, size_t u32Len);
 static void MESHNETWORK_vStartBeaconing(uint32_t u32DreqId, uint8_t u8HopCount);
 static NodeRole_e MESHNETWORK_eGetRole(void);
 static bool MESHNETWORK_bStopBeaconingLocked(uint32_t u32DreqId);
+static void MESHNETWORK_vStopBeaconingByOrigin(uint32_t u32DreqId);
 
 /* --------------------------------------------------------------------------
  * Endian helpers (on-wire big-endian)
@@ -1133,7 +1128,7 @@ static bool MESHNETWORK_bStopBeaconingLocked(uint32_t u32DreqId)
  * new dreq per wave, so an exact-dreq match leaves a wave-1 beaconer acked
  * during wave 2 beaconing until its cap. Origin (dreq >> 16) is the primary's
  * 16-bit id, so this stays multi-primary safe. */
-void MESHNETWORK_vStopBeaconingByOrigin(uint32_t u32DreqId)
+static void MESHNETWORK_vStopBeaconingByOrigin(uint32_t u32DreqId)
 {
     bool bDoStop = false;
     if (osMutexAcquire(xRoleMutex, 100) == osOK)
@@ -1189,27 +1184,12 @@ static void MESHNETWORK_vStartBeaconing(uint32_t u32DreqId, uint8_t u8HopCount)
     if (bDoStart)
     {
         /* Periodic retries... */
-        osTimerStart(xBeaconTimer, MESH_BEACON_INTERVAL_MS_CFG);
+        osTimerStart(xBeaconTimer, MESH_BEACON_INTERVAL_MS);
         /* ...plus R1: fire the FIRST beacon immediately (built on the MeshTx
          * full stack), not after a full interval. */
         if (xMeshTxTaskHandle != NULL)
             osThreadFlagsSet(xMeshTxTaskHandle, MESH_TX_FLAG_BEACON);
         DBG_LOG("MeshNetwork: Start beaconing dreq=%08X\r\n", u32DreqId);
-    }
-}
-
-void MESHNETWORK_vStopBeaconing(uint32_t u32DreqId)
-{
-    bool bDoStop = false;
-    if (osMutexAcquire(xRoleMutex, 100) == osOK)
-    {
-        bDoStop = MESHNETWORK_bStopBeaconingLocked(u32DreqId);
-        osMutexRelease(xRoleMutex);
-    }
-    if (bDoStop)
-    {
-        osTimerStop(xBeaconTimer);
-        DBG_LOG("MeshNetwork: Stop beaconing, become forwarder\r\n");
     }
 }
 
@@ -1260,7 +1240,7 @@ uint64_t MESHNETWORK_u64GetLastPrimaryHeardTick(void) { return u64LastPrimaryHea
 void MESHNETWORK_vStartPrimaryAck(void)
 {
     if (xPrimaryAckTimer != NULL)
-        osTimerStart(xPrimaryAckTimer, MESH_PRIMARY_ACK_INTERVAL_MS_CFG);
+        osTimerStart(xPrimaryAckTimer, MESH_PRIMARY_ACK_INTERVAL_MS);
 }
 void MESHNETWORK_vStopPrimaryAck(void)
 {

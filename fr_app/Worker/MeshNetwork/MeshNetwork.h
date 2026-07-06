@@ -74,13 +74,6 @@ typedef enum {
 /* ---- On-wire packet structs ---- */
 typedef struct {
     uint32_t u32DreqId;
-    uint32_t u32OriginId;
-    uint32_t u32SenderId;
-    uint8_t  u8SenderHopCount;
-} MeshPktDReq_t;
-
-typedef struct {
-    uint32_t u32DreqId;
     uint32_t u32DeviceId;
     uint16_t u16BatMv;
     uint8_t  u8HopCount;
@@ -166,10 +159,6 @@ bool MESHNETWORK_bStartDiscoveryRound(uint32_t u32DreqId);
 void MESHNETWORK_vSendTimeSync(uint32_t u32UtcTimestamp,
                                WakeupInterval tWakeupInterval);
 
-void MESHNETWORK_vStopBeaconing(uint32_t u32DreqId);
-/* Stop when the acking primary matches the beacon dreq's ORIGIN (dreq >> 16) —
- * used by the D-Ack path so a newer-wave ack still stops an older-wave beacon. */
-void MESHNETWORK_vStopBeaconingByOrigin(uint32_t u32DreqId);
 /* Stop whatever dreq this node is currently beaconing (secondary campaign end —
  * the caller doesn't know the node's internal beacon dreq id). */
 void MESHNETWORK_vStopBeaconingSelf(void);

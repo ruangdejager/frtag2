@@ -21,9 +21,6 @@
 
 #include "main.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-
 #include "dbg_log.h"
 #include "platform_rtc.h"
 #include "hal_rtc.h"
@@ -84,7 +81,9 @@ void DEVICE_DISCOVERY_vInit(void)
     configASSERT(DeviceDiscoveryAppTask_handle    != NULL);
     configASSERT(DeviceDiscoveryWakeupTask_handle != NULL);
 
+    /* Capture the reset cause — first clue in a field post-mortem. */
     uint32_t u32ModifiedCSR = u32GetCSR() >> 5;
+    DBG_LOG("DeviceDiscovery: reset cause CSR=0x%lX\r\n", u32ModifiedCSR);
     EVTLOG(LOG_RESET_CAUSE, u32ModifiedCSR);
 
     DBG_LOG("DeviceDiscovery: Initialized.\r\n");
@@ -380,7 +379,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
         DBG_LOG("DeviceDiscovery: Waiting for synchronized wake-up...\r\n");
         osDelay(100);
-//        BSP_LED_Off(LED_YELLOW);
         LORARADIO_vEnterDeepSleep();
 
         /* Campaign complete — release the sleep lock taken when this wake
@@ -463,7 +461,6 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             continue;
         }
 
-//        BSP_LED_Toggle(LED_YELLOW);
         /* --- Discovery wake trigger: once per interval slot (B6) --- */
         bool bFireDiscovery = false;
         if (!bSlotValid)
