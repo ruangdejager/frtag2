@@ -164,22 +164,31 @@ bool MICROSD_vInit(void)
     MICROSD_DRIVER_vDeselect();
     SD_vClock(20U);                                        /* 160 clocks */
 
-    MICROSD_DRIVER_vSelect();
-
     bool bIdle = false;
+    uint8_t u8LastR1 = 0xFFU;
     for (uint8_t i = 0U; i < 10U; i++)
     {
-        if (SD_u8SendCmd(SD_CMD0_GO_IDLE_STATE, 0U, 0x95U) == SD_R1_IDLE_STATE)
+        /* Deassert CS, give one trailing clock, then reassert before each
+         * CMD0 attempt — required by the SD SPI spec for proper retry. */
+        MICROSD_DRIVER_vDeselect();
+        SD_vClock(1U);
+        MICROSD_DRIVER_vSelect();
+
+        u8LastR1 = SD_u8SendCmd(SD_CMD0_GO_IDLE_STATE, 0U, 0x95U);
+        (void)SD_u8Xchg(0xFFU);   /* trailing clock after R1 */
+
+        if (u8LastR1 == SD_R1_IDLE_STATE)
         {
             bIdle = true;
             break;
         }
-        osDelay(10U);   /* give the card time between retries */
+        osDelay(10U);
     }
     if (!bIdle)
     {
         SD_vDeselectIdle();
-        DBG_LOG("MicroSD: CMD0 (go-idle) failed\r\n");
+        DBG_LOG("MicroSD: CMD0 (go-idle) failed (last R1=0x%02X)\r\n",
+                (unsigned)u8LastR1);
         return false;
     }
 
