@@ -165,7 +165,6 @@ bool MICROSD_vInit(void)
     SD_vClock(20U);                                        /* 160 clocks */
 
     bool bIdle = false;
-    uint8_t u8LastR1 = 0xFFU;
     for (uint8_t i = 0U; i < 10U; i++)
     {
         /* Deassert CS, give one trailing clock, then reassert before each
@@ -174,10 +173,10 @@ bool MICROSD_vInit(void)
         SD_vClock(1U);
         MICROSD_DRIVER_vSelect();
 
-        u8LastR1 = SD_u8SendCmd(SD_CMD0_GO_IDLE_STATE, 0U, 0x95U);
+        uint8_t u8R1 = SD_u8SendCmd(SD_CMD0_GO_IDLE_STATE, 0U, 0x95U);
         (void)SD_u8Xchg(0xFFU);   /* trailing clock after R1 */
 
-        if (u8LastR1 == SD_R1_IDLE_STATE)
+        if (u8R1 == SD_R1_IDLE_STATE)
         {
             bIdle = true;
             break;
@@ -187,8 +186,7 @@ bool MICROSD_vInit(void)
     if (!bIdle)
     {
         SD_vDeselectIdle();
-        DBG_LOG("MicroSD: CMD0 (go-idle) failed (last R1=0x%02X)\r\n",
-                (unsigned)u8LastR1);
+        DBG_LOG("MicroSD: CMD0 (go-idle) failed\r\n");
         return false;
     }
 
