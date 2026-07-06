@@ -154,10 +154,15 @@ bool MICROSD_vInit(void)
     /* No other task touches the SD bus until init returns, so the command
      * sequence below runs without taking the mutex. */
 
-    /* >=74 clocks with CS de-asserted at <=400 kHz to enter SPI mode. */
+    /* SD power-up: VDD must be stable for >=250 ms before the init clocks.
+     * The MCU boots in <50 ms, so we pay the remainder here. */
+    osDelay(250U);
+
+    /* >=74 clocks with CS de-asserted at <=400 kHz to enter SPI mode.
+     * Use 20 bytes (160 clocks) — some cards need more than the 74-clock minimum. */
     MICROSD_DRIVER_vSetSpeed(SPI_BAUDRATEPRESCALER_128);   /* ~250 kHz */
     MICROSD_DRIVER_vDeselect();
-    SD_vClock(10U);                                        /* 80 clocks */
+    SD_vClock(20U);                                        /* 160 clocks */
 
     MICROSD_DRIVER_vSelect();
 
@@ -169,6 +174,7 @@ bool MICROSD_vInit(void)
             bIdle = true;
             break;
         }
+        osDelay(10U);   /* give the card time between retries */
     }
     if (!bIdle)
     {
