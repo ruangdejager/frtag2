@@ -37,4 +37,28 @@ uint64_t FARMRANGER_u64RequestTimestamp(void);
 uint8_t  FARMRANGER_u8RequestInterval(void);
 bool     FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count);
 
+/* ---- Firmware-file pull (OTA acquire, see Worker/OtaUpdate) ----
+ * Protocol (tag is master): AT+FWREQ queries what the logger holds;
+ * AT+FWGET=<offset>,<len> pulls one block — the logger answers with exactly
+ * <len> raw file bytes followed by a "FB,<offset>,<xor8hex>" trailer line;
+ * AT+FWDONE=OK/ERR reports the outcome. Raw block bytes are captured into a
+ * caller buffer via the block-capture hook in the RX task (bypassing the
+ * 48-byte line path). */
+
+/* FW query outcome. */
+typedef enum {
+    FARMRANGER_FW_NONE = 0,     /* logger holds no tag firmware            */
+    FARMRANGER_FW_WAIT,         /* logger is warming its modem — poll again */
+    FARMRANGER_FW_AVAILABLE     /* version + file size returned            */
+} FarmrangerFw_e;
+
+FarmrangerFw_e FARMRANGER_eFwQuery(uint32_t *pu32Version, uint32_t *pu32FileBytes);
+
+/* Pull one raw file block into pu8Buf. Returns true when exactly u16Len
+ * bytes arrived AND the trailer's offset and XOR-8 match the captured data. */
+bool FARMRANGER_bFwGetBlock(uint32_t u32Offset, uint16_t u16Len, uint8_t *pu8Buf);
+
+/* Report the transfer outcome to the logger. */
+bool FARMRANGER_bFwReportDone(bool bOk);
+
 #endif /* DEVICE_FARMRANGER_FARMRANGER_H_ */

@@ -37,6 +37,11 @@
 #include "Debug.h"
 #include "FrKernel.h"
 
+#include "storage_config.h"
+#ifdef STORAGE_BACKEND_FLASH
+#  include "OtaUpdate.h"
+#endif
+
 /* ---- Private defines ---- */
 #define APP_TASK_STACK_SIZE     (configMINIMAL_STACK_SIZE * 10)
 
@@ -308,6 +313,14 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             else if (u8WakeInterval == 30)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_30_MIN);
             else if (u8WakeInterval == 60)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_60_MIN);
             else if (u8WakeInterval == 120) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_120_MIN);
+
+#ifdef STORAGE_BACKEND_FLASH
+            /* ---- OTA firmware pull (logger session still up) ----
+             * If the logger offers a newer tag firmware, acquire it into the
+             * ext-flash scratchpad. On success this arms the bootloader and
+             * RESETS — nothing after it runs this wake. */
+            OTAUPDATE_bUartAcquire();
+#endif
 
             DEVICE_DISCOVERY_DRIVER_vDisconnectLogger();
 
