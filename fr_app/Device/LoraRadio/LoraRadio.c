@@ -31,7 +31,12 @@
 #include <stdlib.h>
 
 /* ---- Private defines ---- */
-#define LORA_TX_QUEUE_SIZE      (24)
+/* TX queue: 8 (was 24). Each slot is a full ~264 B LoraRadio_Packet_t from the
+ * 48 KB heap, and the mesh layer already paces its TX through its own 24-deep
+ * jitter queue upstream — this queue only buffers what the radio task is about
+ * to drain. 8 still absorbs a multi-line FrKernel LoRa response burst;
+ * overflow is handled gracefully (logged drop). Frees ~4.2 KB of heap. */
+#define LORA_TX_QUEUE_SIZE      (8)
 #define LORA_RX_QUEUE_SIZE      (8)
 #define LORA_TASK_STACK_SIZE    (configMINIMAL_STACK_SIZE * 10)
 

@@ -63,9 +63,12 @@
 #define MESH_GPS_FIX_MAX_AGE_S      300U
 #define MESH_DISCOVERY_IDLE_MS_CFG       MESH_DISCOVERY_IDLE_MS
 
-/* ---- TX queue item ---- */
+/* ---- TX queue item ----
+ * Item buffer 64 (was 128): the largest mesh frame is a full D-Ack at
+ * 10 + 8*4 = 42 B (beacon 24, DReq 7, TimeSync 6); FrKernel responses bypass
+ * this queue entirely. 24 x 64 B saves ~1.5 KB of heap vs 128. */
 #define MESH_TX_QUEUE_LEN        24
-#define MESH_TX_MAX_PACKET_SIZE  128
+#define MESH_TX_MAX_PACKET_SIZE  64
 
 /* ---- MeshTx task thread flags ----
  * The periodic beacon/ack software-timer callbacks run in the FreeRTOS Timer

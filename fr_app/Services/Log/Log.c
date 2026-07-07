@@ -29,6 +29,10 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Number of 4 KB sectors in the log PARTITION (not the whole device — the
+ * lower sectors belong to the OTA scratchpad, see OtaStore_Config.h). */
+#define LOG_NUM_SECTORS  (LOG_FLASH_SIZE_BYTES / FLASH_SECTOR_SIZE_BYTES)
+
 static uint32_t u32WriteAddr;
 static uint32_t u32StartAddr;
 static bool     bWrapped;
@@ -52,18 +56,18 @@ static uint8_t LOG_u8ReadSectorTailByte(uint32_t sector)
  * Find the FIFO write-head sector: the one (and only) sector that still has
  * unused 0xFF padding at its tail. All other sectors — whether holding the
  * current generation's data or an older, not-yet-overwritten generation —
- * are filled right to their last byte. Returns FLASH_NUM_SECTORS if no such
+ * are filled right to their last byte. Returns LOG_NUM_SECTORS if no such
  * sector is found (the degenerate case where every sector is filled to
  * exactly its last byte).
  */
 static uint32_t LOG_u32FindHeadByTailPadding(void)
 {
-    for (uint32_t sector = 0U; sector < FLASH_NUM_SECTORS; sector++)
+    for (uint32_t sector = 0U; sector < LOG_NUM_SECTORS; sector++)
     {
         if (LOG_u8ReadSectorTailByte(sector) == 0xFFU)
             return sector;
     }
-    return FLASH_NUM_SECTORS;
+    return LOG_NUM_SECTORS;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -72,16 +76,16 @@ void LOG_vInit(void)
 {
     /* Pass 1: first byte of every sector. A sector whose first byte is
      * 0xFF is virgin — never written since the last chip erase. */
-    uint32_t u32FirstVirgin  = FLASH_NUM_SECTORS;
+    uint32_t u32FirstVirgin  = LOG_NUM_SECTORS;
     uint32_t u32VirginCount  = 0U;
 
-    for (uint32_t sector = 0U; sector < FLASH_NUM_SECTORS; sector++)
+    for (uint32_t sector = 0U; sector < LOG_NUM_SECTORS; sector++)
     {
         uint8_t  byte;
         FLASH_vRead(LOG_FLASH_START_ADDR + sector * FLASH_SECTOR_SIZE_BYTES, &byte, 1);
         if (byte == 0xFFU)
         {
-            if (u32FirstVirgin == FLASH_NUM_SECTORS)
+            if (u32FirstVirgin == LOG_NUM_SECTORS)
                 u32FirstVirgin = sector;
             u32VirginCount++;
         }
@@ -90,10 +94,10 @@ void LOG_vInit(void)
     uint32_t u32HeadSector;
     uint32_t u32TailSector;
 
-    if ((u32FirstVirgin != FLASH_NUM_SECTORS) &&
-        (u32VirginCount == (FLASH_NUM_SECTORS - u32FirstVirgin)))
+    if ((u32FirstVirgin != LOG_NUM_SECTORS) &&
+        (u32VirginCount == (LOG_NUM_SECTORS - u32FirstVirgin)))
     {
-        /* The virgin sectors form a clean suffix [u32FirstVirgin, 128) — the
+        /* The virgin sectors form a clean suffix up to the partition end — the
          * FIFO has never wrapped. The write head is the last *written*
          * sector (or sector 0 if the log is completely empty); the tail
          * (oldest data) is fixed at sector 0. */
@@ -108,14 +112,14 @@ void LOG_vInit(void)
          * its first byte. Find it instead by its trailing 0xFF padding. The
          * sector right after it holds the oldest surviving data. */
         u32HeadSector = LOG_u32FindHeadByTailPadding();
-        if (u32HeadSector == FLASH_NUM_SECTORS)
+        if (u32HeadSector == LOG_NUM_SECTORS)
         {
             /* Degenerate: every sector filled to its last byte. Fall back to
              * sector 0 — the next write will erase it and re-establish a
              * normal FIFO layout. */
             u32HeadSector = 0U;
         }
-        u32TailSector = (u32HeadSector + 1U) % FLASH_NUM_SECTORS;
+        u32TailSector = (u32HeadSector + 1U) % LOG_NUM_SECTORS;
         bWrapped      = true;
     }
 
@@ -207,14 +211,22 @@ uint32_t LOG_u32GetUsedBytes(void)
 
 uint8_t LOG_u8GetUsedPercent(void)
 {
-    return (uint8_t)(LOG_u32GetUsedBytes() * 100UL / FLASH_CAPACITY_BYTES);
+    return (uint8_t)(LOG_u32GetUsedBytes() * 100UL / LOG_FLASH_SIZE_BYTES);
 }
 
 /* -------------------------------------------------------------------------- */
 
 void LOG_vErase(void)
 {
-    FLASH_vChipErase();
+    /* Per-sector erase of the log PARTITION only. A chip erase would also
+     * wipe the OTA image scratchpad + metadata in the lower sectors. */
+    for (uint32_t u32Addr = LOG_FLASH_START_ADDR;
+         u32Addr < LOG_FLASH_END_ADDR;
+         u32Addr += FLASH_SECTOR_SIZE_BYTES)
+    {
+        if (!FLASH_vSectorErase(u32Addr))
+            break;
+    }
     u32WriteAddr = LOG_FLASH_START_ADDR;
     u32StartAddr = LOG_FLASH_START_ADDR;
     bWrapped     = false;

@@ -50,6 +50,7 @@
 #include "flashLog.h"
 #include "Flash.h"
 #include "Log.h"
+#include "OtaStore.h"
 #include "DbgLog.h"
 
 #include "storage_config.h"
@@ -92,6 +93,8 @@ void INIT_vInitialization(void *parameters)
     MICROSD_vInit();
 #else
     FLASH_vInit();
+    /* One-time OTA partition-layout migration (see OtaStore_Config.h). */
+    OTASTORE_vInit();
 #endif
     LOG_vInit();
 
