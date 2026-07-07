@@ -50,12 +50,19 @@
 
 /* ---- Packet types (wire, first byte) ---- */
 typedef enum {
-    MeshPktType_Reserved = 0,
-    MeshPktType_DReq     = 1,
-    MeshPktType_DBeacon  = 2,
-    MeshPktType_DAck     = 3,
-    MeshPktType_TimeSync = 4,
-    MeshPktType_FrKernel = 5    /* FrKernel command / response */
+    MeshPktType_Reserved  = 0,
+    MeshPktType_DReq      = 1,
+    MeshPktType_DBeacon   = 2,
+    MeshPktType_DAck      = 3,
+    MeshPktType_TimeSync  = 4,
+    MeshPktType_FrKernel  = 5,   /* FrKernel command / response */
+    /* OTA firmware distribution (DIRECT LoRa, never mesh-forwarded) —
+     * formats and state machines in fr_app/Worker/OtaUpdate. */
+    MeshPktType_OtaPrep    = 6,  /* primary bcast: session announcement    */
+    MeshPktType_OtaPrepAck = 7,  /* secondary: joins the session           */
+    MeshPktType_OtaChunk   = 8,  /* primary bcast: one image chunk         */
+    MeshPktType_OtaPoll    = 9,  /* primary: request one target's report   */
+    MeshPktType_OtaReport  = 10  /* secondary: missing bitmap / verdict    */
 } MeshPktType_e;
 
 /* ---- Wake-up interval enum ---- */
@@ -179,6 +186,11 @@ uint8_t       MESHNETWORK_u8GetWakeupInterval(void);
 /* Called by the parser when a FrKernel packet arrives.
  * Override in FrKernel.c when FRKERNEL_INTERFACE_LORA is defined. */
 void MESHNETWORK_vOnFrKernelPacket(const uint8_t *buf, uint8_t len);
+
+/* Enqueue a small OTA response (PrepAck/Report, <= the mesh TX item size)
+ * through the jittered mesh TX queue. Parser-context safe — used by the
+ * OtaUpdate packet handlers to answer the primary without a new TX path. */
+bool MESHNETWORK_bSendOtaResponse(const uint8_t *buf, uint16_t len);
 
 uint32_t MESHNETWORK_u32GetLastBeaconHeardTick(void);
 uint32_t MESHNETWORK_u32GetLastDiscoveryPktTick(void);  /* any DReq/DBeacon/DAck/TimeSync */

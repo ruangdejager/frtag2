@@ -34,6 +34,11 @@
 #include "Battery.h"
 #include "flashLog.h"
 
+#include "storage_config.h"
+#ifdef STORAGE_BACKEND_FLASH
+#include "OtaUpdate.h"
+#endif
+
 #ifdef ENABLE_GPS
 #include "GPS.h"
 #endif
@@ -131,12 +136,17 @@ static const uint8_t u8CurrentWakeupIntervalMin[] = {
 };
 
 static const char * const MeshPktTypeStr[] = {
-    [MeshPktType_Reserved] = "Reserved",
-    [MeshPktType_DReq]     = "DReq",
-    [MeshPktType_DBeacon]  = "DBeacon",
-    [MeshPktType_DAck]     = "DAck",
-    [MeshPktType_TimeSync] = "TimeSync",
-    [MeshPktType_FrKernel] = "FrKernel"
+    [MeshPktType_Reserved]   = "Reserved",
+    [MeshPktType_DReq]       = "DReq",
+    [MeshPktType_DBeacon]    = "DBeacon",
+    [MeshPktType_DAck]       = "DAck",
+    [MeshPktType_TimeSync]   = "TimeSync",
+    [MeshPktType_FrKernel]   = "FrKernel",
+    [MeshPktType_OtaPrep]    = "OtaPrep",
+    [MeshPktType_OtaPrepAck] = "OtaPrepAck",
+    [MeshPktType_OtaChunk]   = "OtaChunk",
+    [MeshPktType_OtaPoll]    = "OtaPoll",
+    [MeshPktType_OtaReport]  = "OtaReport"
 };
 
 /* ---- Misc state ---- */
@@ -886,6 +896,18 @@ void MESHNETWORK_vParserTask(void *pvParameters)
             case MeshPktType_FrKernel:
                 MESHNETWORK_vOnFrKernelPacket(tRx.buffer + 1, (uint8_t)(tRx.length - 1));
                 break;
+#ifdef STORAGE_BACKEND_FLASH
+            case MeshPktType_OtaPrep:
+            case MeshPktType_OtaPrepAck:
+            case MeshPktType_OtaChunk:
+            case MeshPktType_OtaPoll:
+            case MeshPktType_OtaReport:
+                /* Direct (non-mesh) OTA traffic: dispatched to the OtaUpdate
+                 * worker, never entered into the forward ring, never
+                 * re-forwarded. */
+                OTAUPDATE_vOnLoraPacket(tRx.buffer, tRx.length);
+                break;
+#endif
             default:
                 DBG_LOG("MeshNetwork: Unknown pkt type %u\r\n", tRx.buffer[0]);
                 break;
@@ -1192,6 +1214,14 @@ void MESHNETWORK_vFlushTxQueue(void)
 
 void MESHNETWORK_vIncrDreqWaveCnt(void) { u8PrimaryDreqWaveCnt++; }
 void MESHNETWORK_vResetDreqWaveCnt(void) { u8PrimaryDreqWaveCnt = 0; }
+
+/* Small OTA responses (PrepAck/Report) ride the normal jittered mesh TX
+ * queue — the jitter de-correlates many secondaries answering one OtaPrep,
+ * exactly as it does for discovery beacons. */
+bool MESHNETWORK_bSendOtaResponse(const uint8_t *buf, uint16_t len)
+{
+    return MESHNETWORK_bSendPacket(buf, len);
+}
 
 __attribute__((weak)) void MESHNETWORK_vOnFrKernelPacket(const uint8_t *buf, uint8_t len)
 {

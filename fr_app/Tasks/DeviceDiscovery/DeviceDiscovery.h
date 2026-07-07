@@ -89,6 +89,10 @@
 /* Thread flag bit — set by MeshNetwork when a TimeSync packet is received */
 #define DEVICE_DISCOVERY_NOTIFY_TIMESYNC    (1UL << 0)
 
+/* Thread flag bit — set by OtaUpdate when OTA session traffic needs the
+ * AppTask (an OtaPrep announcement, or a chunk in the receive mailbox) */
+#define DEVICE_DISCOVERY_NOTIFY_OTA         (1UL << 1)
+
 /* ---- Logger driver macros ---- */
 #define DEVICE_DISCOVERY_DRIVER_bConnectLogger()             FARMRANGER_bDeviceOn()
 #define DEVICE_DISCOVERY_DRIVER_vDisconnectLogger()          FARMRANGER_vDeviceOff()

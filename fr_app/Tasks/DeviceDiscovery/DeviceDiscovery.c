@@ -148,7 +148,24 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         osDelay(APP_WAKEUP_BUFFER_MS);
         EVTLOG(LOG_DISCOVERY_START, eDeviceRole);
 
-        if (eDeviceRole == DEVICE_ROLE_PRIMARY)
+        bool bOtaSlot = false;
+#ifdef STORAGE_BACKEND_FLASH
+        /* OTA distribution slot (primary): when a validated image is stored
+         * and this node already runs it, the wake slot serves firmware to the
+         * secondaries instead of running a discovery campaign — the OtaPrep
+         * announcement goes out where the DReq would have. */
+        if (eDeviceRole == DEVICE_ROLE_PRIMARY && OTAUPDATE_bDistributePending())
+        {
+            bOtaSlot = true;
+            OTAUPDATE_vDistribute();
+        }
+#endif
+
+        if (bOtaSlot)
+        {
+            /* Distribution already ran; no discovery, no logger upload. */
+        }
+        else if (eDeviceRole == DEVICE_ROLE_PRIMARY)
         {
             bool    bDiscoveryFinished = false;
             uint8_t u8WaveCount        = 0;
@@ -201,7 +218,8 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             DBG_LOG("DeviceDiscovery %X: Secondary waiting for timesync.\r\n",
                 LORARADIO_u32GetUniqueId());
 
-            osThreadFlagsClear(DEVICE_DISCOVERY_NOTIFY_TIMESYNC);
+            osThreadFlagsClear(DEVICE_DISCOVERY_NOTIFY_TIMESYNC |
+                               DEVICE_DISCOVERY_NOTIFY_OTA);
 
             /* R3: end the campaign on the FIRST of:
              *   - TimeSync received (clean end),
@@ -219,10 +237,30 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
             for (;;)
             {
-                uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
+                uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC |
+                                               DEVICE_DISCOVERY_NOTIFY_OTA,
                                                osFlagsWaitAny,
                                                APP_SECONDARY_POLL_MS);
-                if (!(r & osFlagsError)) { bTimeSync = true; break; }
+                if (!(r & osFlagsError))
+                {
+#ifdef STORAGE_BACKEND_FLASH
+                    /* OTA prep announced instead of a DReq: this wake slot
+                     * becomes a firmware-receive session. On a complete +
+                     * verified image the call resets into the bootloader;
+                     * otherwise fall through to the normal sleep path. */
+                    if ((r & DEVICE_DISCOVERY_NOTIFY_OTA) && OTAUPDATE_bPrepPending())
+                    {
+                        OTAUPDATE_vSecondaryReceive();
+                        break;
+                    }
+#endif
+                    if (r & DEVICE_DISCOVERY_NOTIFY_TIMESYNC)
+                    {
+                        bTimeSync = true;
+                        break;
+                    }
+                    continue;   /* stray OTA flag without a pending prep */
+                }
 
                 uint32_t u32Now = osKernelGetTickCount();
 
@@ -256,7 +294,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             LORARADIO_u32GetUniqueId());
         EVTLOG(LOG_DISCOVERY_CMPLT, eDeviceRole);
 
-        if (eDeviceRole == DEVICE_ROLE_PRIMARY)
+        if (!bOtaSlot && eDeviceRole == DEVICE_ROLE_PRIMARY)
         {
             MeshDiscoveredNeighbor_t tNeighbors[MESH_MAX_NEIGHBORS];
             uint16_t u16NeighborCount = 0;
