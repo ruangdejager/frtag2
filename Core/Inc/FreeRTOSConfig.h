@@ -64,7 +64,11 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
-#define configTOTAL_HEAP_SIZE                    ((size_t)49152)  /* 48 KB — sized for all tasks incl. GPS dispatcher + RX */
+/* 44 KB (was 48 KB): the LoRa TX queue (24->8 slots) and mesh TX item size
+ * (128->64 B) cut ~5.8 KB of heap demand, so 4 KB of the static heap moves
+ * back to the .bss budget with runtime slack still ~1.8 KB better than
+ * before. Still sized for all tasks incl. GPS dispatcher + RX. */
+#define configTOTAL_HEAP_SIZE                    ((size_t)45056)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0

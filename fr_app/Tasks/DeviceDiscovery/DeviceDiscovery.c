@@ -21,9 +21,6 @@
 
 #include "main.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-
 #include "dbg_log.h"
 #include "platform_rtc.h"
 #include "hal_rtc.h"
@@ -84,7 +81,9 @@ void DEVICE_DISCOVERY_vInit(void)
     configASSERT(DeviceDiscoveryAppTask_handle    != NULL);
     configASSERT(DeviceDiscoveryWakeupTask_handle != NULL);
 
+    /* Capture the reset cause — first clue in a field post-mortem. */
     uint32_t u32ModifiedCSR = u32GetCSR() >> 5;
+    DBG_LOG("DeviceDiscovery: reset cause CSR=0x%lX\r\n", u32ModifiedCSR);
     EVTLOG(LOG_RESET_CAUSE, u32ModifiedCSR);
 
     DBG_LOG("DeviceDiscovery: Initialized.\r\n");
@@ -241,7 +240,11 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 DBG_LOG("DeviceDiscovery: Secondary %04X: campaign end (silence/cap)\r\n",
                     LORARADIO_u32GetUniqueId());
 
-            MESHNETWORK_vStopBeaconing(u32DreqId);
+            /* B4: stop OUR beacon dreq. The global u32DreqId is only ever
+             * written on the primary — on a secondary it is stale/zero, so the
+             * old exact-dreq stop was a silent no-op and the node kept
+             * beaconing into the post-campaign delay (until the beacon cap). */
+            MESHNETWORK_vStopBeaconingSelf();
         }
 
         /* ----------------------------------------------------------------
@@ -376,7 +379,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
         DBG_LOG("DeviceDiscovery: Waiting for synchronized wake-up...\r\n");
         osDelay(100);
-//        BSP_LED_Off(LED_YELLOW);
         LORARADIO_vEnterDeepSleep();
 
         /* Campaign complete — release the sleep lock taken when this wake
@@ -396,6 +398,27 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
 {
     (void)pvParameters;
 
+    /* B6: slot latches. The old exact `phase == 0` compare missed a wake
+     * whenever the RTC was stepped FORWARD across a boundary (TimeSync /
+     * logger sync) and double-fired when stepped BACKWARD across one.
+     * Fire once per interval slot (utc / interval), strictly increasing:
+     *   - slot > lastFired          -> fire and latch (catches forward jumps
+     *                                  and ordinary boundaries, even if the
+     *                                  exact boundary second was missed)
+     *   - slot == lastFired         -> already ran this slot (backward step
+     *                                  re-entering the previous slot: no
+     *                                  double campaign)
+     *   - slot << lastFired (> 1)   -> large backward correction / interval
+     *                                  change: resync the latch, no fire
+     * Armed (not fired) on the first heartbeat so boot behaviour matches the
+     * old code: first campaign at the next boundary. */
+    static uint64_t u64LastFiredSlot = 0;
+    static bool     bSlotValid       = false;
+#ifdef ENABLE_GPS
+    static uint64_t u64LastGpsSlot   = 0;
+    static bool     bGpsSlotValid    = false;
+#endif
+
     PLATFORM_bSubscribeToHeartbeat(osThreadGetId(), HB_ALLOW_IN_RECOVERY);
 
     for (;;)
@@ -405,7 +428,7 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
 
         uint64_t u64Utc       = RTC_u64GetUTC();
         uint32_t u32IntervalS = (uint32_t)MESHNETWORK_u8GetWakeupInterval() * 60U;
-        uint32_t u32Phase     = (uint32_t)(u64Utc % (uint64_t)u32IntervalS);
+        uint64_t u64Slot      = u64Utc / (uint64_t)u32IntervalS;
 
         /* ---- ProductionSleep: secondary only — primary has no solar panel ---- */
         if (eDeviceRole == DEVICE_ROLE_SECONDARY && eProductionState == PRODUCTION_SLEEP)
@@ -438,9 +461,24 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             continue;
         }
 
-//        BSP_LED_Toggle(LED_YELLOW);
-        /* --- Discovery wake trigger (phase == 0) --- */
-        if (u32Phase == 0U)
+        /* --- Discovery wake trigger: once per interval slot (B6) --- */
+        bool bFireDiscovery = false;
+        if (!bSlotValid)
+        {
+            u64LastFiredSlot = u64Slot;          /* boot: arm, don't fire */
+            bSlotValid       = true;
+        }
+        else if (u64Slot > u64LastFiredSlot)
+        {
+            u64LastFiredSlot = u64Slot;
+            bFireDiscovery   = true;
+        }
+        else if ((u64LastFiredSlot - u64Slot) > 1ULL)
+        {
+            u64LastFiredSlot = u64Slot;          /* big backward correction: resync */
+        }
+
+        if (bFireDiscovery)
         {
             /* Scheduled wakes still fire in LOW; only RECOVERY suppresses them.
              * GPS gates strictly on NORMAL itself, so a LOW wake just produces
@@ -490,11 +528,38 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
         /* --- GPS pre-trigger (SECONDARY only) ---
          * GPS is not fitted on PRIMARY boards. Fire-and-forget 3 minutes
          * before each scheduled wake so a fresh fix is cached by the time
-         * the AppTask runs. The AppTask never blocks on a GPS result. */
+         * the AppTask runs. The AppTask never blocks on a GPS result.
+         *
+         * B6: slot-latched like the discovery trigger — the old exact
+         * `phase == interval - 180` compare skipped the pre-trigger whenever
+         * that one heartbeat second was missed. Fire once inside the last
+         * PRETRIGGER window of each interval; the slot being pre-triggered is
+         * the UPCOMING one ((utc + lead) / interval). */
+        bool bFireGps = false;
         if (eDeviceRole == DEVICE_ROLE_SECONDARY &&
-            u32IntervalS > DEVICE_DISCOVERY_GPS_PRETRIGGER_S &&
-            u32Phase == (u32IntervalS - DEVICE_DISCOVERY_GPS_PRETRIGGER_S) &&
-            (POWER_tGetState() & POWER_CLASS_NORMAL))
+            u32IntervalS > DEVICE_DISCOVERY_GPS_PRETRIGGER_S)
+        {
+            uint32_t u32Phase   = (uint32_t)(u64Utc % (uint64_t)u32IntervalS);
+            uint64_t u64GpsSlot = (u64Utc + DEVICE_DISCOVERY_GPS_PRETRIGGER_S)
+                                  / (uint64_t)u32IntervalS;
+            if (!bGpsSlotValid)
+            {
+                u64LastGpsSlot = u64GpsSlot;     /* boot: arm, don't fire */
+                bGpsSlotValid  = true;
+            }
+            else if (u32Phase >= (u32IntervalS - DEVICE_DISCOVERY_GPS_PRETRIGGER_S) &&
+                     u64GpsSlot > u64LastGpsSlot)
+            {
+                u64LastGpsSlot = u64GpsSlot;
+                bFireGps       = true;
+            }
+            else if (u64LastGpsSlot > u64GpsSlot + 1ULL)
+            {
+                u64LastGpsSlot = u64GpsSlot;     /* big backward correction: resync */
+            }
+        }
+
+        if (bFireGps && (POWER_tGetState() & POWER_CLASS_NORMAL))
         {
             /* Hold off deep sleep until GPS auto-shuts-down, times out, or is
              * otherwise turned off — released inside GPS_vPowerOff().

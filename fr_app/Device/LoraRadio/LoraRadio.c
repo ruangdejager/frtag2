@@ -31,7 +31,12 @@
 #include <stdlib.h>
 
 /* ---- Private defines ---- */
-#define LORA_TX_QUEUE_SIZE      (24)
+/* TX queue: 8 (was 24). Each slot is a full ~264 B LoraRadio_Packet_t from the
+ * 48 KB heap, and the mesh layer already paces its TX through its own 24-deep
+ * jitter queue upstream — this queue only buffers what the radio task is about
+ * to drain. 8 still absorbs a multi-line FrKernel LoRa response burst;
+ * overflow is handled gracefully (logged drop). Frees ~4.2 KB of heap. */
+#define LORA_TX_QUEUE_SIZE      (8)
 #define LORA_RX_QUEUE_SIZE      (8)
 #define LORA_TASK_STACK_SIZE    (configMINIMAL_STACK_SIZE * 10)
 
@@ -116,7 +121,10 @@ bool LORARADIO_bRxPacket(LoraRadio_Packet_t *packet)
  * -------------------------------------------------------------------------- */
 bool LORARADIO_bTxPacket(LoraRadio_Packet_t *packet)
 {
-    if (packet->length > LORA_MAX_PACKET_SIZE)
+    /* Reserve room for the appended CRC byte: the length field is uint8_t, so
+     * type+payload+CRC must fit in 255. A 255-byte payload would wrap
+     * pkt.length to 0 on the CRC append in the radio task (corrupt frame). */
+    if (packet->length > (LORA_MAX_PACKET_SIZE - 2))
         return false;
 
     if (osMessageQueuePut(xLoRaTxQueue, packet, 0, 0) != osOK)
@@ -161,16 +169,27 @@ void LORARADIO_vRadioTask(void *arg)
             memset(&pkt, 0, sizeof(pkt));
             LORARADIO_DRIVER_bReceivePayload(&pkt);
 
-            uint8_t crc_rx = pkt.buffer[pkt.length - 1];
-            uint8_t crc    = LORARADIO_u8CRC8_Calculate(pkt.buffer, pkt.length - 1);
-            if (crc == crc_rx)
+            /* Shortest valid frame is type byte + CRC byte. A 0/1-byte frame
+             * (corrupt header that passed the radio CRC) would otherwise
+             * underflow pkt.length - 1 below: buffer[-1] read and a CRC pass
+             * over (uint16_t)-1 = 65535 bytes, far past the 256-byte buffer. */
+            if (pkt.length < 2)
             {
-                pkt.length--;
-                osMessageQueuePut(xLoRaRxQueue, &pkt, 0, 0);
+                DBG_LOG("Loraradio: runt frame dropped (len=%u)\r\n", pkt.length);
             }
             else
             {
-                DBG_LOG("CRC mismatch\r\n");
+                uint8_t crc_rx = pkt.buffer[pkt.length - 1];
+                uint8_t crc    = LORARADIO_u8CRC8_Calculate(pkt.buffer, pkt.length - 1);
+                if (crc == crc_rx)
+                {
+                    pkt.length--;
+                    osMessageQueuePut(xLoRaRxQueue, &pkt, 0, 0);
+                }
+                else
+                {
+                    DBG_LOG("CRC mismatch\r\n");
+                }
             }
             SUBGRF_ClearIrqStatus(IRQ_RX_DONE);
             LORARADIO_DRIVER_vEnterRxMode(0);

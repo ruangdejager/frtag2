@@ -209,7 +209,6 @@ bool FARMRANGER_bDeviceOn(void)
                             3000))
     {
         DBG_LOG("RDY not received\r\n");
-//        BSP_LED_On(LED_YELLOW);
         return false;
     }
 
@@ -428,7 +427,6 @@ bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
     {
         EVTLOG(LOG_FRLOG_ERROR, 1);
         DBG_LOG("LogData: No 'Logger ready' received.\r\n");
-//        BSP_LED_On(LED_YELLOW);
     }
 
     /* Step 2: stream the CSV payload one row at a time, paced so the fr9 keeps

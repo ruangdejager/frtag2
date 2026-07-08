@@ -123,8 +123,11 @@ static void FRKERNEL_vRespond(const char *msg)
 #elif defined(FRKERNEL_INTERFACE_LORA)
     LoraRadio_Packet_t pkt = {0};
     pkt.buffer[0] = (uint8_t)MeshPktType_FrKernel;
-    if (len > (uint16_t)(LORA_MAX_PACKET_SIZE - 1))
-        len = (uint16_t)(LORA_MAX_PACKET_SIZE - 1);
+    /* Cap so type byte + payload + radio-appended CRC fit the uint8_t length
+     * field (255): payload <= LORA_MAX_PACKET_SIZE - 3. The old "- 1" cap
+     * made pkt.length wrap to 0 for max-length responses. */
+    if (len > (uint16_t)(LORA_MAX_PACKET_SIZE - 3))
+        len = (uint16_t)(LORA_MAX_PACKET_SIZE - 3);
     memcpy(&pkt.buffer[1], msg, len);
     pkt.length = (uint8_t)(len + 1U);
     LORARADIO_bTxPacket(&pkt);

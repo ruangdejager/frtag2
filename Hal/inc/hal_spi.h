@@ -47,8 +47,6 @@ extern SPI_HandleTypeDef hFlashSpi;
 #define FLASH_SPI_CLK_DISABLE() __HAL_RCC_SPI2_CLK_DISABLE()
 #define FLASH_PORT_CLK_ENABLE() __HAL_RCC_GPIOA_CLK_ENABLE()
 
-void HAL_SPI_FLASH_vDeInit(void);
-
 /* Restore the flash bus if a STOP2 sleep parked it (no-op otherwise). Folded
  * into the chip-select so a logging flash write after a wake always finds an
  * awake bus, while idle wakes that don't touch the flash skip the re-init. */
@@ -89,7 +87,6 @@ void HAL_SPI_SD_vSetSpeed(uint32_t u32Prescaler);
  * Initialises both SPI1 (ACC) and SPI2 (flash) in a single call.
  * ----------------------------------------------------------------------- */
 void HAL_SPI_vInit(void);
-void HAL_SPI_vDeInit(void);
 
 /* Flag both SPI buses as torn down by STOP2; each is re-initialised lazily on
  * its next chip-select. Call from the wake path instead of HAL_SPI_vInit() so

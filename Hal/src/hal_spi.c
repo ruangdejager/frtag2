@@ -220,30 +220,3 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef *spiHandle)
         HAL_GPIO_Init(BSP_FLASH_MOSI_PORT, &GPIO_InitStruct);
     }
 }
-
-void HAL_SPI_vDeInit(void)
-{
-    HAL_SPI_DeInit(&hAccSpi);
-}
-
-void HAL_SPI_FLASH_vDeInit(void)
-{
-    HAL_SPI_DeInit(&hFlashSpi);
-}
-
-void HAL_SPI_MspDeInit(SPI_HandleTypeDef *spiHandle)
-{
-    if (spiHandle->Instance == ACC_SPI)
-    {
-        ACC_SPI_CLK_DISABLE();
-        HAL_GPIO_DeInit(BSP_ACC_SCK_PORT,  BSP_ACC_SCK_PIN);
-        HAL_GPIO_DeInit(BSP_ACC_MOSI_PORT, BSP_ACC_MISO_PIN | BSP_ACC_MOSI_PIN);
-    }
-    else if (spiHandle->Instance == FLASH_SPI)
-    {
-        FLASH_SPI_CLK_DISABLE();
-        HAL_GPIO_DeInit(BSP_FLASH_CS_PORT,   BSP_FLASH_CS_PIN);
-        HAL_GPIO_DeInit(BSP_FLASH_MISO_PORT, BSP_FLASH_MISO_PIN);
-        HAL_GPIO_DeInit(BSP_FLASH_MOSI_PORT, BSP_FLASH_SCK_PIN | BSP_FLASH_MOSI_PIN);
-    }
-}
