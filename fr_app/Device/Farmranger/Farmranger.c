@@ -93,7 +93,7 @@ static void FARMRANGER_vATHandlerTask(void *args);
 static bool FARMRANGER_bParseTimestamp(const char *line, void *ctx);
 static bool FARMRANGER_bParseInterval(const char *line, void *ctx);
 static bool FARMRANGER_bParseLoggerReady(const char *line, void *ctx);
-static bool FARMRANGER_bParseOK(const char *line, void *ctx);
+static bool FARMRANGER_bParseLogVerdict(const char *line, void *ctx);
 static bool FARMRANGER_bParseRDY(const char *line, void *ctx);
 
 /* --------------------------------------------------------------------------
@@ -395,25 +395,25 @@ static int FARMRANGER_iFormatRow(char *row, const MeshDiscoveredNeighbor_t *n)
                     (long)n->i32LonUDeg);
 }
 
-bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
+/* Upload retry policy. The fr9 signals a failed transfer (bytes lost on the
+ * wire, e.g. its RX ring overflowed during a GNSS acquire or a flash-log page
+ * erase) with "ERR" 5 s after the last byte it received, so the verdict wait
+ * must exceed that; an fr9 running older firmware answers "OK" either way,
+ * which degrades this to today's single-attempt behaviour. */
+#define FR_LOG_ATTEMPTS        3U
+#define FR_LOG_VERDICT_MS      6500U
+#define FR_LOG_RETRY_DELAY_MS  250U
+
+/* One AT+LOG upload attempt: handshake, paced row stream, final verdict.
+ * `pos` is the pre-computed total payload length. */
+static bool FARMRANGER_bLogAttempt(const MeshDiscoveredNeighbor_t *neighbors,
+                                   uint16_t count, size_t pos)
 {
-    /* The AT+LOG protocol needs the total payload length up front, so build
-     * it in two passes over a single small row buffer rather than one large
-     * static payload buffer: pass 1 sums the byte count, pass 2 streams each
-     * row. Keeps RAM use to one ~80-byte row regardless of neighbor count. */
-    char   row[FR_CSV_ROW_MAX];
-    size_t pos = 0;
+    char row[FR_CSV_ROW_MAX];
 
-    /* Pass 1: compute total payload length. */
-    for (uint16_t i = 0; i < count; i++)
-    {
-        int n = FARMRANGER_iFormatRow(row, &neighbors[i]);
-        if (n <= 0 || n >= (int)sizeof(row))
-            return false;
-        pos += (size_t)n;
-    }
-
-    /* Step 1: send AT+LOG=<len> and wait for "Logger ready" */
+    /* Step 1: send AT+LOG=<len> and wait for "Logger ready". Without it the
+     * fr9 is not in its payload state and the stream would go into the void —
+     * fail the attempt rather than transmit blind. */
     char cmd[32];
     snprintf(cmd, sizeof(cmd), "AT+LOG=%u\r\n", (unsigned)pos);
 
@@ -427,6 +427,7 @@ bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
     {
         EVTLOG(LOG_FRLOG_ERROR, 1);
         DBG_LOG("LogData: No 'Logger ready' received.\r\n");
+        return false;
     }
 
     /* Step 2: stream the CSV payload one row at a time, paced so the fr9 keeps
@@ -459,21 +460,73 @@ bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
         osDelay(FR_LOG_ROW_GAP_MS);
     }
 
-    /* Step 3: wait for final OK */
-    memset(respBuf, 0, sizeof(respBuf));
+    /* Step 3: wait for the fr9's verdict — "OK" (all bytes counted) or "ERR"
+     * (its silence timeout hit before the count was reached: bytes were lost
+     * and the upload must be retried). No line at all also fails the attempt. */
+    char cVerdict = '\0';
     if (!FARMRANGER_bATSend(NULL,
-                            FARMRANGER_bParseOK,
+                            FARMRANGER_bParseLogVerdict,
                             respBuf,
                             sizeof(respBuf),
-                            respBuf,
-                            3500))
+                            &cVerdict,
+                            FR_LOG_VERDICT_MS))
     {
-        DBG_LOG("LogData: No final OK received.\r\n");
+        DBG_LOG("LogData: no verdict received.\r\n");
         EVTLOG(LOG_FRLOG_ERROR, 3);
         return false;
     }
 
+    if (cVerdict != 'O')
+    {
+        DBG_LOG("LogData: fr9 reported ERR (bytes lost).\r\n");
+        EVTLOG(LOG_FRLOG_ERROR, 4);
+        return false;
+    }
+
     return true;
+}
+
+bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
+{
+    /* The AT+LOG protocol needs the total payload length up front, so build
+     * it in two passes over a single small row buffer rather than one large
+     * static payload buffer: pass 1 sums the byte count, pass 2 streams each
+     * row. Keeps RAM use to one ~80-byte row regardless of neighbor count. */
+    char   row[FR_CSV_ROW_MAX];
+    size_t pos = 0;
+
+    /* Pass 1: compute total payload length. */
+    for (uint16_t i = 0; i < count; i++)
+    {
+        int n = FARMRANGER_iFormatRow(row, &neighbors[i]);
+        if (n <= 0 || n >= (int)sizeof(row))
+            return false;
+        pos += (size_t)n;
+    }
+
+    /* Pass 2: upload, retrying on a failed transfer. A single field event
+     * (fr9 RX overrun during its GNSS window / a flash page erase) drops a
+     * chunk of bytes mid-stream; without a retry that discovery is lost for
+     * good. Each attempt is self-contained — the fr9 returns to idle before
+     * the next AT+LOG goes out (verdict wait > its silence timeout). */
+    for (uint8_t u8Attempt = 1U; u8Attempt <= FR_LOG_ATTEMPTS; u8Attempt++)
+    {
+        if (FARMRANGER_bLogAttempt(neighbors, count, pos))
+        {
+            if (u8Attempt > 1U)
+                DBG_LOG("LogData: upload OK on attempt %u\r\n", u8Attempt);
+            return true;
+        }
+
+        if (u8Attempt < FR_LOG_ATTEMPTS)
+        {
+            DBG_LOG("LogData: attempt %u failed, retrying...\r\n", u8Attempt);
+            osDelay(FR_LOG_RETRY_DELAY_MS);
+        }
+    }
+
+    DBG_LOG("LogData: all %u attempts failed\r\n", FR_LOG_ATTEMPTS);
+    return false;
 }
 
 /* --------------------------------------------------------------------------
@@ -522,10 +575,30 @@ static bool FARMRANGER_bParseLoggerReady(const char *line, void *ctx)
     return (line != NULL && strstr(line, "Logger ready") != NULL);
 }
 
-static bool FARMRANGER_bParseOK(const char *line, void *ctx)
+/* Transfer verdict: matches "OK" (success) or "ERR" (fr9 timed out — bytes
+ * were lost on the wire). Writes 'O'/'E' into ctx so the caller can tell the
+ * two apart; matching ERR here (instead of only OK) lets a failed upload
+ * fail fast rather than burn the whole verdict window. Note "ERR" must be
+ * checked first: strstr("ERR...", "OK") can't false-match, but keeping the
+ * explicit order makes the precedence obvious. */
+static bool FARMRANGER_bParseLogVerdict(const char *line, void *ctx)
 {
-    (void)ctx;
-    return (line != NULL && strstr(line, "OK") != NULL);
+    char *pcVerdict = (char *)ctx;
+
+    if (line == NULL)
+        return false;
+
+    if (strstr(line, "ERR") != NULL)
+    {
+        *pcVerdict = 'E';
+        return true;
+    }
+    if (strstr(line, "OK") != NULL)
+    {
+        *pcVerdict = 'O';
+        return true;
+    }
+    return false;
 }
 
 static bool FARMRANGER_bParseRDY(const char *line, void *ctx)
