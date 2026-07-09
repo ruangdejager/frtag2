@@ -94,42 +94,36 @@ void INIT_vInitialization(void *parameters)
      * .cproject or build_config.h happened to say at build time. Only lists
      * options this TU actually saw defined -- the string is assembled by the
      * preprocessor, not read back at runtime. */
-    DBG_LOG("Build config:"
+    DBG_LOG("\r\n\r\nBuild config:\r\n"
 #ifdef FRKERNEL_INTERFACE_UART
-        " FRKERNEL_INTERFACE_UART"
+        " FRKERNEL_INTERFACE_UART\r\n"
 #endif
 #ifdef FRKERNEL_INTERFACE_LORA
-        " FRKERNEL_INTERFACE_LORA"
+        " FRKERNEL_INTERFACE_LORA\r\n"
 #endif
 #ifdef FRKERNEL_INTERFACE_LORA_BRIDGE
-        " FRKERNEL_INTERFACE_LORA_BRIDGE"
+        " FRKERNEL_INTERFACE_LORA_BRIDGE\r\n"
 #endif
 #ifdef STORAGE_BACKEND_FLASH
-        " STORAGE_BACKEND_FLASH"
+        " STORAGE_BACKEND_FLASH\r\n"
 #endif
 #ifdef STORAGE_BACKEND_MICROSD
-        " STORAGE_BACKEND_MICROSD"
+        " STORAGE_BACKEND_MICROSD\r\n"
 #endif
 #ifdef DEBUG_OUTPUT_UART
-        " DEBUG_OUTPUT_UART"
+        " DEBUG_OUTPUT_UART\r\n"
 #endif
 #ifdef DEBUG_OUTPUT_USB
-        " DEBUG_OUTPUT_USB"
-#endif
-#ifdef ENABLE_MOVE
-        " ENABLE_MOVE"
-#endif
-#ifdef ENABLE_GPS
-        " ENABLE_GPS"
+        " DEBUG_OUTPUT_USB\r\n"
 #endif
 #ifdef LEDS_ALLOWED
-        " LEDS_ALLOWED"
+        " LEDS_ALLOWED\r\n"
 #endif
 #ifdef ENABLE_RADIO_TEST
-        " ENABLE_RADIO_TEST"
+        " ENABLE_RADIO_TEST\r\n"
 #endif
 #ifdef ENABLE_LOW_POWER_RECOVERY
-        " ENABLE_LOW_POWER_RECOVERY"
+        " ENABLE_LOW_POWER_RECOVERY\r\n"
 #endif
         "\r\n");
 
@@ -200,29 +194,23 @@ void INIT_vInitialization(void *parameters)
     if (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY)
     {
         SOLAR_vInit();
-#ifdef ENABLE_MOVE
         ACC_vInit();
-#  ifdef STORAGE_BACKEND_MICROSD
+#ifdef STORAGE_BACKEND_MICROSD
         /* Recover the ACC-data write head before the movement task (which feeds
          * the logger from its 1 Hz FIFO drain) starts ticking. */
         ACCLOG_vInit();
-#  endif
+#endif
         MOVE_vInit();
-#endif
-#ifdef ENABLE_GPS
         GPS_vInit();
-#endif
     }
     else
     {
-#ifdef ENABLE_MOVE
         /* The accelerometer is fitted and powered on primaries too, but the
          * primary doesn't track movement. Left in its undefined power-on state
          * its I/O drew ~115 uA; configured-but-active (25 Hz, un-drained FIFO)
          * ~45 uA; full power-down was worse (floating SPI inputs crowbar). So
          * use a low-power, no-FIFO idle config - I/O active, nothing to overrun. */
         ACC_vConfigIdle();
-#endif
         /* Primary: bring up the Farmranger UART link to the fr9 logger board.
          * (Debug UART is a separate peripheral, so the two no longer conflict.) */
         FARMRANGER_vInit();

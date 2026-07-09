@@ -415,10 +415,8 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
      * old code: first campaign at the next boundary. */
     static uint64_t u64LastFiredSlot = 0;
     static bool     bSlotValid       = false;
-#ifdef ENABLE_GPS
     static uint64_t u64LastGpsSlot   = 0;
     static bool     bGpsSlotValid    = false;
-#endif
 
     PLATFORM_bSubscribeToHeartbeat(osThreadGetId(), HB_ALLOW_IN_RECOVERY);
 
@@ -545,7 +543,6 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             }
         }
 
-#ifdef ENABLE_GPS
         /* --- GPS pre-trigger (SECONDARY only) ---
          * GPS is not fitted on PRIMARY boards. Fire-and-forget 3 minutes
          * before each scheduled wake so a fresh fix is cached by the time
@@ -603,7 +600,6 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
              * can never run forever */
             GPS_vRequestFix(true, 120);
         }
-#endif
     }
 }
 

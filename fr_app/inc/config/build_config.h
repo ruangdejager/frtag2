@@ -26,8 +26,8 @@
  * See fr_app/Worker/FrKernel/FrKernel_Config.h.
  * -------------------------------------------------------------------------- */
 // #define FRKERNEL_INTERFACE_UART        /* debug UART (bench use) */
-// #define FRKERNEL_INTERFACE_LORA        /* LoRa radio (deployed secondary) */
-#define FRKERNEL_INTERFACE_LORA_BRIDGE    /* UART<->LoRa relay (bench test rig) */
+ #define FRKERNEL_INTERFACE_LORA        /* LoRa radio (deployed secondary) */
+//#define FRKERNEL_INTERFACE_LORA_BRIDGE    /* UART<->LoRa relay (bench test rig) */
 
 /* --------------------------------------------------------------------------
  * Persistent-storage backend — select exactly one. Mutually exclusive
@@ -47,9 +47,11 @@
 
 /* --------------------------------------------------------------------------
  * Feature toggles
+ *
+ * Movement (shake-to-wake / movement sequencing) and GPS are always built
+ * in -- not configurable here, no ENABLE_MOVE / ENABLE_GPS guards remain in
+ * the code.
  * -------------------------------------------------------------------------- */
-#define ENABLE_MOVE                       /* shake-to-wake / movement sequencing */
-#define ENABLE_GPS
 #define LEDS_ALLOWED                      /* currently unreferenced in code */
 // #define ENABLE_RADIO_TEST              /* radio smoke-test task, see fr_app/Tasks/RadioTest */
 // #define ENABLE_LOW_POWER_RECOVERY      /* see fr_app/Tasks/DeviceDiscovery/DeviceDiscovery.h */
