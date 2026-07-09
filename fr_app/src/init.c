@@ -42,6 +42,7 @@
 #ifdef ENABLE_RADIO_TEST
 #  include "RadioTest.h"
 #endif
+#include "FrKernel_Config.h"
 #include "Battery.h"
 #include "SolarPower.h"
 #include "Power.h"
@@ -130,6 +131,18 @@ void INIT_vInitialization(void *parameters)
      * DBG output is visible on the debug UART (always enabled).
      */
     RADIO_TEST_vInit();
+#elif defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
+    /*
+     * UART<->LoRa FrKernel bridge (bench test rig): this primary's only job
+     * is relaying whatever the user types over the debug UART out as a LoRa
+     * FrKernel command, and printing whatever answer comes back. MeshNetwork
+     * supplies the radio TX/RX plumbing (its parser task is what delivers
+     * inbound FrKernel packets to FRKERNEL.c's callback); DeviceDiscovery,
+     * Farmranger, GPS and Movement are all skipped, same rationale as
+     * ENABLE_RADIO_TEST -- a scheduled campaign or logger session would
+     * fight this device for the radio/UART instead of just relaying.
+     */
+    MESHNETWORK_vInit();
 #else
     MESHNETWORK_vInit();
     DEVICE_DISCOVERY_vInit();
@@ -164,7 +177,7 @@ void INIT_vInitialization(void *parameters)
          * (Debug UART is a separate peripheral, so the two no longer conflict.) */
         FARMRANGER_vInit();
     }
-#endif /* ENABLE_RADIO_TEST */
+#endif /* ENABLE_RADIO_TEST / FRKERNEL_INTERFACE_LORA_BRIDGE */
 
     TIME_vInit();
     BAT_vInit();
