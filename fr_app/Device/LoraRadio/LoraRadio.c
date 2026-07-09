@@ -297,6 +297,17 @@ bool LORARADIO_bCarrierSense(void)
         return false;
     }
 
+    /* TX_PENDING is self-noise here: we're already inside TX processing for
+     * a packet already dequeued off xLoRaTxQueue (that's why CAD is running
+     * at all). LORARADIO_bTxPacket() sets this flag unconditionally, and it
+     * can still be pending the first time we wait on it if the flag was set
+     * after the radio task's top-of-loop flags-wait already snapshotted (a
+     * fast responder, e.g. FrKernel answering a just-received request, wins
+     * that race essentially every time). Treating our own trigger as a
+     * foreign interrupting event caused every first-attempt TX to abort and
+     * drop the packet with no retry. */
+    r &= ~RADIO_EVT_TX_PENDING;
+
     if (r & RADIO_EVT_CAD_BUSY)
     {
         DBG("Loraradio: CAD busy\r\n");
@@ -308,8 +319,12 @@ bool LORARADIO_bCarrierSense(void)
         return true;
     }
 
-    /* Another radio event arrived during CAD — stash it, report busy */
-    LORARADIO_vStashPendingEvents(r);
+    if (r)
+    {
+        /* Another, genuinely foreign radio event arrived during CAD — stash
+         * it, report busy. */
+        LORARADIO_vStashPendingEvents(r);
+    }
     return false;
 }
 
@@ -340,10 +355,19 @@ bool LORARADIO_bCarrierSenseAndWait(uint32_t maxWaitMs)
         uint32_t r = osThreadFlagsWait(ALL_FLAGS, osFlagsWaitAny, backoffMs);
         if (!(r & osFlagsError))
         {
+            /* Same self-noise as LORARADIO_bCarrierSense() — see comment
+             * there. Strip it before deciding whether something genuinely
+             * foreign woke us. */
+            r &= ~RADIO_EVT_TX_PENDING;
+
             if (r & RADIO_EVT_CAD_CLEAR) return true;
             if (r & RADIO_EVT_CAD_BUSY)  return false;
-            LORARADIO_vStashPendingEvents(r);
-            return false;
+            if (r)
+            {
+                LORARADIO_vStashPendingEvents(r);
+                return false;
+            }
+            /* Only our own TX_PENDING fired — spurious wake, retry CAD. */
         }
 
         failCount++;

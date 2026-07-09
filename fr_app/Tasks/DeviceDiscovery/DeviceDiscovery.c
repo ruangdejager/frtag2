@@ -621,14 +621,21 @@ static void DEVICE_DISCOVERY_vSendTS(void)
 void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
 {
     /* Hold off deep sleep until the resulting (no-op) campaign completes —
-     * released at the end of DEVICE_DISCOVERY_vAppTask's loop. */
+     * released at the end of DEVICE_DISCOVERY_vAppTask's loop.
+     *
+     * Both the debug UART and the radio are re-armed unconditionally here,
+     * matching the scheduled-wake path below — not one or the other picked
+     * by FRKERNEL_INTERFACE_LORA vs UART. DBG_LOG visibility has nothing to
+     * do with which transport FrKernel commands arrive on: a LORA-interface
+     * secondary still needs its debug UART alive for bench observation, and
+     * the radio must come out of its between-campaigns deep sleep on EVERY
+     * kernel wakeup regardless of interface, or a LoRa-delivered command
+     * (e.g. a broadcast "tag -devicereq") arrives at a radio that's still
+     * off and is never received. */
     SYSTEM_vSleepLockAcquire();
-#ifdef FRKERNEL_INTERFACE_LORA
-    LORARADIO_vWakeUp();
-#else
     HAL_UART_vInit();
     DEBUG_vInit();
-#endif
+    LORARADIO_vWakeUp();
     DBG("\r\n--- KERNEL WAKEUP ---\r\n");
 
     /* This is the single entry point for shake-triggered wakeups (only ever

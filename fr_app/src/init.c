@@ -24,6 +24,7 @@
 #include "hal_timer.h"
 #include "hal_uart.h"
 #include "hal_spi.h"
+#include "hal_system.h"
 #include "platform.h"
 #include "hal_gpio.h"
 #include "hal_adc.h"
@@ -143,6 +144,16 @@ void INIT_vInitialization(void *parameters)
      * fight this device for the radio/UART instead of just relaying.
      */
     MESHNETWORK_vInit();
+
+    /* This rig has to stay reachable at any moment: a sleep lock acquired
+     * and never released holds the whole system on the tickless-idle LIGHT
+     * WFI path forever, so it never drops into STOP2. That matters for two
+     * things at once -- STOP2 parks the debug UART pins to analog (the
+     * terminal would go dead), and it suspends the CPU core entirely, so
+     * the LoRa radio task could only service RX/TX once per 1 Hz RTC
+     * heartbeat instead of promptly. Without this the bridge looks "asleep"
+     * within moments of boot completing. */
+    SYSTEM_vSleepLockAcquire();
 #else
     MESHNETWORK_vInit();
     DEVICE_DISCOVERY_vInit();

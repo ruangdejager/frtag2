@@ -64,11 +64,16 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
-/* 44 KB (was 48 KB): the LoRa TX queue (24->8 slots) and mesh TX item size
- * (128->64 B) cut ~5.8 KB of heap demand, so 4 KB of the static heap moves
- * back to the .bss budget with runtime slack still ~1.8 KB better than
- * before. Still sized for all tasks incl. GPS dispatcher + RX. */
-#define configTOTAL_HEAP_SIZE                    ((size_t)45056)
+/* 45 KB (was 44 KB): FRKERNEL_INTERFACE_LORA allocates an extra inbound
+ * queue (FrKernel.c s_rxQueue, 4 x sizeof(FrKernelPkt_t)=129 B + the queue
+ * control block, ~650 B) that the UART interface doesn't need. First real
+ * boot of the LORA interface hit heap exhaustion -- POWER_vInit()'s task is
+ * the last one created in the boot sequence, so it's the one that finally
+ * found nothing left, regardless of which earlier allocation was the actual
+ * tipping point. +1 KB comfortably covers it with margin (chip has ~4.1 KB
+ * of RAM sitting idle outside .bss/.data at 44 KB, so this still leaves
+ * ~3.1 KB free afterward). */
+#define configTOTAL_HEAP_SIZE                    ((size_t)46080)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0
