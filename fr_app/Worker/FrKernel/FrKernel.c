@@ -101,7 +101,13 @@ void FRKERNEL_vInit(void)
 
     static const osThreadAttr_t attr = {
         .name       = "FrKernel",
-        .stack_size = configMINIMAL_STACK_SIZE * 6U,
+        /* CMSIS-RTOS v2 stack_size is BYTES; configMINIMAL_STACK_SIZE is a
+         * WORD count, so every other task in this codebase multiplies by
+         * sizeof(StackType_t). This one didn't -- it was actually allocating
+         * 768 B, a quarter of the intended ~3 KB, which the deeper call
+         * chain behind "tag prodsleep" (-> DEVICE_DISCOVERY_vEnterProductionSleep
+         * -> DBG_LOG's timestamp formatting) finally overran. */
+        .stack_size = configMINIMAL_STACK_SIZE * 6U * sizeof(StackType_t),
         .priority   = osPriorityLow,
     };
     s_taskHandle = osThreadNew(FRKERNEL_vTask, NULL, &attr);
