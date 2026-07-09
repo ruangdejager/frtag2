@@ -24,7 +24,7 @@
 #include "Acc.h"
 #include "DeviceDiscovery.h"
 
-#include "storage_config.h"
+#include "build_config.h"
 #ifdef STORAGE_BACKEND_MICROSD
 #  include "AccLog.h"
 #  include "platform_rtc.h"

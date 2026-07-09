@@ -9,6 +9,7 @@
 
 #include "hal_gpio.h"
 #include "hal_bsp.h"
+#include "build_config.h"
 
 #include "stm32wlxx.h"
 

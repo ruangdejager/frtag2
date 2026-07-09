@@ -16,7 +16,7 @@
  * then a byte-scan within it for the exact write head.
  */
 
-#include "storage_config.h"
+#include "build_config.h"
 
 #ifdef STORAGE_BACKEND_FLASH
 
@@ -224,16 +224,28 @@ void LOG_vErase(void)
 
 void LOG_vStreamToDebug(void)
 {
+    LOG_vStreamViaSink(DEBUG_vPutBuffer);
+}
+
+void LOG_vStreamViaSink(void (*sink)(const uint8_t *data, uint16_t len))
+{
     char hdr[64];
     int  n = snprintf(hdr, sizeof(hdr),
                       "\r\n==== EXT-FLASH LOG DUMP (%lu bytes) ====\r\n",
                       (unsigned long)LOG_u32GetUsedBytes());
     if (n > 0)
-        DEBUG_vPutBuffer((const uint8_t *)hdr, (uint16_t)n);
+        sink((const uint8_t *)hdr, (uint16_t)n);
 
     uint32_t u32Remaining = LOG_u32GetUsedBytes();
     uint32_t u32Addr      = u32StartAddr;        /* FIFO tail = oldest byte */
-    uint8_t  au8Chunk[64];
+    /* 200 B: comfortably under the LoRa FrKernel per-packet payload cap
+     * (LORA_MAX_PACKET_SIZE - 3 = 253 B), so a chunk normally maps to exactly
+     * one radio packet, while still being far fewer, larger flash reads /
+     * sink calls than the old 64 B chunking (which throttled throughput over
+     * both the debug UART and, worse, LoRa). A sink that needs a smaller
+     * unit (or gets handed a larger one, e.g. MicroSD's block-sized chunks)
+     * is free to split further itself. */
+    uint8_t  au8Chunk[200];
 
     while (u32Remaining > 0U)
     {
@@ -245,7 +257,7 @@ void LOG_vStreamToDebug(void)
             u16Chunk = (uint16_t)(LOG_FLASH_END_ADDR - u32Addr);
 
         FLASH_vRead(u32Addr, au8Chunk, u16Chunk);
-        DEBUG_vPutBuffer(au8Chunk, u16Chunk);
+        sink(au8Chunk, u16Chunk);
 
         u32Addr += u16Chunk;
         if (u32Addr >= LOG_FLASH_END_ADDR)
@@ -255,7 +267,7 @@ void LOG_vStreamToDebug(void)
     }
 
     static const char end[] = "\r\n==== EXT-FLASH LOG DUMP END ====\r\n";
-    DEBUG_vPutBuffer((const uint8_t *)end, (uint16_t)(sizeof(end) - 1U));
+    sink((const uint8_t *)end, (uint16_t)(sizeof(end) - 1U));
 }
 
 /* -------------------------------------------------------------------------- */

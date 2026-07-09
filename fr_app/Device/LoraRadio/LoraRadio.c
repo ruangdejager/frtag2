@@ -138,6 +138,25 @@ bool LORARADIO_bTxPacket(LoraRadio_Packet_t *packet)
 }
 
 /* --------------------------------------------------------------------------
+ * LORARADIO_bTxPacketWait — enqueue, blocking while the queue is full
+ * -------------------------------------------------------------------------- */
+bool LORARADIO_bTxPacketWait(LoraRadio_Packet_t *packet, uint32_t timeoutMs)
+{
+    if (packet->length > (LORA_MAX_PACKET_SIZE - 2))
+        return false;
+
+    /* Blocking put: FreeRTOS wakes this caller the moment the radio task's
+     * osMessageQueueGet() pulls the head item, i.e. as soon as it has
+     * actually finished with the previous packet -- no polling, no guessed
+     * delay. */
+    if (osMessageQueuePut(xLoRaTxQueue, packet, 0, timeoutMs) != osOK)
+        return false;
+
+    osThreadFlagsSet(LORARADIO_vRadioTask_handle, RADIO_EVT_TX_PENDING);
+    return true;
+}
+
+/* --------------------------------------------------------------------------
  * LORARADIO_vRadioTask — main radio state machine
  * -------------------------------------------------------------------------- */
 void LORARADIO_vRadioTask(void *arg)

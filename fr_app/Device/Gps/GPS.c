@@ -12,6 +12,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "GPS.h"
+#include "build_config.h"
 #include "Power.h"
 #include "platform_rtc.h"
 #include "dbg_log.h"

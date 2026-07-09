@@ -2,7 +2,7 @@
  * FrKernel_Config.h
  *
  * Compile-time configuration for the FrKernel command interface.
- * Define exactly one transport in the project preprocessor settings:
+ * Transport is selected in fr_app/inc/config/build_config.h — exactly one of:
  *   FRKERNEL_INTERFACE_UART        — debug UART (bench use)
  *   FRKERNEL_INTERFACE_LORA        — LoRa radio (deployed device)
  *   FRKERNEL_INTERFACE_LORA_BRIDGE — UART<->LoRa relay (bench test rig: a
@@ -16,10 +16,7 @@
 #ifndef WORKER_FRKERNEL_FRKERNEL_CONFIG_H_
 #define WORKER_FRKERNEL_FRKERNEL_CONFIG_H_
 
-#if (defined(FRKERNEL_INTERFACE_UART) + defined(FRKERNEL_INTERFACE_LORA) + \
-     defined(FRKERNEL_INTERFACE_LORA_BRIDGE)) != 1
-#  error "Define exactly one of FRKERNEL_INTERFACE_UART, FRKERNEL_INTERFACE_LORA, FRKERNEL_INTERFACE_LORA_BRIDGE"
-#endif
+#include "build_config.h"
 
 #define FRKERNEL_CMD_PREFIX             "tag"
 #define FRKERNEL_LINE_BUF_LEN          128U    /* max command line length (bytes)        */

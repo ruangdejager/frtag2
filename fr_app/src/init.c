@@ -20,6 +20,7 @@
  */
 
 #include "init.h"
+#include "build_config.h"
 #include "hal_rtc.h"
 #include "hal_timer.h"
 #include "hal_uart.h"
@@ -54,7 +55,6 @@
 #include "Log.h"
 #include "DbgLog.h"
 
-#include "storage_config.h"
 #ifdef STORAGE_BACKEND_MICROSD
 #  include "MicroSD.h"
 #  include "AccLog.h"
@@ -88,6 +88,51 @@ void INIT_vInitialization(void *parameters)
 
     DBGLOG_vInit();
 
+    /* Record the active build_config.h feature set at the top of every boot
+     * log, so "what did I actually flash" is recoverable from the terminal
+     * (or, once persisted, the flash/SD log) instead of only from whatever
+     * .cproject or build_config.h happened to say at build time. Only lists
+     * options this TU actually saw defined -- the string is assembled by the
+     * preprocessor, not read back at runtime. */
+    DBG_LOG("Build config:"
+#ifdef FRKERNEL_INTERFACE_UART
+        " FRKERNEL_INTERFACE_UART"
+#endif
+#ifdef FRKERNEL_INTERFACE_LORA
+        " FRKERNEL_INTERFACE_LORA"
+#endif
+#ifdef FRKERNEL_INTERFACE_LORA_BRIDGE
+        " FRKERNEL_INTERFACE_LORA_BRIDGE"
+#endif
+#ifdef STORAGE_BACKEND_FLASH
+        " STORAGE_BACKEND_FLASH"
+#endif
+#ifdef STORAGE_BACKEND_MICROSD
+        " STORAGE_BACKEND_MICROSD"
+#endif
+#ifdef DEBUG_OUTPUT_UART
+        " DEBUG_OUTPUT_UART"
+#endif
+#ifdef DEBUG_OUTPUT_USB
+        " DEBUG_OUTPUT_USB"
+#endif
+#ifdef ENABLE_MOVE
+        " ENABLE_MOVE"
+#endif
+#ifdef ENABLE_GPS
+        " ENABLE_GPS"
+#endif
+#ifdef LEDS_ALLOWED
+        " LEDS_ALLOWED"
+#endif
+#ifdef ENABLE_RADIO_TEST
+        " ENABLE_RADIO_TEST"
+#endif
+#ifdef ENABLE_LOW_POWER_RECOVERY
+        " ENABLE_LOW_POWER_RECOVERY"
+#endif
+        "\r\n");
+
     /* Bring up the selected storage backend (mutually exclusive HW, same SPI2
      * bus). LOG_vInit() then recovers the text-log FIFO on whichever is fitted. */
 #ifdef STORAGE_BACKEND_MICROSD
@@ -96,12 +141,6 @@ void INIT_vInitialization(void *parameters)
     FLASH_vInit();
 #endif
     LOG_vInit();
-
-    /* Ask the DbgLog consumer to stream the external-flash log over the debug
-     * UART once it runs — this replays everything DBG_LOG()/LOG() persisted in
-     * the previous run (the ext-flash readback test). Routed through the
-     * consumer so the dump never interleaves with live log output. */
-    DBGLOG_vRequestDump();
 
     FLASHLOG_vDump();     /* no-op unless ENABLE_FLASH_LOG + DEBUG_OUTPUT_UART both defined */
 
@@ -195,6 +234,16 @@ void INIT_vInitialization(void *parameters)
     POWER_vInit();
 
     BSP_LED_Off(LED_YELLOW);
+
+    /* Let the whole boot-time DBG_LOG output -- including the build-config
+     * line above -- actually drain out of DbgLog's ring and off the wire
+     * before this task exits. systemReadyForSleep is what gates the first
+     * STOP2 entry (INIT_bIsSleepReady(), checked by
+     * vPortSuppressTicksAndSleep()), so delaying it here is what makes the
+     * boot log's completion a precondition of the first sleep, not a race
+     * against it (same "let the log line drain" pattern used before
+     * FrKernel's prodsleep and OTASTORE_vArmBootloaderAndReset's reset). */
+    osDelay(100);
 
     systemReadyForSleep = true;
 

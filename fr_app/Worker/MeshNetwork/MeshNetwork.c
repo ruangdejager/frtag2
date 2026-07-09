@@ -18,6 +18,7 @@
 
 #include "MeshNetwork.h"
 #include "LoraRadio.h"
+#include "build_config.h"
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"   /* configMINIMAL_STACK_SIZE */
 #include "task.h"

@@ -36,6 +36,17 @@ typedef struct {
 void     LORARADIO_vInit(void);
 bool     LORARADIO_bRxPacket(LoraRadio_Packet_t *packet);
 bool     LORARADIO_bTxPacket(LoraRadio_Packet_t *packet);
+
+/* Same as LORARADIO_bTxPacket, but blocks the calling task (instead of
+ * dropping the packet) when the TX queue is momentarily full, up to
+ * timeoutMs. The queue only frees a slot once the radio task has actually
+ * finished with the packet ahead of it (transmitted or dropped after
+ * carrier-sense/back-off), so this lets a bulk sender (e.g. streaming the
+ * ext-flash log over LoRa) pace itself off real radio progress instead of a
+ * guessed fixed delay between sends. Not for latency-sensitive single
+ * responses -- those should keep using the non-blocking LORARADIO_bTxPacket. */
+bool     LORARADIO_bTxPacketWait(LoraRadio_Packet_t *packet, uint32_t timeoutMs);
+
 void     LORARADIO_vRadioTask(void *arg);
 uint32_t LORARADIO_u32GetUniqueId(void);
 

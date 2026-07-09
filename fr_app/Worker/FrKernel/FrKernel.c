@@ -58,7 +58,7 @@
 #include "LoraRadio.h"
 #include "DeviceDiscovery.h"
 
-#include "storage_config.h"
+#include "build_config.h"
 #include "DbgLog.h"
 #ifdef STORAGE_BACKEND_MICROSD
 #  include "AccLog.h"
@@ -149,6 +149,44 @@ static void FRKERNEL_vRespond(const char *msg)
     LORARADIO_bTxPacket(&pkt);
 #endif
 }
+
+#if defined(FRKERNEL_INTERFACE_LORA) && defined(STORAGE_BACKEND_FLASH)
+/* DbgLog's dump sink for "tag flash stream" on the LoRa interface: there's no
+ * UART session to read a UART-routed dump from, so the dump goes out as
+ * FrKernel LoRa packets instead (same framing as FRKERNEL_vRespond's LoRa
+ * branch, but with an explicit length rather than strlen — flash-log bytes
+ * aren't guaranteed to be NUL-free). Runs on the DbgLog consumer task (see
+ * DBGLOG_vRequestDumpVia), not this task.
+ *
+ * Sliced to the full per-packet payload (LORA_MAX_PACKET_SIZE - 3) rather
+ * than whatever chunk size the log backend happens to hand in — a caller
+ * chunk larger than that (e.g. a 512 B MicroSD block, on that backend) is
+ * split across as many packets as it takes instead of being silently
+ * truncated to the first slice.
+ *
+ * Paced with LORARADIO_bTxPacketWait instead of a fixed delay: it blocks
+ * only when the TX queue is actually full, and unblocks the instant the
+ * radio task makes room by picking up the packet ahead of it — i.e. paced
+ * off real radio progress, not a guessed inter-packet gap. */
+static void FRKERNEL_vLoraLogSink(const uint8_t *data, uint16_t len)
+{
+    const uint16_t maxPayload = (uint16_t)(LORA_MAX_PACKET_SIZE - 3);
+
+    while (len > 0U)
+    {
+        uint16_t n = (len > maxPayload) ? maxPayload : len;
+
+        LoraRadio_Packet_t pkt = {0};
+        pkt.buffer[0] = (uint8_t)MeshPktType_FrKernel;
+        memcpy(&pkt.buffer[1], data, n);
+        pkt.length = (uint8_t)(n + 1U);
+        LORARADIO_bTxPacketWait(&pkt, osWaitForever);
+
+        data += n;
+        len  = (uint16_t)(len - n);
+    }
+}
+#endif
 
 /* -------------------------------------------------------------------------- */
 
@@ -280,8 +318,16 @@ static void FRKERNEL_vProcessCommand(const char *line)
     }
     else if (strcmp(p, "flash stream") == 0)
     {
-        DBGLOG_vRequestDump();   /* consumer streams oldest -> newest */
+        /* consumer streams oldest -> newest, on whichever transport this
+         * session arrived on -- a LoRa session has no UART to read a
+         * UART-routed dump from. */
+#ifdef FRKERNEL_INTERFACE_LORA
+        DBGLOG_vRequestDumpVia(FRKERNEL_vLoraLogSink);
+        FRKERNEL_vRespond("Streaming ext-flash log via LoRa...\r\n");
+#else
+        DBGLOG_vRequestDump();
         FRKERNEL_vRespond("Streaming ext-flash log...\r\n");
+#endif
     }
 #endif
 #ifdef STORAGE_BACKEND_MICROSD
@@ -362,15 +408,58 @@ void MESHNETWORK_vOnFrKernelPacket(const uint8_t *buf, uint8_t len)
     osMessageQueuePut(s_rxQueue, &pkt, 0U, 0U);    /* non-blocking, ISR-safe */
 }
 #elif defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
+
+/* Substring search over a non-NUL-terminated FrKernel payload. */
+static bool FRKERNEL_bBufContains(const uint8_t *buf, uint8_t len, const char *needle)
+{
+    size_t needleLen = strlen(needle);
+    if (needleLen == 0U || (size_t)len < needleLen) return false;
+    size_t last = (size_t)len - needleLen;
+    for (size_t i = 0U; i <= last; i++)
+        if (memcmp(&buf[i], needle, needleLen) == 0) return true;
+    return false;
+}
+
+static bool s_bLogStreaming = false;
+
 /* Override the weak MeshNetwork callback — called from parser task context
- * (not an ISR), so writing straight to the debug UART here is safe. This is
- * the "answer": print it as-is, no local command processing. */
+ * (not an ISR), so writing straight to the debug UART here is safe. Normally
+ * prints "<-- <payload>" (the plain command/response case). While a "tag
+ * flash stream" dump is in flight -- bracketed by LOG_vStreamViaSink's
+ * "...LOG DUMP (...)" / "...LOG DUMP END" header/footer lines, relayed here
+ * like any other FrKernel packet -- switch to passing the raw payload
+ * straight through with no "<-- "/"\r\n" framing, and ask the 1 Hz heartbeat
+ * marker (platform.c) to hold off, so what lands on the terminal is the log
+ * itself instead of the relay's usual chrome interleaved with it. Both
+ * markers are matched as substrings, but in practice each always arrives
+ * whole in a single small packet (LOG_vStreamViaSink emits them as one
+ * sub-64-byte sink call each, well under one LoRa payload). */
 void MESHNETWORK_vOnFrKernelPacket(const uint8_t *buf, uint8_t len)
 {
     if (len == 0U) return;
-    DEBUG_vPutBuffer((const uint8_t *)"<-- ", 4U);
-    DEBUG_vPutBuffer(buf, len);
-    DEBUG_vPutBuffer((const uint8_t *)"\r\n", 2U);
+
+    if (!s_bLogStreaming && FRKERNEL_bBufContains(buf, len, "LOG DUMP ("))
+    {
+        s_bLogStreaming = true;
+        DEBUG_vSetQuiet(true);
+    }
+
+    if (s_bLogStreaming)
+    {
+        DEBUG_vPutBuffer(buf, len);
+    }
+    else
+    {
+        DEBUG_vPutBuffer((const uint8_t *)"<-- ", 4U);
+        DEBUG_vPutBuffer(buf, len);
+        DEBUG_vPutBuffer((const uint8_t *)"\r\n", 2U);
+    }
+
+    if (s_bLogStreaming && FRKERNEL_bBufContains(buf, len, "LOG DUMP END"))
+    {
+        s_bLogStreaming = false;
+        DEBUG_vSetQuiet(false);
+    }
 }
 #endif
 

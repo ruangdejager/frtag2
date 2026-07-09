@@ -49,6 +49,12 @@ void DBGLOG_vPutVerbose(uint8_t dest, const char *format, ...);
  * interleaving with live log output). */
 void DBGLOG_vRequestDump(void);
 
+/* Same as DBGLOG_vRequestDump, but streams via the given sink instead of the
+ * debug UART -- still run from the consumer task, so it can't race the
+ * consumer's own log writes on the shared storage device. Used by FrKernel's
+ * LoRa interface, which has no UART session to read a UART-routed dump from. */
+void DBGLOG_vRequestDumpVia(void (*sink)(const uint8_t *data, uint16_t len));
+
 /* Ask the consumer task to erase the whole text log (flash chip-erase / SD log
  * region reset). Done from the consumer so it never races the consumer's own
  * log writes on the shared storage device. */

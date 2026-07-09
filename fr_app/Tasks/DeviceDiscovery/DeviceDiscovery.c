@@ -15,6 +15,7 @@
 #include "DeviceDiscovery.h"
 #include "MeshNetwork.h"
 #include "Farmranger.h"
+#include "build_config.h"
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"   /* configMINIMAL_STACK_SIZE */
 #include "task.h"

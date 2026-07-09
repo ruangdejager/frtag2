@@ -68,7 +68,7 @@ HAL_StatusTypeDef HAL_SPI_FLASH_vReadPacket(uint8_t *rx, uint16_t len);
 /* -----------------------------------------------------------------------
  * SPI2 — MicroSD card (alternative population of the SPI2 footprint).
  * The MicroSD card and the NOR flash are mutually exclusive hardware
- * (storage_config.h) and share the same SPI2 bus + PA15 CS, so the SD path
+ * (build_config.h) and share the same SPI2 bus + PA15 CS, so the SD path
  * reuses the flash select/transfer primitives. The card additionally needs
  * a software-controllable clock rate: ~250 kHz (/128) for its power-up
  * handshake, then a faster rate (/8) for block transfers.
