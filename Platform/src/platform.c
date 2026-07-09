@@ -18,6 +18,7 @@
 #include "task.h"
 #include "platform.h"
 #include "dbg_log.h"
+#include "Debug.h"
 #include "hal_rtc.h"
 #include "hal_wdt.h"
 #include "hal_system.h"
@@ -99,7 +100,7 @@ void PLATFORM_vHeartbeatDispatchTask(void *parameters)
          * verbose timestamped line and clock ~30 bytes out of USART2 every
          * second for nothing, so skip it. SYSTEM_bCheckSleepModeStatus() returns
          * true when no lock is held. */
-        if (!SYSTEM_bCheckSleepModeStatus())
+        if (!SYSTEM_bCheckSleepModeStatus() && !DEBUG_bIsQuiet())
             DBG("\r\n");
     }
 }

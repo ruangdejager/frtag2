@@ -20,10 +20,12 @@
  */
 
 #include "init.h"
+#include "build_config.h"
 #include "hal_rtc.h"
 #include "hal_timer.h"
 #include "hal_uart.h"
 #include "hal_spi.h"
+#include "hal_system.h"
 #include "platform.h"
 #include "hal_gpio.h"
 #include "hal_adc.h"
@@ -42,6 +44,7 @@
 #ifdef ENABLE_RADIO_TEST
 #  include "RadioTest.h"
 #endif
+#include "FrKernel_Config.h"
 #include "Battery.h"
 #include "SolarPower.h"
 #include "Power.h"
@@ -52,7 +55,6 @@
 #include "Log.h"
 #include "DbgLog.h"
 
-#include "storage_config.h"
 #ifdef STORAGE_BACKEND_MICROSD
 #  include "MicroSD.h"
 #  include "AccLog.h"
@@ -86,6 +88,45 @@ void INIT_vInitialization(void *parameters)
 
     DBGLOG_vInit();
 
+    /* Record the active build_config.h feature set at the top of every boot
+     * log, so "what did I actually flash" is recoverable from the terminal
+     * (or, once persisted, the flash/SD log) instead of only from whatever
+     * .cproject or build_config.h happened to say at build time. Only lists
+     * options this TU actually saw defined -- the string is assembled by the
+     * preprocessor, not read back at runtime. */
+    DBG_LOG("\r\n\r\nBuild config:\r\n"
+#ifdef FRKERNEL_INTERFACE_UART
+        " FRKERNEL_INTERFACE_UART\r\n"
+#endif
+#ifdef FRKERNEL_INTERFACE_LORA
+        " FRKERNEL_INTERFACE_LORA\r\n"
+#endif
+#ifdef FRKERNEL_INTERFACE_LORA_BRIDGE
+        " FRKERNEL_INTERFACE_LORA_BRIDGE\r\n"
+#endif
+#ifdef STORAGE_BACKEND_FLASH
+        " STORAGE_BACKEND_FLASH\r\n"
+#endif
+#ifdef STORAGE_BACKEND_MICROSD
+        " STORAGE_BACKEND_MICROSD\r\n"
+#endif
+#ifdef DEBUG_OUTPUT_UART
+        " DEBUG_OUTPUT_UART\r\n"
+#endif
+#ifdef DEBUG_OUTPUT_USB
+        " DEBUG_OUTPUT_USB\r\n"
+#endif
+#ifdef LEDS_ALLOWED
+        " LEDS_ALLOWED\r\n"
+#endif
+#ifdef ENABLE_RADIO_TEST
+        " ENABLE_RADIO_TEST\r\n"
+#endif
+#ifdef ENABLE_LOW_POWER_RECOVERY
+        " ENABLE_LOW_POWER_RECOVERY\r\n"
+#endif
+        "\r\n");
+
     /* Bring up the selected storage backend (mutually exclusive HW, same SPI2
      * bus). LOG_vInit() then recovers the text-log FIFO on whichever is fitted. */
 #ifdef STORAGE_BACKEND_MICROSD
@@ -94,12 +135,6 @@ void INIT_vInitialization(void *parameters)
     FLASH_vInit();
 #endif
     LOG_vInit();
-
-    /* Ask the DbgLog consumer to stream the external-flash log over the debug
-     * UART once it runs — this replays everything DBG_LOG()/LOG() persisted in
-     * the previous run (the ext-flash readback test). Routed through the
-     * consumer so the dump never interleaves with live log output. */
-    DBGLOG_vRequestDump();
 
     FLASHLOG_vDump();     /* no-op unless ENABLE_FLASH_LOG + DEBUG_OUTPUT_UART both defined */
 
@@ -130,6 +165,28 @@ void INIT_vInitialization(void *parameters)
      * DBG output is visible on the debug UART (always enabled).
      */
     RADIO_TEST_vInit();
+#elif defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
+    /*
+     * UART<->LoRa FrKernel bridge (bench test rig): this primary's only job
+     * is relaying whatever the user types over the debug UART out as a LoRa
+     * FrKernel command, and printing whatever answer comes back. MeshNetwork
+     * supplies the radio TX/RX plumbing (its parser task is what delivers
+     * inbound FrKernel packets to FRKERNEL.c's callback); DeviceDiscovery,
+     * Farmranger, GPS and Movement are all skipped, same rationale as
+     * ENABLE_RADIO_TEST -- a scheduled campaign or logger session would
+     * fight this device for the radio/UART instead of just relaying.
+     */
+    MESHNETWORK_vInit();
+
+    /* This rig has to stay reachable at any moment: a sleep lock acquired
+     * and never released holds the whole system on the tickless-idle LIGHT
+     * WFI path forever, so it never drops into STOP2. That matters for two
+     * things at once -- STOP2 parks the debug UART pins to analog (the
+     * terminal would go dead), and it suspends the CPU core entirely, so
+     * the LoRa radio task could only service RX/TX once per 1 Hz RTC
+     * heartbeat instead of promptly. Without this the bridge looks "asleep"
+     * within moments of boot completing. */
+    SYSTEM_vSleepLockAcquire();
 #else
     MESHNETWORK_vInit();
     DEVICE_DISCOVERY_vInit();
@@ -137,40 +194,44 @@ void INIT_vInitialization(void *parameters)
     if (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY)
     {
         SOLAR_vInit();
-#ifdef ENABLE_MOVE
         ACC_vInit();
-#  ifdef STORAGE_BACKEND_MICROSD
+#ifdef STORAGE_BACKEND_MICROSD
         /* Recover the ACC-data write head before the movement task (which feeds
          * the logger from its 1 Hz FIFO drain) starts ticking. */
         ACCLOG_vInit();
-#  endif
+#endif
         MOVE_vInit();
-#endif
-#ifdef ENABLE_GPS
         GPS_vInit();
-#endif
     }
     else
     {
-#ifdef ENABLE_MOVE
         /* The accelerometer is fitted and powered on primaries too, but the
          * primary doesn't track movement. Left in its undefined power-on state
          * its I/O drew ~115 uA; configured-but-active (25 Hz, un-drained FIFO)
          * ~45 uA; full power-down was worse (floating SPI inputs crowbar). So
          * use a low-power, no-FIFO idle config - I/O active, nothing to overrun. */
         ACC_vConfigIdle();
-#endif
         /* Primary: bring up the Farmranger UART link to the fr9 logger board.
          * (Debug UART is a separate peripheral, so the two no longer conflict.) */
         FARMRANGER_vInit();
     }
-#endif /* ENABLE_RADIO_TEST */
+#endif /* ENABLE_RADIO_TEST / FRKERNEL_INTERFACE_LORA_BRIDGE */
 
     TIME_vInit();
     BAT_vInit();
     POWER_vInit();
 
     BSP_LED_Off(LED_YELLOW);
+
+    /* Let the whole boot-time DBG_LOG output -- including the build-config
+     * line above -- actually drain out of DbgLog's ring and off the wire
+     * before this task exits. systemReadyForSleep is what gates the first
+     * STOP2 entry (INIT_bIsSleepReady(), checked by
+     * vPortSuppressTicksAndSleep()), so delaying it here is what makes the
+     * boot log's completion a precondition of the first sleep, not a race
+     * against it (same "let the log line drain" pattern used before
+     * FrKernel's prodsleep and OTASTORE_vArmBootloaderAndReset's reset). */
+    osDelay(100);
 
     systemReadyForSleep = true;
 

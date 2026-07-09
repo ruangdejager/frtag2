@@ -13,7 +13,7 @@
  * parser walks the stream by magic + count.
  */
 
-#include "storage_config.h"
+#include "build_config.h"
 
 #ifdef STORAGE_BACKEND_MICROSD
 

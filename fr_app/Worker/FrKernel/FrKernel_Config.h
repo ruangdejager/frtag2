@@ -2,20 +2,21 @@
  * FrKernel_Config.h
  *
  * Compile-time configuration for the FrKernel command interface.
- * Define exactly one transport in the project preprocessor settings:
- *   FRKERNEL_INTERFACE_UART  — debug UART (bench use)
- *   FRKERNEL_INTERFACE_LORA  — LoRa radio (deployed device)
+ * Transport is selected in fr_app/inc/config/build_config.h — exactly one of:
+ *   FRKERNEL_INTERFACE_UART        — debug UART (bench use)
+ *   FRKERNEL_INTERFACE_LORA        — LoRa radio (deployed device)
+ *   FRKERNEL_INTERFACE_LORA_BRIDGE — UART<->LoRa relay (bench test rig: a
+ *                                    primary that forwards whatever's typed
+ *                                    over UART out as a LoRa FrKernel command
+ *                                    and prints whatever comes back. Also
+ *                                    skips DeviceDiscovery/Farmranger/GPS —
+ *                                    see init.c)
  */
 
 #ifndef WORKER_FRKERNEL_FRKERNEL_CONFIG_H_
 #define WORKER_FRKERNEL_FRKERNEL_CONFIG_H_
 
-#if defined(FRKERNEL_INTERFACE_UART) && defined(FRKERNEL_INTERFACE_LORA)
-#  error "Define only one of FRKERNEL_INTERFACE_UART or FRKERNEL_INTERFACE_LORA"
-#endif
-#if !defined(FRKERNEL_INTERFACE_UART) && !defined(FRKERNEL_INTERFACE_LORA)
-#  error "Define one of FRKERNEL_INTERFACE_UART or FRKERNEL_INTERFACE_LORA"
-#endif
+#include "build_config.h"
 
 #define FRKERNEL_CMD_PREFIX             "tag"
 #define FRKERNEL_LINE_BUF_LEN          128U    /* max command line length (bytes)        */

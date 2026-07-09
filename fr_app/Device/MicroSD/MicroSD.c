@@ -3,7 +3,7 @@
  *
  * MicroSD card driver, SPI mode, raw 512-byte block access (no filesystem).
  * Shares the SPI2 bus + PA15 CS with the NOR-flash footprint; the two are
- * mutually exclusive hardware (storage_config.h), so this whole TU is empty
+ * mutually exclusive hardware (build_config.h), so this whole TU is empty
  * unless STORAGE_BACKEND_MICROSD is selected.
  *
  * Init handshake clocks at ~250 kHz (SPI mandates <=400 kHz until the card is
@@ -12,7 +12,7 @@
  * accelerometer write loads.
  */
 
-#include "storage_config.h"
+#include "build_config.h"
 
 #ifdef STORAGE_BACKEND_MICROSD
 

@@ -15,6 +15,7 @@
 #define INC_FLASHLOG_H_
 
 #include <stdint.h>
+#include "build_config.h"
 
 #ifdef ENABLE_FLASH_LOG
 

@@ -138,6 +138,25 @@ bool LORARADIO_bTxPacket(LoraRadio_Packet_t *packet)
 }
 
 /* --------------------------------------------------------------------------
+ * LORARADIO_bTxPacketWait — enqueue, blocking while the queue is full
+ * -------------------------------------------------------------------------- */
+bool LORARADIO_bTxPacketWait(LoraRadio_Packet_t *packet, uint32_t timeoutMs)
+{
+    if (packet->length > (LORA_MAX_PACKET_SIZE - 2))
+        return false;
+
+    /* Blocking put: FreeRTOS wakes this caller the moment the radio task's
+     * osMessageQueueGet() pulls the head item, i.e. as soon as it has
+     * actually finished with the previous packet -- no polling, no guessed
+     * delay. */
+    if (osMessageQueuePut(xLoRaTxQueue, packet, 0, timeoutMs) != osOK)
+        return false;
+
+    osThreadFlagsSet(LORARADIO_vRadioTask_handle, RADIO_EVT_TX_PENDING);
+    return true;
+}
+
+/* --------------------------------------------------------------------------
  * LORARADIO_vRadioTask — main radio state machine
  * -------------------------------------------------------------------------- */
 void LORARADIO_vRadioTask(void *arg)
@@ -297,6 +316,17 @@ bool LORARADIO_bCarrierSense(void)
         return false;
     }
 
+    /* TX_PENDING is self-noise here: we're already inside TX processing for
+     * a packet already dequeued off xLoRaTxQueue (that's why CAD is running
+     * at all). LORARADIO_bTxPacket() sets this flag unconditionally, and it
+     * can still be pending the first time we wait on it if the flag was set
+     * after the radio task's top-of-loop flags-wait already snapshotted (a
+     * fast responder, e.g. FrKernel answering a just-received request, wins
+     * that race essentially every time). Treating our own trigger as a
+     * foreign interrupting event caused every first-attempt TX to abort and
+     * drop the packet with no retry. */
+    r &= ~RADIO_EVT_TX_PENDING;
+
     if (r & RADIO_EVT_CAD_BUSY)
     {
         DBG("Loraradio: CAD busy\r\n");
@@ -308,8 +338,12 @@ bool LORARADIO_bCarrierSense(void)
         return true;
     }
 
-    /* Another radio event arrived during CAD — stash it, report busy */
-    LORARADIO_vStashPendingEvents(r);
+    if (r)
+    {
+        /* Another, genuinely foreign radio event arrived during CAD — stash
+         * it, report busy. */
+        LORARADIO_vStashPendingEvents(r);
+    }
     return false;
 }
 
@@ -340,10 +374,19 @@ bool LORARADIO_bCarrierSenseAndWait(uint32_t maxWaitMs)
         uint32_t r = osThreadFlagsWait(ALL_FLAGS, osFlagsWaitAny, backoffMs);
         if (!(r & osFlagsError))
         {
+            /* Same self-noise as LORARADIO_bCarrierSense() — see comment
+             * there. Strip it before deciding whether something genuinely
+             * foreign woke us. */
+            r &= ~RADIO_EVT_TX_PENDING;
+
             if (r & RADIO_EVT_CAD_CLEAR) return true;
             if (r & RADIO_EVT_CAD_BUSY)  return false;
-            LORARADIO_vStashPendingEvents(r);
-            return false;
+            if (r)
+            {
+                LORARADIO_vStashPendingEvents(r);
+                return false;
+            }
+            /* Only our own TX_PENDING fired — spurious wake, retry CAD. */
         }
 
         failCount++;

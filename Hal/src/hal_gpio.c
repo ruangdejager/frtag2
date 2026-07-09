@@ -28,11 +28,7 @@ void HAL_GPIO_vInit(void)
     HAL_GPIO_vInitOutput(BSP_GNSS_ON_PORT, BSP_GNSS_ON_PIN, GPIO_PIN_RESET);
 
     /* Accelerometer chip-select */
-#ifdef ENABLE_MOVE
     HAL_GPIO_vInitOutput(BSP_ACC_CS_PORT, BSP_ACC_CS_PIN, GPIO_PIN_SET);
-#else
-    HAL_GPIO_vInitOutput(BSP_ACC_CS_PORT, BSP_ACC_CS_PIN, GPIO_PIN_RESET);
-#endif
     /* ACC SPI SCK/MISO/MOSI are initialised by hal_spi */
 
     /* Battery measurement */

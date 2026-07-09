@@ -30,12 +30,8 @@
 #include "Battery.h"
 #include "flashLog.h"
 
-#ifdef ENABLE_GPS
 #include "GPS.h"
-#endif
-#ifdef ENABLE_MOVE
 #include "Movement.h"
-#endif
 
 /* ---- DBeacon flags byte (byte 15) ---- */
 #define MESH_BEACON_FLAG_STILL      0x01U   /* bit0: 1 = still, 0 = moving */
@@ -425,10 +421,7 @@ static void MESHNETWORK_vBuildAndQueueBeacon(void)
     tBeacon.i32LatUDeg  = 0;
     tBeacon.i32LonUDeg  = 0;
     uint32_t u32GpsAgeS = UINT32_MAX;   /* age of the fix we evaluated (for log) */
-#ifdef ENABLE_MOVE
     tBeacon.u8MoveState = (MOVE_eGetState() == MOVE_STATE_STILL) ? 1U : 0U;
-#endif
-#ifdef ENABLE_GPS
     {
         gnss_coord_deg_t tLat, tLon;
         /* Only stamp a fix from the most recent pre-trigger: it must exist AND
@@ -442,7 +435,6 @@ static void MESHNETWORK_vBuildAndQueueBeacon(void)
             tBeacon.i32LonUDeg = tLon.i32MicroDeg;
         }
     }
-#endif
 
     DBG_LOG("MeshNetwork: Sending Beacon %08X move=%u gps=%u age=%lus\r\n",
         tBeacon.u32BeaconMsgId, tBeacon.u8MoveState, tBeacon.bGpsValid,

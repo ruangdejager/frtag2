@@ -3,7 +3,7 @@
  *
  * Public API for the MicroSD card (SPI mode, raw 512-byte block access).
  *
- * Mutually exclusive with the NOR flash (storage_config.h). Only compiled
+ * Mutually exclusive with the NOR flash (build_config.h). Only compiled
  * into an active translation unit when STORAGE_BACKEND_MICROSD is selected.
  */
 

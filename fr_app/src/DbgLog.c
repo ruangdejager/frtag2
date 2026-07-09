@@ -16,7 +16,7 @@
 #include "DbgLog.h"
 #include "Debug.h"
 #include "Log.h"
-#include "storage_config.h"
+#include "build_config.h"
 
 #include "platform_rtc.h"
 #include "Battery.h"
@@ -54,6 +54,7 @@ static osMutexId_t       xFmtMutex   = NULL;
 static osThreadId_t      xConsumer   = NULL;
 static volatile bool     bDumpRequested = false;
 static volatile bool     bEraseRequested = false;
+static void            (*pfnDumpSink)(const uint8_t *data, uint16_t len) = NULL;
 
 /* Count of whole messages dropped because the ring was full. Incremented under
  * xFmtMutex (on the producer push path); snapshotted+cleared under the same
@@ -215,6 +216,15 @@ void DBGLOG_vPutLog(const char *format, ...)
 
 void DBGLOG_vRequestDump(void)
 {
+    pfnDumpSink = NULL;
+    bDumpRequested = true;
+    if (xConsumer != NULL)
+        osThreadFlagsSet(xConsumer, DBGLOG_WAKE_FLAG);
+}
+
+void DBGLOG_vRequestDumpVia(void (*sink)(const uint8_t *data, uint16_t len))
+{
+    pfnDumpSink = sink;
     bDumpRequested = true;
     if (xConsumer != NULL)
         osThreadFlagsSet(xConsumer, DBGLOG_WAKE_FLAG);
@@ -251,7 +261,15 @@ static void DBGLOG_vConsumerTask(void *arg)
         if (bDumpRequested)
         {
             bDumpRequested = false;
-            LOG_vStreamToDebug();
+            if (pfnDumpSink != NULL)
+            {
+                LOG_vStreamViaSink(pfnDumpSink);
+                pfnDumpSink = NULL;
+            }
+            else
+            {
+                LOG_vStreamToDebug();
+            }
         }
 
         /* Drain every complete frame currently published. */
