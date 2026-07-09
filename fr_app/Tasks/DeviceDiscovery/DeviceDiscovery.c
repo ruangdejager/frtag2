@@ -437,12 +437,26 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             if (SOLAR_u32GetPowerMW() >= SOLAR_ACTIVATION_POWER_MW)
             {
                 eProductionState = PRODUCTION_ACTIVE;
+
+                /* Hold off deep sleep until the resulting kernel window
+                 * completes (released at the end of
+                 * DEVICE_DISCOVERY_vAppTask's loop). Re-arm the debug UART
+                 * BEFORE logging so the activation is observable live —
+                 * STOP2 parked its pins analog and this branch is otherwise
+                 * the only wake path that forgets to restore them. */
+                SYSTEM_vSleepLockAcquire();
+                HAL_UART_vInit();
+                DEBUG_vInit();
+
                 DBG_LOG("DeviceDiscovery: Solar activation (%lu mW) — exiting ProductionSleep\r\n",
                     SOLAR_u32GetPowerMW());
-                /* Hold off deep sleep until the resulting campaign completes
-                 * (released at the end of DEVICE_DISCOVERY_vAppTask's loop). */
-                SYSTEM_vSleepLockAcquire();
-                osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_WAKEUP_BIT);
+
+                /* Open a FrKernel window instead of an autonomous discovery
+                 * campaign (same path the shake-wakeup trigger uses); the
+                 * kernel's own 5-min inactivity timeout — or an explicit
+                 * "tag release" — is what returns the device to normal
+                 * scheduled-wake sleep from here. */
+                osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
             }
 #else
             /* Panel power sensing is disabled (broken RSENSE front-end); gate
@@ -450,12 +464,18 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             if (SOLAR_u16GetVSolarMV() >= SOLAR_ACTIVATION_VSOLAR_MV)
             {
                 eProductionState = PRODUCTION_ACTIVE;
+
+                /* See the ENABLE_SOLAR_POWER_SENSE branch above for why the
+                 * UART is re-armed here and why this opens a kernel window
+                 * rather than a discovery campaign. */
+                SYSTEM_vSleepLockAcquire();
+                HAL_UART_vInit();
+                DEBUG_vInit();
+
                 DBG_LOG("DeviceDiscovery: Solar activation (%u mV) — exiting ProductionSleep\r\n",
                     SOLAR_u16GetVSolarMV());
-                /* Hold off deep sleep until the resulting campaign completes
-                 * (released at the end of DEVICE_DISCOVERY_vAppTask's loop). */
-                SYSTEM_vSleepLockAcquire();
-                osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_WAKEUP_BIT);
+
+                osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
             }
 #endif
             continue;
@@ -610,6 +630,20 @@ void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
     DEBUG_vInit();
 #endif
     DBG("\r\n--- KERNEL WAKEUP ---\r\n");
+
+    /* This is the single entry point for shake-triggered wakeups (only ever
+     * called from the secondary-only shake-sequence in Movement.c, same
+     * role restriction as ProductionSleep — no role guard needed here). A
+     * shake already opens a kernel session regardless of eProductionState,
+     * but without this it never leaves ProductionSleep: once the session
+     * ends the device would fall back to waiting for Vsolar instead of
+     * resuming normal scheduled discovery. Mirrors the solar wake path. */
+    if (eProductionState == PRODUCTION_SLEEP)
+    {
+        eProductionState = PRODUCTION_ACTIVE;
+        DBG_LOG("DeviceDiscovery: Kernel wakeup — exiting ProductionSleep\r\n");
+    }
+
     osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
 }
 
