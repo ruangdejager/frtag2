@@ -249,6 +249,18 @@ static void FRKERNEL_vProcessCommand(const char *line)
     {
         DEVICE_DISCOVERY_vEnterProductionSleep();
         FRKERNEL_vRespond("ProductionSleep entered — wakes on Vsolar >= 3000 mV\r\n");
+
+        /* prodsleep is a terminal command: don't linger in an open session
+         * waiting for "tag release" or the 5-min inactivity timeout, or
+         * DeviceDiscovery's deep-sleep tail blocks on FRKERNEL_bIsConnected()
+         * for no reason. osDelay first so the response above — written
+         * directly to the UART TX ring, interrupt-drained in the background —
+         * actually leaves the wire before sleep can park the UART pins mid-
+         * transmission (same "let the log line drain" pattern used before
+         * OTASTORE_vArmBootloaderAndReset's reset). Then auto-release so
+         * sleep proceeds immediately instead of opening a kernel window. */
+        osDelay(100);
+        s_bConnected = false;
     }
 #ifdef STORAGE_BACKEND_FLASH
     else if (strcmp(p, "flash clear") == 0)
