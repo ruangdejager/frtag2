@@ -45,6 +45,7 @@
 #include "task.h"
 
 #include "Battery.h"
+#include "SolarPower.h"
 #include "MeshNetwork.h"
 #include "LoraRadio.h"
 #include "DeviceDiscovery.h"
@@ -188,7 +189,7 @@ static void FRKERNEL_vProcessCommand(const char *line)
             "FrKernel commands:\r\n"
             "  tag -devicereq              this device's ID\r\n"
             "  tag -help                   list commands\r\n"
-            "  tag battery                 battery voltage (mV)\r\n"
+            "  tag juice                   battery + solar panel voltage (mV)\r\n"
             "  tag discovery schedule      wakeup interval (min)\r\n"
             "  tag prodsleep               enter production sleep (secondary only)\r\n"
             "  tag release                 release device for sleep\r\n"
@@ -198,7 +199,7 @@ static void FRKERNEL_vProcessCommand(const char *line)
             "FrKernel commands:\r\n"
             "  tag -devicereq              discover all device IDs\r\n"
             "  tag <ID> -help              list commands\r\n"
-            "  tag <ID> battery            battery voltage (mV)\r\n"
+            "  tag <ID> juice              battery + solar panel voltage (mV)\r\n"
             "  tag <ID> discovery schedule wakeup interval (min)\r\n"
             "  tag <ID> prodsleep          enter production sleep (secondary only)\r\n"
             "  tag <ID> release            release device for sleep\r\n"
@@ -223,9 +224,13 @@ static void FRKERNEL_vProcessCommand(const char *line)
             "  tag <ID> sd log stream      stream MicroSD log\r\n");
 #endif
     }
-    else if (strcmp(p, "battery") == 0)
+    else if (strcmp(p, "juice") == 0)
     {
-        snprintf(resp, sizeof(resp), "Battery: %u mV\r\n", BAT_u16GetVoltage());
+        /* Solar getter is safe to call unconditionally: SolarPower is
+         * secondary-only (primaries have no panel), and its getter is a
+         * plain static-variable read that defaults to 0 if never inited. */
+        snprintf(resp, sizeof(resp), "Battery: %u mV  Solar: %u mV\r\n",
+                 BAT_u16GetVoltage(), SOLAR_u16GetVSolarMV());
         FRKERNEL_vRespond(resp);
     }
     else if (strcmp(p, "discovery schedule") == 0)

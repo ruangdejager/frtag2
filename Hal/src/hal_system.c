@@ -78,9 +78,17 @@ void HAL_SYSTEM_vEnterStop2(void)
 {
     /* Red LED off while in STOP2; back on the moment we wake. The LED is
      * therefore a direct visual indicator of the power mode: off == STOP2,
-     * on == running in any other mode. */
+     * on == running in any other mode.
+     *
+     * Yellow is NOT touched here (unlike red, it is never restored on wake).
+     * Its only owner is the Movement shake-sequence confirmation flash
+     * (MOVE_DRIVER_vLedOn/Off, bounded by a short osDelay with no sleep lock
+     * held) — STOP2 has no minimum-idle-time floor, so it can fire mid-flash,
+     * and force-clearing yellow here used to extinguish that flash almost
+     * immediately after it was set, well before the intended on-time. GPIO
+     * output level is retained across STOP2, so leaving yellow alone simply
+     * lets it stay lit through the sleep window when Movement is flashing it. */
     BSP_LED_Off(LED_RED);
-    BSP_LED_Off(LED_YELLOW);
 
     HAL_GPIO_vOnSleep();
 
