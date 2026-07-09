@@ -45,6 +45,7 @@
 #include "task.h"
 
 #include "Battery.h"
+#include "SolarPower.h"
 #include "MeshNetwork.h"
 #include "LoraRadio.h"
 #include "DeviceDiscovery.h"
@@ -100,7 +101,13 @@ void FRKERNEL_vInit(void)
 
     static const osThreadAttr_t attr = {
         .name       = "FrKernel",
-        .stack_size = configMINIMAL_STACK_SIZE * 6U,
+        /* CMSIS-RTOS v2 stack_size is BYTES; configMINIMAL_STACK_SIZE is a
+         * WORD count, so every other task in this codebase multiplies by
+         * sizeof(StackType_t). This one didn't -- it was actually allocating
+         * 768 B, a quarter of the intended ~3 KB, which the deeper call
+         * chain behind "tag prodsleep" (-> DEVICE_DISCOVERY_vEnterProductionSleep
+         * -> DBG_LOG's timestamp formatting) finally overran. */
+        .stack_size = configMINIMAL_STACK_SIZE * 6U * sizeof(StackType_t),
         .priority   = osPriorityLow,
     };
     s_taskHandle = osThreadNew(FRKERNEL_vTask, NULL, &attr);
@@ -188,7 +195,7 @@ static void FRKERNEL_vProcessCommand(const char *line)
             "FrKernel commands:\r\n"
             "  tag -devicereq              this device's ID\r\n"
             "  tag -help                   list commands\r\n"
-            "  tag battery                 battery voltage (mV)\r\n"
+            "  tag juice                   battery + solar panel voltage (mV)\r\n"
             "  tag discovery schedule      wakeup interval (min)\r\n"
             "  tag prodsleep               enter production sleep (secondary only)\r\n"
             "  tag release                 release device for sleep\r\n"
@@ -198,7 +205,7 @@ static void FRKERNEL_vProcessCommand(const char *line)
             "FrKernel commands:\r\n"
             "  tag -devicereq              discover all device IDs\r\n"
             "  tag <ID> -help              list commands\r\n"
-            "  tag <ID> battery            battery voltage (mV)\r\n"
+            "  tag <ID> juice              battery + solar panel voltage (mV)\r\n"
             "  tag <ID> discovery schedule wakeup interval (min)\r\n"
             "  tag <ID> prodsleep          enter production sleep (secondary only)\r\n"
             "  tag <ID> release            release device for sleep\r\n"
@@ -223,9 +230,13 @@ static void FRKERNEL_vProcessCommand(const char *line)
             "  tag <ID> sd log stream      stream MicroSD log\r\n");
 #endif
     }
-    else if (strcmp(p, "battery") == 0)
+    else if (strcmp(p, "juice") == 0)
     {
-        snprintf(resp, sizeof(resp), "Battery: %u mV\r\n", BAT_u16GetVoltage());
+        /* Solar getter is safe to call unconditionally: SolarPower is
+         * secondary-only (primaries have no panel), and its getter is a
+         * plain static-variable read that defaults to 0 if never inited. */
+        snprintf(resp, sizeof(resp), "Battery: %u mV  Solar: %u mV\r\n",
+                 BAT_u16GetVoltage(), SOLAR_u16GetVSolarMV());
         FRKERNEL_vRespond(resp);
     }
     else if (strcmp(p, "discovery schedule") == 0)
@@ -238,6 +249,18 @@ static void FRKERNEL_vProcessCommand(const char *line)
     {
         DEVICE_DISCOVERY_vEnterProductionSleep();
         FRKERNEL_vRespond("ProductionSleep entered — wakes on Vsolar >= 3000 mV\r\n");
+
+        /* prodsleep is a terminal command: don't linger in an open session
+         * waiting for "tag release" or the 5-min inactivity timeout, or
+         * DeviceDiscovery's deep-sleep tail blocks on FRKERNEL_bIsConnected()
+         * for no reason. osDelay first so the response above — written
+         * directly to the UART TX ring, interrupt-drained in the background —
+         * actually leaves the wire before sleep can park the UART pins mid-
+         * transmission (same "let the log line drain" pattern used before
+         * OTASTORE_vArmBootloaderAndReset's reset). Then auto-release so
+         * sleep proceeds immediately instead of opening a kernel window. */
+        osDelay(100);
+        s_bConnected = false;
     }
 #ifdef STORAGE_BACKEND_FLASH
     else if (strcmp(p, "flash clear") == 0)
