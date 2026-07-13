@@ -182,6 +182,12 @@ static void FRKERNEL_vLoraLogSink(const uint8_t *data, uint16_t len)
         pkt.length = (uint8_t)(n + 1U);
         LORARADIO_bTxPacketWait(&pkt, osWaitForever);
 
+        /* Each outbound packet counts as session activity — keeps the
+         * inactivity timer from firing during a long stream where no
+         * incoming commands arrive (the stream is one-way outbound). */
+        if (s_bConnected)
+            s_u32LastCmdTick = osKernelGetTickCount();
+
         data += n;
         len  = (uint16_t)(len - n);
     }
