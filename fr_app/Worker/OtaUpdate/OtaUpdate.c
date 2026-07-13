@@ -18,7 +18,7 @@
  * upload's "LOG TIMEOUT" history applied in the opposite direction.
  */
 
-#include "storage_config.h"
+#include "build_config.h"   /* STORAGE_BACKEND_FLASH (was storage_config.h) */
 
 #ifdef STORAGE_BACKEND_FLASH
 
@@ -216,6 +216,14 @@ bool OTAUPDATE_bUartAcquire(void)
 /* ---- Shared session state ---- */
 static uint32_t u32SessionId;
 
+/* Secondary firmware-acceptance gate (see OtaUpdate.h). A secondary drops
+ * every OtaPrep unless armed, so a deliberate "tag <ID> fwaccept" over a
+ * kernel session is required before any firmware is taken. */
+static volatile bool bFwAcceptArmed;
+
+/* Primary on-demand distribution request (see OtaUpdate.h). */
+static volatile bool bDistributeReq;
+
 /* ---- Primary: distribution target table (filled by the parser) ---- */
 typedef struct {
     uint32_t u32DeviceId;
@@ -321,6 +329,12 @@ void OTAUPDATE_vOnLoraPacket(const uint8_t *pu8Buf, uint16_t u16Len)
         {
             if (u16Len < OTA_PKT_PREP_LEN) return;
             if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_SECONDARY) return;
+
+            /* Acceptance gate: a secondary takes firmware ONLY after a
+             * deliberate "tag <ID> fwaccept" arms it. Unarmed devices ignore
+             * every prep so firmware can never be pushed to the field
+             * unattended. */
+            if (!bFwAcceptArmed) return;
 
             uint32_t u32Ver = OTAUPDATE_u32GetU32(&pu8Buf[5]);
             if (u32Ver <= VERSION_u32Get())
@@ -455,6 +469,36 @@ bool OTAUPDATE_bDistributePending(void)
     if (!OTASTORE_bGetMeta(&tMeta))
         return false;
     return (tMeta.u32Version == VERSION_u32Get()) && !tMeta.bDistributed;
+}
+
+bool OTAUPDATE_bRequestDistribute(void)
+{
+    /* Only arm the request when there's actually a valid image to send —
+     * distribution reads it straight from the ext-flash scratchpad. Unlike
+     * the auto path (bDistributePending) this ignores the version-match and
+     * distributed flags: an on-demand request re-sends whatever VALID image
+     * is staged, so a bench operator can re-run a distribution at will. */
+    OtaMeta_t tMeta;
+    if (!OTASTORE_bGetMeta(&tMeta) || !tMeta.bValid)
+    {
+        DBG_LOG("OtaUpdate: distribute requested but no valid image staged\r\n");
+        return false;
+    }
+
+    bDistributeReq = true;
+    DBG_LOG("OtaUpdate: distribute requested (v%lu, %lu B staged)\r\n",
+            (unsigned long)tMeta.u32Version, (unsigned long)tMeta.u32SizeBytes);
+    return true;
+}
+
+bool OTAUPDATE_bDistributeRequested(void)
+{
+    return bDistributeReq;
+}
+
+void OTAUPDATE_vClearDistributeRequest(void)
+{
+    bDistributeReq = false;
 }
 
 /* Send one image chunk read from the scratchpad. */
@@ -652,9 +696,31 @@ bool OTAUPDATE_bPrepPending(void)
     return bPrepPending;
 }
 
+void OTAUPDATE_vArmAcceptance(void)
+{
+    bFwAcceptArmed = true;
+    DBG_LOG("OtaUpdate: firmware acceptance ARMED\r\n");
+}
+
+void OTAUPDATE_vDisarmAcceptance(void)
+{
+    bFwAcceptArmed = false;
+    bPrepPending   = false;   /* drop any prep heard before disarm */
+    DBG_LOG("OtaUpdate: firmware acceptance disarmed\r\n");
+}
+
+bool OTAUPDATE_bAcceptanceArmed(void)
+{
+    return bFwAcceptArmed;
+}
+
 void OTAUPDATE_vSecondaryReceive(void)
 {
     bPrepPending = false;
+
+    /* One-shot: an attempted receive consumes the arm. A retry needs a fresh
+     * "tag <ID> fwaccept" — the same deliberate opt-in as the first time. */
+    bFwAcceptArmed = false;
 
     DBG_LOG("OtaUpdate: receiving v%lu (%lu B, %u chunks)\r\n",
             (unsigned long)tPrep.u32Version, (unsigned long)tPrep.u32ImageSize,

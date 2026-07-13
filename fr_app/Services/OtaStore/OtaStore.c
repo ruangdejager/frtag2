@@ -11,7 +11,7 @@
  * partition (>= 0x3C000).
  */
 
-#include "storage_config.h"
+#include "build_config.h"   /* STORAGE_BACKEND_FLASH (was storage_config.h) */
 
 #ifdef STORAGE_BACKEND_FLASH
 

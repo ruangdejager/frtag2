@@ -63,6 +63,9 @@
 #ifdef STORAGE_BACKEND_MICROSD
 #  include "AccLog.h"
 #endif
+#ifdef STORAGE_BACKEND_FLASH
+#  include "OtaUpdate.h"
+#endif
 
 #if defined(FRKERNEL_INTERFACE_UART) || defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
 #  include "Debug.h"
@@ -267,11 +270,15 @@ static void FRKERNEL_vProcessCommand(const char *line)
 #if defined(STORAGE_BACKEND_FLASH) && defined(FRKERNEL_INTERFACE_UART)
         FRKERNEL_vRespond(
             "  tag flash clear             erase ext-flash log\r\n"
-            "  tag flash stream            stream ext-flash log\r\n");
+            "  tag flash stream            stream ext-flash log\r\n"
+            "  tag fwaccept [off]          arm/disarm firmware acceptance (secondary)\r\n"
+            "  tag fwdistribute            distribute staged firmware (primary)\r\n");
 #elif defined(STORAGE_BACKEND_FLASH)
         FRKERNEL_vRespond(
             "  tag <ID> flash clear        erase ext-flash log\r\n"
-            "  tag <ID> flash stream       stream ext-flash log\r\n");
+            "  tag <ID> flash stream       stream ext-flash log\r\n"
+            "  tag <ID> fwaccept [off]     arm/disarm firmware acceptance (secondary)\r\n"
+            "  tag <ID> fwdistribute       distribute staged firmware (primary)\r\n");
 #endif
 #if defined(STORAGE_BACKEND_MICROSD) && defined(FRKERNEL_INTERFACE_UART)
         FRKERNEL_vRespond(
@@ -316,6 +323,44 @@ static void FRKERNEL_vProcessCommand(const char *line)
         s_bConnected = false;
     }
 #ifdef STORAGE_BACKEND_FLASH
+    else if (strcmp(p, "fwaccept") == 0)
+    {
+        /* Arm firmware acceptance (secondary only). The session stays open so
+         * the secondary live-listens for the primary's OtaPrep from the
+         * DeviceDiscovery hold-while-connected loop. */
+        if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_SECONDARY)
+        {
+            FRKERNEL_vRespond("fwaccept: secondary only\r\n");
+        }
+        else
+        {
+            OTAUPDATE_vArmAcceptance();
+            FRKERNEL_vRespond("Firmware acceptance ARMED - awaiting OtaPrep\r\n");
+        }
+    }
+    else if (strcmp(p, "fwaccept off") == 0)
+    {
+        OTAUPDATE_vDisarmAcceptance();
+        FRKERNEL_vRespond("Firmware acceptance disarmed\r\n");
+    }
+    else if (strcmp(p, "fwdistribute") == 0)
+    {
+        /* Request an on-demand distribution of the staged image (primary
+         * only). The session keeps the primary awake past its campaign so the
+         * hold-while-connected loop runs OTAUPDATE_vDistribute(). */
+        if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_PRIMARY)
+        {
+            FRKERNEL_vRespond("fwdistribute: primary only\r\n");
+        }
+        else if (OTAUPDATE_bRequestDistribute())
+        {
+            FRKERNEL_vRespond("Firmware distribute requested\r\n");
+        }
+        else
+        {
+            FRKERNEL_vRespond("fwdistribute: no valid image staged\r\n");
+        }
+    }
     else if (strcmp(p, "flash clear") == 0)
     {
         /* Routed through the DbgLog consumer so it can't race log writes. */

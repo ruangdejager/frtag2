@@ -35,7 +35,7 @@
 #include "Debug.h"
 #include "FrKernel.h"
 
-#include "storage_config.h"
+/* STORAGE_BACKEND_FLASH comes from build_config.h (included above). */
 #ifdef STORAGE_BACKEND_FLASH
 #  include "OtaUpdate.h"
 #endif
@@ -421,12 +421,39 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         EVTLOG(LOG_DEVICE_ENTERING_SLEEP, eDeviceRole);
 
         /* Hold off sleep while an active FrKernel session is in progress.
-         * The user must issue "tag release" (or 5-min inactivity auto-releases). */
+         * The user must issue "tag release" (or 5-min inactivity auto-releases).
+         *
+         * This loop is also the OTA-over-kernel-session rendezvous:
+         *   - Secondary armed with "tag <ID> fwaccept" live-listens here for an
+         *     OtaPrep and runs the receive in-place (resets into the bootloader
+         *     on a verified image).
+         *   - Primary asked with "tag <ID> fwdistribute" (its session kept the
+         *     device awake past the campaign) distributes the staged image from
+         *     ext flash here.
+         * The session's s_bConnected is what parked the AppTask in this loop in
+         * the first place, so no extra wake plumbing is needed. */
         if (FRKERNEL_bIsConnected())
         {
             DBG("DeviceDiscovery: FrKernel session active — waiting for release...\r\n");
             while (FRKERNEL_bIsConnected())
+            {
+#ifdef STORAGE_BACKEND_FLASH
+                if (eDeviceRole == DEVICE_ROLE_SECONDARY &&
+                    OTAUPDATE_bAcceptanceArmed() && OTAUPDATE_bPrepPending())
+                {
+                    /* Verified image -> resets into the bootloader (no return);
+                     * failure returns here and the session keeps holding. */
+                    OTAUPDATE_vSecondaryReceive();
+                }
+                else if (eDeviceRole == DEVICE_ROLE_PRIMARY &&
+                         OTAUPDATE_bDistributeRequested())
+                {
+                    OTAUPDATE_vClearDistributeRequest();
+                    OTAUPDATE_vDistribute();
+                }
+#endif
                 osDelay(500);
+            }
         }
 
         DBG_LOG("DeviceDiscovery: Waiting for synchronized wake-up...\r\n");

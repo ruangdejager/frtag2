@@ -690,6 +690,13 @@ static bool FARMRANGER_bParseFwTrailer(const char *line, void *ctx)
     return true;
 }
 
+/* Plain "OK" acknowledgement (AT+FWDONE). ctx is unused. */
+static bool FARMRANGER_bParseOK(const char *line, void *ctx)
+{
+    (void)ctx;
+    return (line != NULL && strstr(line, "OK") != NULL);
+}
+
 FarmrangerFw_e FARMRANGER_eFwQuery(uint32_t *pu32Version, uint32_t *pu32FileBytes)
 {
     FwQueryCtx_t tCtx = { .eResult = FARMRANGER_FW_NONE };

@@ -45,4 +45,24 @@ bool OTAUPDATE_bPrepPending(void);
  * returns so the caller can go back to sleep. */
 void OTAUPDATE_vSecondaryReceive(void);
 
+/* ---- Firmware acceptance mode (secondary) ----
+ * A secondary ignores every OtaPrep until it is explicitly ARMED, so a field
+ * device can never be re-flashed without a deliberate opt-in. Armed over a
+ * live FrKernel session ("tag <ID> fwaccept"); while armed the secondary
+ * honors an OtaPrep for a strictly-newer version and runs the receive session
+ * in-place. Cleared by "tag <ID> fwaccept off", by a completed/attempted
+ * receive, or by reset. */
+void OTAUPDATE_vArmAcceptance(void);
+void OTAUPDATE_vDisarmAcceptance(void);
+bool OTAUPDATE_bAcceptanceArmed(void);
+
+/* ---- On-demand distribution (primary) ----
+ * Request a LoRa distribution of the image currently staged in ext flash
+ * ("tag <ID> fwdistribute"), read straight from the scratchpad. Returns false
+ * (and requests nothing) when no VALID image is staged. The AppTask acts on
+ * the request from its hold-while-connected loop; the request is one-shot. */
+bool OTAUPDATE_bRequestDistribute(void);
+bool OTAUPDATE_bDistributeRequested(void);
+void OTAUPDATE_vClearDistributeRequest(void);
+
 #endif /* WORKER_OTAUPDATE_OTAUPDATE_H_ */
