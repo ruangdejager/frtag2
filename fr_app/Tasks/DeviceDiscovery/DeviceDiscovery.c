@@ -487,6 +487,19 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             u64LastFiredSlot = u64Slot;          /* boot: arm, don't fire */
             bSlotValid       = true;
         }
+        else if (u64Slot > u64LastFiredSlot + 1ULL)
+        {
+            /* Big forward jump. In practice this is a clock resync -- typically
+             * the AT+TSREQ that ended the first campaign after a boot with no
+             * RTC backup (fake epoch small u64Utc -> real ~1.7e9). Without
+             * this, the wake immediately after the sync would fire a whole
+             * second campaign against a fr9 that JUST finished processing
+             * the first one, so we'd get two "Total devices discovered" log
+             * entries a few seconds apart even though the interval is minutes.
+             * Just resync the latch and skip the fire -- the next real slot
+             * boundary is the one worth waking for. */
+            u64LastFiredSlot = u64Slot;
+        }
         else if (u64Slot > u64LastFiredSlot)
         {
             u64LastFiredSlot = u64Slot;
@@ -564,6 +577,12 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             {
                 u64LastGpsSlot = u64GpsSlot;     /* boot: arm, don't fire */
                 bGpsSlotValid  = true;
+            }
+            else if (u64GpsSlot > u64LastGpsSlot + 1ULL)
+            {
+                /* Big forward jump -- clock resync; see the discovery slot
+                 * latch above for full reasoning. Just resync, don't fire. */
+                u64LastGpsSlot = u64GpsSlot;
             }
             else if (u32Phase >= (u32IntervalS - DEVICE_DISCOVERY_GPS_PRETRIGGER_S) &&
                      u64GpsSlot > u64LastGpsSlot)

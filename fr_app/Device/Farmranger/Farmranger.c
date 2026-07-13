@@ -46,18 +46,30 @@
 /* ---- RX buffer ----
  * The fr9 logger's AT responses are all short fixed tokens ("RDY\r\n",
  * "Logger ready\r\n", "OK\r\n", a 10-digit timestamp, a wake interval) -
- * the longest is ~14 bytes. 48 keeps a >3x margin while two of these line
- * buffers stay small (RAM here is very tight). */
+ * the longest is ~14 bytes. 48 keeps a >3x margin. */
 #define FR_RX_BUF_LEN 48
 static char     acFrRxBuf[FR_RX_BUF_LEN];
 static uint8_t  u8FrRxBufIdx = 0;
-static char     acFrLineBuf[FR_RX_BUF_LEN];
+
+/* Delivered-line queue. Replaces the earlier single-slot
+ * (acFrLineBuf + binary xLineReadySem) design, which lost lines whenever
+ * two AT responses arrived back-to-back: for AT+LOG=0 the fr9's own state
+ * machine sends "Logger ready\r\n" and "OK\r\n" on adjacent ticks (see
+ * fr9's FRTAG_vLogCmdHandler), so the two land at this RX task inside a
+ * single ring-drain pass. With one slot the RX task's second "\n" would
+ * overwrite the still-unread "Logger ready" with "OK" and the second
+ * osSemaphoreRelease would silently no-op (binary sem capped at 1). The AT
+ * handler then acquired the sem and parsed "OK" against the "Logger ready"
+ * parser -> mismatch, Step 1 timeout, whole log retried. A small queue
+ * absorbs those bursts atomically instead. */
+typedef struct { char data[FR_RX_BUF_LEN]; } FrRxLine_t;
+#define FR_LINE_QUEUE_DEPTH  8
 
 /* ---- CMSIS-RTOS v2 objects ---- */
 static osThreadId_t  Farmranger_vRxTask_handle;
 static osThreadId_t  Farmranger_vATHandlerTask_handle;
 
-static osSemaphoreId_t xLineReadySem;
+static osMessageQueueId_t xLineQueue;
 static osMessageQueueId_t xATQueue;
 
 /* ---- Device state ---- */
@@ -105,10 +117,10 @@ void FARMRANGER_vInit(void)
 
     FR_DRIVER_vInitFRDevice(&farmranger.UartHandle);
 
-    xLineReadySem    = osSemaphoreNew(1, 0, NULL);
+    xLineQueue       = osMessageQueueNew(FR_LINE_QUEUE_DEPTH, sizeof(FrRxLine_t), NULL);
     xATQueue         = osMessageQueueNew(4, sizeof(ATReq_t), NULL);
 
-    configASSERT(xLineReadySem  != NULL);
+    configASSERT(xLineQueue     != NULL);
     configASSERT(xATQueue       != NULL);
 
     static const osThreadAttr_t rx_attr = {
@@ -158,12 +170,21 @@ void FARMRANGER_vRxTask(void *parameters)
 
             if (byte == '\n')
             {
-                /* Transfer ownership of the completed line */
-                memcpy(acFrLineBuf, acFrRxBuf, u8FrRxBufIdx);
-                acFrLineBuf[u8FrRxBufIdx] = '\0';
+                /* Publish the completed line into the queue. Non-blocking:
+                 * if the queue is full (shouldn't happen with the 8-slot
+                 * depth for our protocol) the newest line is dropped rather
+                 * than the RX task stalling and letting the UART ring
+                 * overflow. */
+                FrRxLine_t line;
+                uint8_t n = (u8FrRxBufIdx < (uint8_t)sizeof(line.data))
+                          ? u8FrRxBufIdx
+                          : (uint8_t)(sizeof(line.data) - 1U);
+                memcpy(line.data, acFrRxBuf, n);
+                line.data[n] = '\0';
+                (void)osMessageQueuePut(xLineQueue, &line, 0U, 0U);
+
                 u8FrRxBufIdx = 0;
                 memset(acFrRxBuf, 0, FR_RX_BUF_LEN);
-                osSemaphoreRelease(xLineReadySem);
             }
         }
     }
@@ -190,11 +211,10 @@ bool FARMRANGER_bDeviceOn(void)
 
     /* Clear stale state */
     taskENTER_CRITICAL();
-    memset(acFrRxBuf,   0, FR_RX_BUF_LEN);
-    memset(acFrLineBuf, 0, FR_RX_BUF_LEN);
+    memset(acFrRxBuf, 0, FR_RX_BUF_LEN);
     u8FrRxBufIdx = 0;
     taskEXIT_CRITICAL();
-    osSemaphoreAcquire(xLineReadySem, 0);   /* drain any pending token */
+    osMessageQueueReset(xLineQueue);        /* drop any queued stale lines */
 
     FR_DRIVER_vEnableUart(&farmranger.UartHandle);
     FR_DRIVER_vIntEnable();
@@ -254,9 +274,11 @@ static bool FARMRANGER_bATSend(const char *cmd,
         .timeout = timeout,
     };
 
-    /* Clear any stale AT notification flags on this thread */
+    /* Clear any stale AT notification flags on this thread. Do NOT drain
+     * xLineQueue here -- the AT handler resets it after dequeueing this
+     * request, and doing it here as well would race with anything already
+     * in flight from the caller task's own perspective. */
     osThreadFlagsClear(FR_AT_NOTIFY_SUCCESS | FR_AT_NOTIFY_TIMEOUT);
-    osSemaphoreAcquire(xLineReadySem, 0);   /* drain */
 
     configASSERT(xATQueue != NULL);
     if (osMessageQueuePut(xATQueue, &req, 0, 100) != osOK)
@@ -284,12 +306,16 @@ static void FARMRANGER_vATHandlerTask(void *args)
         if (osMessageQueueGet(xATQueue, &req, NULL, osWaitForever) != osOK)
             continue;
 
-        /* Reset RX state before issuing the command */
+        /* Reset RX state and drop any stale queued lines from before this
+         * command was issued. Bytes accumulating in acFrRxBuf that don't
+         * yet form a complete line stay put -- the RX task will finish
+         * them on the next '\n' -- but partial garbage from a previous
+         * command shouldn't hang around either. */
         taskENTER_CRITICAL();
         u8FrRxBufIdx = 0;
         memset(acFrRxBuf, 0, FR_RX_BUF_LEN);
         taskEXIT_CRITICAL();
-        osSemaphoreAcquire(xLineReadySem, 0);
+        osMessageQueueReset(xLineQueue);
 
         if (req.cmd && strlen(req.cmd) > 0)
         {
@@ -300,18 +326,22 @@ static void FARMRANGER_vATHandlerTask(void *args)
 
         uint32_t start     = osKernelGetTickCount();
         bool     notified  = false;
+        FrRxLine_t line;
 
         while ((osKernelGetTickCount() - start) < req.timeout)
         {
-            if (osSemaphoreAcquire(xLineReadySem, 50) == osOK)
+            if (osMessageQueueGet(xLineQueue, &line, NULL, 50U) == osOK)
             {
-                if (req.parser(acFrLineBuf, req.context))
+                if (req.parser(line.data, req.context))
                 {
                     osThreadFlagsSet(req.caller, FR_AT_NOTIFY_SUCCESS);
                     notified = true;
                     break;
                 }
-                memset(acFrLineBuf, 0, FR_RX_BUF_LEN);
+                /* Non-matching line -- discard and keep waiting. Queue
+                 * absorbs the next line (e.g. an early "OK" that arrived
+                 * back-to-back with the "Logger ready" we were looking
+                 * for) so nothing is lost. */
             }
         }
 
@@ -417,17 +447,42 @@ static bool FARMRANGER_bLogAttempt(const MeshDiscoveredNeighbor_t *neighbors,
     char cmd[32];
     snprintf(cmd, sizeof(cmd), "AT+LOG=%u\r\n", (unsigned)pos);
 
+    DBG_LOG("LogData: attempt sending AT+LOG=%u\r\n", (unsigned)pos);
+
+    /* For an empty upload (count==0) the fr9 sends "Logger ready\r\n" and
+     * "OK\r\n" back-to-back on adjacent state-machine ticks. Splitting that
+     * into a separate Step-1 wait (via bATSend, which resets the line queue
+     * on entry) only exists to guard the payload stream below -- there's no
+     * stream to guard here, and the split is exactly what created a
+     * consume-race that lost the OK and forced an unnecessary retry (the
+     * fr9 then received a second AT+LOG=0, logging the empty campaign
+     * twice). Skip the AT-handler round-trip: send AT+LOG=0 directly and
+     * let Step 3 below discard the Logger ready and pick up the OK from
+     * the same queue. For count>0 the payload's own streaming time gives
+     * fr9 the gap it needs, so the split remains correct. */
     char respBuf[32] = {0};
-    if (!FARMRANGER_bATSend(cmd,
-                            FARMRANGER_bParseLoggerReady,
-                            respBuf,
-                            sizeof(respBuf),
-                            respBuf,
-                            1000))
+    if (count == 0)
     {
-        EVTLOG(LOG_FRLOG_ERROR, 1);
-        DBG_LOG("LogData: No 'Logger ready' received.\r\n");
-        return false;
+        /* Reset the line queue so nothing stale from before this attempt
+         * lands in Step 3 as a false verdict. */
+        osMessageQueueReset(xLineQueue);
+        HAL_UART_vTxPutBuffer(&farmranger.UartHandle,
+                              (uint8_t *)cmd,
+                              (uint16_t)strlen(cmd));
+    }
+    else
+    {
+        if (!FARMRANGER_bATSend(cmd,
+                                FARMRANGER_bParseLoggerReady,
+                                respBuf,
+                                sizeof(respBuf),
+                                respBuf,
+                                1000))
+        {
+            EVTLOG(LOG_FRLOG_ERROR, 1);
+            DBG_LOG("LogData: No 'Logger ready' received (Step 1 fail).\r\n");
+            return false;
+        }
     }
 
     /* Step 2: stream the CSV payload one row at a time, paced so the fr9 keeps
@@ -462,16 +517,39 @@ static bool FARMRANGER_bLogAttempt(const MeshDiscoveredNeighbor_t *neighbors,
 
     /* Step 3: wait for the fr9's verdict — "OK" (all bytes counted) or "ERR"
      * (its silence timeout hit before the count was reached: bytes were lost
-     * and the upload must be retried). No line at all also fails the attempt. */
-    char cVerdict = '\0';
-    if (!FARMRANGER_bATSend(NULL,
-                            FARMRANGER_bParseLogVerdict,
-                            respBuf,
-                            sizeof(respBuf),
-                            &cVerdict,
-                            FR_LOG_VERDICT_MS))
+     * and the upload must be retried). No line at all also fails the attempt.
+     *
+     * Captured INLINE off xLineQueue rather than via FARMRANGER_bATSend, and
+     * without resetting the queue first. The fr9 answers AT+LOG=0 by sending
+     * "Logger ready\r\n" and "OK\r\n" back-to-back on adjacent state-machine
+     * ticks (see fr9's FRTAG_vLogCmdHandler), so for empty uploads the "OK"
+     * regularly lands here before this code even starts waiting -- either
+     * queued right behind the "Logger ready" that Step 1 consumed, or arriving
+     * within microseconds of the empty Step 2 loop finishing. Going through
+     * bATSend would call osMessageQueueReset on entry (via the AT handler) and
+     * lose that already-queued OK; the whole upload would time out at
+     * FR_LOG_VERDICT_MS and retry unnecessarily, logging the same discovery
+     * twice on the fr9. */
+    char       cVerdict    = '\0';
+    uint32_t   u32Start    = osKernelGetTickCount();
+    bool       bGotVerdict = false;
+    FrRxLine_t line;
+
+    while ((osKernelGetTickCount() - u32Start) < FR_LOG_VERDICT_MS)
     {
-        DBG_LOG("LogData: no verdict received.\r\n");
+        if (osMessageQueueGet(xLineQueue, &line, NULL, 50U) == osOK)
+        {
+            if (FARMRANGER_bParseLogVerdict(line.data, &cVerdict))
+            {
+                bGotVerdict = true;
+                break;
+            }
+        }
+    }
+
+    if (!bGotVerdict)
+    {
+        DBG_LOG("LogData: no verdict received (Step 3 timeout).\r\n");
         EVTLOG(LOG_FRLOG_ERROR, 3);
         return false;
     }
@@ -483,6 +561,7 @@ static bool FARMRANGER_bLogAttempt(const MeshDiscoveredNeighbor_t *neighbors,
         return false;
     }
 
+    DBG_LOG("LogData: Step 3 OK (verdict='%c')\r\n", cVerdict);
     return true;
 }
 
