@@ -121,7 +121,10 @@ bool LORARADIO_bRxPacket(LoraRadio_Packet_t *packet)
  * -------------------------------------------------------------------------- */
 bool LORARADIO_bTxPacket(LoraRadio_Packet_t *packet)
 {
-    if (packet->length > LORA_MAX_PACKET_SIZE)
+    /* Reserve room for the appended CRC byte: the length field is uint8_t, so
+     * type+payload+CRC must fit in 255. A 255-byte payload would wrap
+     * pkt.length to 0 on the CRC append in the radio task (corrupt frame). */
+    if (packet->length > (LORA_MAX_PACKET_SIZE - 2))
         return false;
 
     if (osMessageQueuePut(xLoRaTxQueue, packet, 0, 0) != osOK)
@@ -129,6 +132,25 @@ bool LORARADIO_bTxPacket(LoraRadio_Packet_t *packet)
         DBG_LOG("Loraradio: TX PKT queue full\r\n");
         return false;
     }
+
+    osThreadFlagsSet(LORARADIO_vRadioTask_handle, RADIO_EVT_TX_PENDING);
+    return true;
+}
+
+/* --------------------------------------------------------------------------
+ * LORARADIO_bTxPacketWait — enqueue, blocking while the queue is full
+ * -------------------------------------------------------------------------- */
+bool LORARADIO_bTxPacketWait(LoraRadio_Packet_t *packet, uint32_t timeoutMs)
+{
+    if (packet->length > (LORA_MAX_PACKET_SIZE - 2))
+        return false;
+
+    /* Blocking put: FreeRTOS wakes this caller the moment the radio task's
+     * osMessageQueueGet() pulls the head item, i.e. as soon as it has
+     * actually finished with the previous packet -- no polling, no guessed
+     * delay. */
+    if (osMessageQueuePut(xLoRaTxQueue, packet, 0, timeoutMs) != osOK)
+        return false;
 
     osThreadFlagsSet(LORARADIO_vRadioTask_handle, RADIO_EVT_TX_PENDING);
     return true;
@@ -166,16 +188,27 @@ void LORARADIO_vRadioTask(void *arg)
             memset(&pkt, 0, sizeof(pkt));
             LORARADIO_DRIVER_bReceivePayload(&pkt);
 
-            uint8_t crc_rx = pkt.buffer[pkt.length - 1];
-            uint8_t crc    = LORARADIO_u8CRC8_Calculate(pkt.buffer, pkt.length - 1);
-            if (crc == crc_rx)
+            /* Shortest valid frame is type byte + CRC byte. A 0/1-byte frame
+             * (corrupt header that passed the radio CRC) would otherwise
+             * underflow pkt.length - 1 below: buffer[-1] read and a CRC pass
+             * over (uint16_t)-1 = 65535 bytes, far past the 256-byte buffer. */
+            if (pkt.length < 2)
             {
-                pkt.length--;
-                osMessageQueuePut(xLoRaRxQueue, &pkt, 0, 0);
+                DBG_LOG("Loraradio: runt frame dropped (len=%u)\r\n", pkt.length);
             }
             else
             {
-                DBG_LOG("CRC mismatch\r\n");
+                uint8_t crc_rx = pkt.buffer[pkt.length - 1];
+                uint8_t crc    = LORARADIO_u8CRC8_Calculate(pkt.buffer, pkt.length - 1);
+                if (crc == crc_rx)
+                {
+                    pkt.length--;
+                    osMessageQueuePut(xLoRaRxQueue, &pkt, 0, 0);
+                }
+                else
+                {
+                    DBG_LOG("CRC mismatch\r\n");
+                }
             }
             SUBGRF_ClearIrqStatus(IRQ_RX_DONE);
             LORARADIO_DRIVER_vEnterRxMode(0);
@@ -283,6 +316,17 @@ bool LORARADIO_bCarrierSense(void)
         return false;
     }
 
+    /* TX_PENDING is self-noise here: we're already inside TX processing for
+     * a packet already dequeued off xLoRaTxQueue (that's why CAD is running
+     * at all). LORARADIO_bTxPacket() sets this flag unconditionally, and it
+     * can still be pending the first time we wait on it if the flag was set
+     * after the radio task's top-of-loop flags-wait already snapshotted (a
+     * fast responder, e.g. FrKernel answering a just-received request, wins
+     * that race essentially every time). Treating our own trigger as a
+     * foreign interrupting event caused every first-attempt TX to abort and
+     * drop the packet with no retry. */
+    r &= ~RADIO_EVT_TX_PENDING;
+
     if (r & RADIO_EVT_CAD_BUSY)
     {
         DBG("Loraradio: CAD busy\r\n");
@@ -294,8 +338,12 @@ bool LORARADIO_bCarrierSense(void)
         return true;
     }
 
-    /* Another radio event arrived during CAD — stash it, report busy */
-    LORARADIO_vStashPendingEvents(r);
+    if (r)
+    {
+        /* Another, genuinely foreign radio event arrived during CAD — stash
+         * it, report busy. */
+        LORARADIO_vStashPendingEvents(r);
+    }
     return false;
 }
 
@@ -326,10 +374,19 @@ bool LORARADIO_bCarrierSenseAndWait(uint32_t maxWaitMs)
         uint32_t r = osThreadFlagsWait(ALL_FLAGS, osFlagsWaitAny, backoffMs);
         if (!(r & osFlagsError))
         {
+            /* Same self-noise as LORARADIO_bCarrierSense() — see comment
+             * there. Strip it before deciding whether something genuinely
+             * foreign woke us. */
+            r &= ~RADIO_EVT_TX_PENDING;
+
             if (r & RADIO_EVT_CAD_CLEAR) return true;
             if (r & RADIO_EVT_CAD_BUSY)  return false;
-            LORARADIO_vStashPendingEvents(r);
-            return false;
+            if (r)
+            {
+                LORARADIO_vStashPendingEvents(r);
+                return false;
+            }
+            /* Only our own TX_PENDING fired — spurious wake, retry CAD. */
         }
 
         failCount++;

@@ -71,3 +71,10 @@ void DEBUG_vPutBuffer(const uint8_t *buf, uint16_t len) { (void)buf; (void)len; 
 void DEBUG_vPutBufferBlocking(const uint8_t *buf, uint16_t len) { (void)buf; (void)len; }
 
 #endif /* DEBUG_OUTPUT_UART */
+
+/* Transport-independent: applies (and is checked) the same way regardless of
+ * which output path above is active. */
+static volatile bool bQuiet = false;
+
+void DEBUG_vSetQuiet(bool quiet) { bQuiet = quiet; }
+bool DEBUG_bIsQuiet(void)        { return bQuiet;  }

@@ -3,8 +3,7 @@
  *
  * Standalone radio smoke-test task.
  *
- * Enabled by defining ENABLE_RADIO_TEST in the project preprocessor settings
- * (STM32CubeIDE: Project > Properties > C/C++ Build > Settings > Preprocessor).
+ * Enabled by defining ENABLE_RADIO_TEST in fr_app/inc/config/build_config.h.
  *
  * When ENABLE_RADIO_TEST is defined:
  *   - This task transmits "Blink!\r\n" at 0.5 Hz over LoRa.
@@ -16,6 +15,8 @@
 
 #ifndef FR_APP_TASKS_RADIOTEST_RADIOTEST_H_
 #define FR_APP_TASKS_RADIOTEST_RADIOTEST_H_
+
+#include "build_config.h"
 
 #ifdef ENABLE_RADIO_TEST
 

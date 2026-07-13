@@ -3,7 +3,7 @@
  *
  * Circular FIFO text log on the MicroSD card's LOG region (raw blocks, no
  * filesystem). Provides the same Log.h API as the NOR-flash Log.c; exactly
- * one of the two is an active translation unit (storage_config.h).
+ * one of the two is an active translation unit (build_config.h).
  *
  * Layout of the LOG region (blocks [SD_LOG_LBA_START, SD_ACC_LBA_START)):
  *   - block SD_LOG_LBA_START          : superblock (head/tail pointers)
@@ -18,7 +18,7 @@
  * park (always < 512) can be lost on an unexpected reset.
  */
 
-#include "storage_config.h"
+#include "build_config.h"
 
 #ifdef STORAGE_BACKEND_MICROSD
 
@@ -224,12 +224,17 @@ void LOG_vPark(void)
 
 void LOG_vStreamToDebug(void)
 {
+    LOG_vStreamViaSink(DEBUG_vPutBuffer);
+}
+
+void LOG_vStreamViaSink(void (*sink)(const uint8_t *data, uint16_t len))
+{
     char hdr[64];
     int  n = snprintf(hdr, sizeof(hdr),
                       "\r\n==== MICROSD LOG DUMP (%lu bytes) ====\r\n",
                       (unsigned long)LOG_u32GetUsedBytes());
     if (n > 0)
-        DEBUG_vPutBuffer((const uint8_t *)hdr, (uint16_t)n);
+        sink((const uint8_t *)hdr, (uint16_t)n);
 
     if (bInited)
     {
@@ -238,15 +243,15 @@ void LOG_vStreamToDebug(void)
         for (uint32_t i = 0U; i < u32Blocks; i++)
         {
             if (MICROSD_bReadBlock(u32Lba, au8Scratch))
-                DEBUG_vPutBuffer(au8Scratch, SD_BLOCK_SIZE);
+                sink(au8Scratch, SD_BLOCK_SIZE);
             u32Lba = LOGSD_u32Advance(u32Lba);
         }
         if (u16CurLen > 0U)
-            DEBUG_vPutBuffer(au8Cur, u16CurLen);
+            sink(au8Cur, u16CurLen);
     }
 
     static const char end[] = "\r\n==== MICROSD LOG DUMP END ====\r\n";
-    DEBUG_vPutBuffer((const uint8_t *)end, (uint16_t)(sizeof(end) - 1U));
+    sink((const uint8_t *)end, (uint16_t)(sizeof(end) - 1U));
 }
 
 #endif /* STORAGE_BACKEND_MICROSD */

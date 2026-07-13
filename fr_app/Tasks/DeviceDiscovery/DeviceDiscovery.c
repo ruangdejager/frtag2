@@ -15,14 +15,12 @@
 #include "DeviceDiscovery.h"
 #include "MeshNetwork.h"
 #include "Farmranger.h"
+#include "build_config.h"
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"   /* configMINIMAL_STACK_SIZE */
 #include "task.h"
 
 #include "main.h"
-
-#include <stdio.h>
-#include <stdlib.h>
 
 #include "dbg_log.h"
 #include "platform_rtc.h"
@@ -89,7 +87,9 @@ void DEVICE_DISCOVERY_vInit(void)
     configASSERT(DeviceDiscoveryAppTask_handle    != NULL);
     configASSERT(DeviceDiscoveryWakeupTask_handle != NULL);
 
+    /* Capture the reset cause — first clue in a field post-mortem. */
     uint32_t u32ModifiedCSR = u32GetCSR() >> 5;
+    DBG_LOG("DeviceDiscovery: reset cause CSR=0x%lX\r\n", u32ModifiedCSR);
     EVTLOG(LOG_RESET_CAUSE, u32ModifiedCSR);
 
     DBG_LOG("DeviceDiscovery: Initialized.\r\n");
@@ -284,7 +284,11 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 DBG_LOG("DeviceDiscovery: Secondary %04X: campaign end (silence/cap)\r\n",
                     LORARADIO_u32GetUniqueId());
 
-            MESHNETWORK_vStopBeaconing(u32DreqId);
+            /* B4: stop OUR beacon dreq. The global u32DreqId is only ever
+             * written on the primary — on a secondary it is stale/zero, so the
+             * old exact-dreq stop was a silent no-op and the node kept
+             * beaconing into the post-campaign delay (until the beacon cap). */
+            MESHNETWORK_vStopBeaconingSelf();
         }
 
         /* ----------------------------------------------------------------
@@ -427,7 +431,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
         DBG_LOG("DeviceDiscovery: Waiting for synchronized wake-up...\r\n");
         osDelay(100);
-//        BSP_LED_Off(LED_YELLOW);
         LORARADIO_vEnterDeepSleep();
 
         /* Campaign complete — release the sleep lock taken when this wake
@@ -447,6 +450,25 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
 {
     (void)pvParameters;
 
+    /* B6: slot latches. The old exact `phase == 0` compare missed a wake
+     * whenever the RTC was stepped FORWARD across a boundary (TimeSync /
+     * logger sync) and double-fired when stepped BACKWARD across one.
+     * Fire once per interval slot (utc / interval), strictly increasing:
+     *   - slot > lastFired          -> fire and latch (catches forward jumps
+     *                                  and ordinary boundaries, even if the
+     *                                  exact boundary second was missed)
+     *   - slot == lastFired         -> already ran this slot (backward step
+     *                                  re-entering the previous slot: no
+     *                                  double campaign)
+     *   - slot << lastFired (> 1)   -> large backward correction / interval
+     *                                  change: resync the latch, no fire
+     * Armed (not fired) on the first heartbeat so boot behaviour matches the
+     * old code: first campaign at the next boundary. */
+    static uint64_t u64LastFiredSlot = 0;
+    static bool     bSlotValid       = false;
+    static uint64_t u64LastGpsSlot   = 0;
+    static bool     bGpsSlotValid    = false;
+
     PLATFORM_bSubscribeToHeartbeat(osThreadGetId(), HB_ALLOW_IN_RECOVERY);
 
     for (;;)
@@ -456,7 +478,7 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
 
         uint64_t u64Utc       = RTC_u64GetUTC();
         uint32_t u32IntervalS = (uint32_t)MESHNETWORK_u8GetWakeupInterval() * 60U;
-        uint32_t u32Phase     = (uint32_t)(u64Utc % (uint64_t)u32IntervalS);
+        uint64_t u64Slot      = u64Utc / (uint64_t)u32IntervalS;
 
         /* ---- ProductionSleep: secondary only — primary has no solar panel ---- */
         if (eDeviceRole == DEVICE_ROLE_SECONDARY && eProductionState == PRODUCTION_SLEEP)
@@ -465,12 +487,26 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             if (SOLAR_u32GetPowerMW() >= SOLAR_ACTIVATION_POWER_MW)
             {
                 eProductionState = PRODUCTION_ACTIVE;
+
+                /* Hold off deep sleep until the resulting kernel window
+                 * completes (released at the end of
+                 * DEVICE_DISCOVERY_vAppTask's loop). Re-arm the debug UART
+                 * BEFORE logging so the activation is observable live —
+                 * STOP2 parked its pins analog and this branch is otherwise
+                 * the only wake path that forgets to restore them. */
+                SYSTEM_vSleepLockAcquire();
+                HAL_UART_vInit();
+                DEBUG_vInit();
+
                 DBG_LOG("DeviceDiscovery: Solar activation (%lu mW) — exiting ProductionSleep\r\n",
                     SOLAR_u32GetPowerMW());
-                /* Hold off deep sleep until the resulting campaign completes
-                 * (released at the end of DEVICE_DISCOVERY_vAppTask's loop). */
-                SYSTEM_vSleepLockAcquire();
-                osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_WAKEUP_BIT);
+
+                /* Open a FrKernel window instead of an autonomous discovery
+                 * campaign (same path the shake-wakeup trigger uses); the
+                 * kernel's own 5-min inactivity timeout — or an explicit
+                 * "tag release" — is what returns the device to normal
+                 * scheduled-wake sleep from here. */
+                osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
             }
 #else
             /* Panel power sensing is disabled (broken RSENSE front-end); gate
@@ -478,20 +514,54 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             if (SOLAR_u16GetVSolarMV() >= SOLAR_ACTIVATION_VSOLAR_MV)
             {
                 eProductionState = PRODUCTION_ACTIVE;
+
+                /* See the ENABLE_SOLAR_POWER_SENSE branch above for why the
+                 * UART is re-armed here and why this opens a kernel window
+                 * rather than a discovery campaign. */
+                SYSTEM_vSleepLockAcquire();
+                HAL_UART_vInit();
+                DEBUG_vInit();
+
                 DBG_LOG("DeviceDiscovery: Solar activation (%u mV) — exiting ProductionSleep\r\n",
                     SOLAR_u16GetVSolarMV());
-                /* Hold off deep sleep until the resulting campaign completes
-                 * (released at the end of DEVICE_DISCOVERY_vAppTask's loop). */
-                SYSTEM_vSleepLockAcquire();
-                osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_WAKEUP_BIT);
+
+                osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
             }
 #endif
             continue;
         }
 
-//        BSP_LED_Toggle(LED_YELLOW);
-        /* --- Discovery wake trigger (phase == 0) --- */
-        if (u32Phase == 0U)
+        /* --- Discovery wake trigger: once per interval slot (B6) --- */
+        bool bFireDiscovery = false;
+        if (!bSlotValid)
+        {
+            u64LastFiredSlot = u64Slot;          /* boot: arm, don't fire */
+            bSlotValid       = true;
+        }
+        else if (u64Slot > u64LastFiredSlot + 1ULL)
+        {
+            /* Big forward jump. In practice this is a clock resync -- typically
+             * the AT+TSREQ that ended the first campaign after a boot with no
+             * RTC backup (fake epoch small u64Utc -> real ~1.7e9). Without
+             * this, the wake immediately after the sync would fire a whole
+             * second campaign against a fr9 that JUST finished processing
+             * the first one, so we'd get two "Total devices discovered" log
+             * entries a few seconds apart even though the interval is minutes.
+             * Just resync the latch and skip the fire -- the next real slot
+             * boundary is the one worth waking for. */
+            u64LastFiredSlot = u64Slot;
+        }
+        else if (u64Slot > u64LastFiredSlot)
+        {
+            u64LastFiredSlot = u64Slot;
+            bFireDiscovery   = true;
+        }
+        else if ((u64LastFiredSlot - u64Slot) > 1ULL)
+        {
+            u64LastFiredSlot = u64Slot;          /* big backward correction: resync */
+        }
+
+        if (bFireDiscovery)
         {
             /* Scheduled wakes still fire in LOW; only RECOVERY suppresses them.
              * GPS gates strictly on NORMAL itself, so a LOW wake just produces
@@ -537,15 +607,47 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             }
         }
 
-#ifdef ENABLE_GPS
         /* --- GPS pre-trigger (SECONDARY only) ---
          * GPS is not fitted on PRIMARY boards. Fire-and-forget 3 minutes
          * before each scheduled wake so a fresh fix is cached by the time
-         * the AppTask runs. The AppTask never blocks on a GPS result. */
+         * the AppTask runs. The AppTask never blocks on a GPS result.
+         *
+         * B6: slot-latched like the discovery trigger — the old exact
+         * `phase == interval - 180` compare skipped the pre-trigger whenever
+         * that one heartbeat second was missed. Fire once inside the last
+         * PRETRIGGER window of each interval; the slot being pre-triggered is
+         * the UPCOMING one ((utc + lead) / interval). */
+        bool bFireGps = false;
         if (eDeviceRole == DEVICE_ROLE_SECONDARY &&
-            u32IntervalS > DEVICE_DISCOVERY_GPS_PRETRIGGER_S &&
-            u32Phase == (u32IntervalS - DEVICE_DISCOVERY_GPS_PRETRIGGER_S) &&
-            (POWER_tGetState() & POWER_CLASS_NORMAL))
+            u32IntervalS > DEVICE_DISCOVERY_GPS_PRETRIGGER_S)
+        {
+            uint32_t u32Phase   = (uint32_t)(u64Utc % (uint64_t)u32IntervalS);
+            uint64_t u64GpsSlot = (u64Utc + DEVICE_DISCOVERY_GPS_PRETRIGGER_S)
+                                  / (uint64_t)u32IntervalS;
+            if (!bGpsSlotValid)
+            {
+                u64LastGpsSlot = u64GpsSlot;     /* boot: arm, don't fire */
+                bGpsSlotValid  = true;
+            }
+            else if (u64GpsSlot > u64LastGpsSlot + 1ULL)
+            {
+                /* Big forward jump -- clock resync; see the discovery slot
+                 * latch above for full reasoning. Just resync, don't fire. */
+                u64LastGpsSlot = u64GpsSlot;
+            }
+            else if (u32Phase >= (u32IntervalS - DEVICE_DISCOVERY_GPS_PRETRIGGER_S) &&
+                     u64GpsSlot > u64LastGpsSlot)
+            {
+                u64LastGpsSlot = u64GpsSlot;
+                bFireGps       = true;
+            }
+            else if (u64LastGpsSlot > u64GpsSlot + 1ULL)
+            {
+                u64LastGpsSlot = u64GpsSlot;     /* big backward correction: resync */
+            }
+        }
+
+        if (bFireGps && (POWER_tGetState() & POWER_CLASS_NORMAL))
         {
             /* Hold off deep sleep until GPS auto-shuts-down, times out, or is
              * otherwise turned off — released inside GPS_vPowerOff().
@@ -568,7 +670,6 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
              * can never run forever */
             GPS_vRequestFix(true, 120);
         }
-#endif
     }
 }
 
@@ -587,15 +688,36 @@ static void DEVICE_DISCOVERY_vSendTS(void)
 void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
 {
     /* Hold off deep sleep until the resulting (no-op) campaign completes —
-     * released at the end of DEVICE_DISCOVERY_vAppTask's loop. */
+     * released at the end of DEVICE_DISCOVERY_vAppTask's loop.
+     *
+     * Both the debug UART and the radio are re-armed unconditionally here,
+     * matching the scheduled-wake path below — not one or the other picked
+     * by FRKERNEL_INTERFACE_LORA vs UART. DBG_LOG visibility has nothing to
+     * do with which transport FrKernel commands arrive on: a LORA-interface
+     * secondary still needs its debug UART alive for bench observation, and
+     * the radio must come out of its between-campaigns deep sleep on EVERY
+     * kernel wakeup regardless of interface, or a LoRa-delivered command
+     * (e.g. a broadcast "tag -devicereq") arrives at a radio that's still
+     * off and is never received. */
     SYSTEM_vSleepLockAcquire();
-#ifdef FRKERNEL_INTERFACE_LORA
-    LORARADIO_vWakeUp();
-#else
     HAL_UART_vInit();
     DEBUG_vInit();
-#endif
+    LORARADIO_vWakeUp();
     DBG("\r\n--- KERNEL WAKEUP ---\r\n");
+
+    /* This is the single entry point for shake-triggered wakeups (only ever
+     * called from the secondary-only shake-sequence in Movement.c, same
+     * role restriction as ProductionSleep — no role guard needed here). A
+     * shake already opens a kernel session regardless of eProductionState,
+     * but without this it never leaves ProductionSleep: once the session
+     * ends the device would fall back to waiting for Vsolar instead of
+     * resuming normal scheduled discovery. Mirrors the solar wake path. */
+    if (eProductionState == PRODUCTION_SLEEP)
+    {
+        eProductionState = PRODUCTION_ACTIVE;
+        DBG_LOG("DeviceDiscovery: Kernel wakeup — exiting ProductionSleep\r\n");
+    }
+
     osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
 }
 

@@ -19,6 +19,14 @@
  *   MESHNETWORK_vOnFrKernelPacket() (overrides weak MeshNetwork callback) →
  *   enqueue FrKernelPkt_t → parse → LORARADIO_bTxPacket() response.
  *
+ * LoRa-bridge path (bench test rig — see FrKernel_Config.h):
+ *   Same UART line accumulation as the UART path, but a completed line is
+ *   forwarded verbatim as a LoRa FrKernel packet instead of being parsed
+ *   locally (FRKERNEL_vForwardLine). MESHNETWORK_vOnFrKernelPacket() prints
+ *   whatever comes back straight to the debug UART instead of enqueueing it
+ *   for local processing. No session/inactivity tracking — there is nothing
+ *   local to time out.
+ *
  * Commands:
  *   tag -devicereq              broadcast; every device replies with its ID
  *   UART:  tag <cmd>
@@ -45,17 +53,18 @@
 #include "task.h"
 
 #include "Battery.h"
+#include "SolarPower.h"
 #include "MeshNetwork.h"
 #include "LoraRadio.h"
 #include "DeviceDiscovery.h"
 
-#include "storage_config.h"
+#include "build_config.h"
 #include "DbgLog.h"
 #ifdef STORAGE_BACKEND_MICROSD
 #  include "AccLog.h"
 #endif
 
-#ifdef FRKERNEL_INTERFACE_UART
+#if defined(FRKERNEL_INTERFACE_UART) || defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
 #  include "Debug.h"
 #endif
 
@@ -74,7 +83,7 @@ typedef struct {
 static osMessageQueueId_t s_rxQueue = NULL;
 #endif
 
-#ifdef FRKERNEL_INTERFACE_UART
+#if defined(FRKERNEL_INTERFACE_UART) || defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
 static char    s_lineBuf[FRKERNEL_LINE_BUF_LEN];
 static uint8_t s_lineIdx = 0U;
 #endif
@@ -100,7 +109,13 @@ void FRKERNEL_vInit(void)
 
     static const osThreadAttr_t attr = {
         .name       = "FrKernel",
-        .stack_size = configMINIMAL_STACK_SIZE * 6U,
+        /* CMSIS-RTOS v2 stack_size is BYTES; configMINIMAL_STACK_SIZE is a
+         * WORD count, so every other task in this codebase multiplies by
+         * sizeof(StackType_t). This one didn't -- it was actually allocating
+         * 768 B, a quarter of the intended ~3 KB, which the deeper call
+         * chain behind "tag prodsleep" (-> DEVICE_DISCOVERY_vEnterProductionSleep
+         * -> DBG_LOG's timestamp formatting) finally overran. */
+        .stack_size = configMINIMAL_STACK_SIZE * 6U * sizeof(StackType_t),
         .priority   = osPriorityLow,
     };
     s_taskHandle = osThreadNew(FRKERNEL_vTask, NULL, &attr);
@@ -109,6 +124,7 @@ void FRKERNEL_vInit(void)
 
 /* -------------------------------------------------------------------------- */
 
+#if defined(FRKERNEL_INTERFACE_UART) || defined(FRKERNEL_INTERFACE_LORA)
 static void FRKERNEL_vRespond(const char *msg)
 {
     /* Any TX extends an active session (covers bulk/slow data scenarios) */
@@ -123,13 +139,60 @@ static void FRKERNEL_vRespond(const char *msg)
 #elif defined(FRKERNEL_INTERFACE_LORA)
     LoraRadio_Packet_t pkt = {0};
     pkt.buffer[0] = (uint8_t)MeshPktType_FrKernel;
-    if (len > (uint16_t)(LORA_MAX_PACKET_SIZE - 1))
-        len = (uint16_t)(LORA_MAX_PACKET_SIZE - 1);
+    /* Cap so type byte + payload + radio-appended CRC fit the uint8_t length
+     * field (255): payload <= LORA_MAX_PACKET_SIZE - 3. The old "- 1" cap
+     * made pkt.length wrap to 0 for max-length responses. */
+    if (len > (uint16_t)(LORA_MAX_PACKET_SIZE - 3))
+        len = (uint16_t)(LORA_MAX_PACKET_SIZE - 3);
     memcpy(&pkt.buffer[1], msg, len);
     pkt.length = (uint8_t)(len + 1U);
     LORARADIO_bTxPacket(&pkt);
 #endif
 }
+
+#if defined(FRKERNEL_INTERFACE_LORA) && defined(STORAGE_BACKEND_FLASH)
+/* DbgLog's dump sink for "tag flash stream" on the LoRa interface: there's no
+ * UART session to read a UART-routed dump from, so the dump goes out as
+ * FrKernel LoRa packets instead (same framing as FRKERNEL_vRespond's LoRa
+ * branch, but with an explicit length rather than strlen — flash-log bytes
+ * aren't guaranteed to be NUL-free). Runs on the DbgLog consumer task (see
+ * DBGLOG_vRequestDumpVia), not this task.
+ *
+ * Sliced to the full per-packet payload (LORA_MAX_PACKET_SIZE - 3) rather
+ * than whatever chunk size the log backend happens to hand in — a caller
+ * chunk larger than that (e.g. a 512 B MicroSD block, on that backend) is
+ * split across as many packets as it takes instead of being silently
+ * truncated to the first slice.
+ *
+ * Paced with LORARADIO_bTxPacketWait instead of a fixed delay: it blocks
+ * only when the TX queue is actually full, and unblocks the instant the
+ * radio task makes room by picking up the packet ahead of it — i.e. paced
+ * off real radio progress, not a guessed inter-packet gap. */
+static void FRKERNEL_vLoraLogSink(const uint8_t *data, uint16_t len)
+{
+    const uint16_t maxPayload = (uint16_t)(LORA_MAX_PACKET_SIZE - 3);
+
+    while (len > 0U)
+    {
+        uint16_t n = (len > maxPayload) ? maxPayload : len;
+
+        LoraRadio_Packet_t pkt = {0};
+        pkt.buffer[0] = (uint8_t)MeshPktType_FrKernel;
+        memcpy(&pkt.buffer[1], data, n);
+        pkt.length = (uint8_t)(n + 1U);
+        LORARADIO_bTxPacketWait(&pkt, osWaitForever);
+
+        /* Each outbound packet counts as session activity — keeps the
+         * inactivity timer from firing during a long stream where no
+         * incoming commands arrive (the stream is one-way outbound). */
+        if (s_bConnected)
+            s_u32LastCmdTick = osKernelGetTickCount();
+
+        data += n;
+        len  = (uint16_t)(len - n);
+    }
+}
+#endif
 
 /* -------------------------------------------------------------------------- */
 
@@ -185,7 +248,7 @@ static void FRKERNEL_vProcessCommand(const char *line)
             "FrKernel commands:\r\n"
             "  tag -devicereq              this device's ID\r\n"
             "  tag -help                   list commands\r\n"
-            "  tag battery                 battery voltage (mV)\r\n"
+            "  tag juice                   battery + solar panel voltage (mV)\r\n"
             "  tag discovery schedule      wakeup interval (min)\r\n"
             "  tag prodsleep               enter production sleep (secondary only)\r\n"
             "  tag release                 release device for sleep\r\n"
@@ -195,7 +258,7 @@ static void FRKERNEL_vProcessCommand(const char *line)
             "FrKernel commands:\r\n"
             "  tag -devicereq              discover all device IDs\r\n"
             "  tag <ID> -help              list commands\r\n"
-            "  tag <ID> battery            battery voltage (mV)\r\n"
+            "  tag <ID> juice              battery + solar panel voltage (mV)\r\n"
             "  tag <ID> discovery schedule wakeup interval (min)\r\n"
             "  tag <ID> prodsleep          enter production sleep (secondary only)\r\n"
             "  tag <ID> release            release device for sleep\r\n"
@@ -220,9 +283,13 @@ static void FRKERNEL_vProcessCommand(const char *line)
             "  tag <ID> sd log stream      stream MicroSD log\r\n");
 #endif
     }
-    else if (strcmp(p, "battery") == 0)
+    else if (strcmp(p, "juice") == 0)
     {
-        snprintf(resp, sizeof(resp), "Battery: %u mV\r\n", BAT_u16GetVoltage());
+        /* Solar getter is safe to call unconditionally: SolarPower is
+         * secondary-only (primaries have no panel), and its getter is a
+         * plain static-variable read that defaults to 0 if never inited. */
+        snprintf(resp, sizeof(resp), "Battery: %u mV  Solar: %u mV\r\n",
+                 BAT_u16GetVoltage(), SOLAR_u16GetVSolarMV());
         FRKERNEL_vRespond(resp);
     }
     else if (strcmp(p, "discovery schedule") == 0)
@@ -235,6 +302,18 @@ static void FRKERNEL_vProcessCommand(const char *line)
     {
         DEVICE_DISCOVERY_vEnterProductionSleep();
         FRKERNEL_vRespond("ProductionSleep entered — wakes on Vsolar >= 3000 mV\r\n");
+
+        /* prodsleep is a terminal command: don't linger in an open session
+         * waiting for "tag release" or the 5-min inactivity timeout, or
+         * DeviceDiscovery's deep-sleep tail blocks on FRKERNEL_bIsConnected()
+         * for no reason. osDelay first so the response above — written
+         * directly to the UART TX ring, interrupt-drained in the background —
+         * actually leaves the wire before sleep can park the UART pins mid-
+         * transmission (same "let the log line drain" pattern used before
+         * OTASTORE_vArmBootloaderAndReset's reset). Then auto-release so
+         * sleep proceeds immediately instead of opening a kernel window. */
+        osDelay(100);
+        s_bConnected = false;
     }
 #ifdef STORAGE_BACKEND_FLASH
     else if (strcmp(p, "flash clear") == 0)
@@ -245,8 +324,16 @@ static void FRKERNEL_vProcessCommand(const char *line)
     }
     else if (strcmp(p, "flash stream") == 0)
     {
-        DBGLOG_vRequestDump();   /* consumer streams oldest -> newest */
+        /* consumer streams oldest -> newest, on whichever transport this
+         * session arrived on -- a LoRa session has no UART to read a
+         * UART-routed dump from. */
+#ifdef FRKERNEL_INTERFACE_LORA
+        DBGLOG_vRequestDumpVia(FRKERNEL_vLoraLogSink);
+        FRKERNEL_vRespond("Streaming ext-flash log via LoRa...\r\n");
+#else
+        DBGLOG_vRequestDump();
         FRKERNEL_vRespond("Streaming ext-flash log...\r\n");
+#endif
     }
 #endif
 #ifdef STORAGE_BACKEND_MICROSD
@@ -270,12 +357,43 @@ static void FRKERNEL_vProcessCommand(const char *line)
         FRKERNEL_vRespond(resp);
     }
 }
+#endif /* FRKERNEL_INTERFACE_UART || FRKERNEL_INTERFACE_LORA */
+
+#ifdef FRKERNEL_INTERFACE_LORA_BRIDGE
+/* Forward a UART-typed line verbatim as a LoRa FrKernel command packet —
+ * whatever the user types (including the "tag" prefix and, for an addressed
+ * command, the target "<ID>") goes out exactly as a real UART-attached
+ * secondary would need to receive it. No local parsing: this device isn't
+ * the one answering, it's just the human's radio-shaped keyboard. */
+static void FRKERNEL_vForwardLine(const char *line)
+{
+    uint16_t len = (uint16_t)strlen(line);
+    if (len == 0U) return;
+
+    LoraRadio_Packet_t pkt = {0};
+    pkt.buffer[0] = (uint8_t)MeshPktType_FrKernel;
+    /* Cap so type byte + payload + radio-appended CRC fit the uint8_t length
+     * field (255) — same bound as FRKERNEL_vRespond's LoRa framing. */
+    if (len > (uint16_t)(LORA_MAX_PACKET_SIZE - 3))
+        len = (uint16_t)(LORA_MAX_PACKET_SIZE - 3);
+    memcpy(&pkt.buffer[1], line, len);
+    pkt.length = (uint8_t)(len + 1U);
+
+    char echo[8 + FRKERNEL_LINE_BUF_LEN];
+    int  n = snprintf(echo, sizeof(echo), "--> %s\r\n", line);
+    if (n > 0)
+        DEBUG_vPutBuffer((const uint8_t *)echo, (uint16_t)n);
+
+    if (!LORARADIO_bTxPacket(&pkt))
+        DEBUG_vPutBuffer((const uint8_t *)"(TX queue full, dropped)\r\n", 27U);
+}
+#endif /* FRKERNEL_INTERFACE_LORA_BRIDGE */
 
 /* --------------------------------------------------------------------------
  * Transport-specific hooks
  * -------------------------------------------------------------------------- */
 
-#ifdef FRKERNEL_INTERFACE_UART
+#if defined(FRKERNEL_INTERFACE_UART) || defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
 /* Override the weak HAL callback — called from USART2 ISR */
 void UART2_vNotifyOnRX(void)
 {
@@ -294,6 +412,60 @@ void MESHNETWORK_vOnFrKernelPacket(const uint8_t *buf, uint8_t len)
     memcpy(pkt.data, buf, pkt.len);
     pkt.data[pkt.len] = '\0';
     osMessageQueuePut(s_rxQueue, &pkt, 0U, 0U);    /* non-blocking, ISR-safe */
+}
+#elif defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
+
+/* Substring search over a non-NUL-terminated FrKernel payload. */
+static bool FRKERNEL_bBufContains(const uint8_t *buf, uint8_t len, const char *needle)
+{
+    size_t needleLen = strlen(needle);
+    if (needleLen == 0U || (size_t)len < needleLen) return false;
+    size_t last = (size_t)len - needleLen;
+    for (size_t i = 0U; i <= last; i++)
+        if (memcmp(&buf[i], needle, needleLen) == 0) return true;
+    return false;
+}
+
+static bool s_bLogStreaming = false;
+
+/* Override the weak MeshNetwork callback — called from parser task context
+ * (not an ISR), so writing straight to the debug UART here is safe. Normally
+ * prints "<-- <payload>" (the plain command/response case). While a "tag
+ * flash stream" dump is in flight -- bracketed by LOG_vStreamViaSink's
+ * "...LOG DUMP (...)" / "...LOG DUMP END" header/footer lines, relayed here
+ * like any other FrKernel packet -- switch to passing the raw payload
+ * straight through with no "<-- "/"\r\n" framing, and ask the 1 Hz heartbeat
+ * marker (platform.c) to hold off, so what lands on the terminal is the log
+ * itself instead of the relay's usual chrome interleaved with it. Both
+ * markers are matched as substrings, but in practice each always arrives
+ * whole in a single small packet (LOG_vStreamViaSink emits them as one
+ * sub-64-byte sink call each, well under one LoRa payload). */
+void MESHNETWORK_vOnFrKernelPacket(const uint8_t *buf, uint8_t len)
+{
+    if (len == 0U) return;
+
+    if (!s_bLogStreaming && FRKERNEL_bBufContains(buf, len, "LOG DUMP ("))
+    {
+        s_bLogStreaming = true;
+        DEBUG_vSetQuiet(true);
+    }
+
+    if (s_bLogStreaming)
+    {
+        DEBUG_vPutBuffer(buf, len);
+    }
+    else
+    {
+        DEBUG_vPutBuffer((const uint8_t *)"<-- ", 4U);
+        DEBUG_vPutBuffer(buf, len);
+        DEBUG_vPutBuffer((const uint8_t *)"\r\n", 2U);
+    }
+
+    if (s_bLogStreaming && FRKERNEL_bBufContains(buf, len, "LOG DUMP END"))
+    {
+        s_bLogStreaming = false;
+        DEBUG_vSetQuiet(false);
+    }
 }
 #endif
 
@@ -356,6 +528,33 @@ static void FRKERNEL_vTask(void *arg)
         {
             s_bConnected = false;
             FRKERNEL_vRespond("FrKernel: session timed out\r\n");
+        }
+    }
+
+#elif defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
+    /* Same UART line accumulation as the UART interface, but a completed
+     * line is forwarded over LoRa instead of processed locally — no session/
+     * inactivity tracking, there is nothing local for it to gate. */
+    for (;;)
+    {
+        osThreadFlagsWait(0x01U, osFlagsWaitAny, osWaitForever);
+
+        uint8_t byte;
+        while (DEBUG_bReadByte(&byte))
+        {
+            if (byte == '\r' || byte == '\n')
+            {
+                if (s_lineIdx > 0U)
+                {
+                    s_lineBuf[s_lineIdx] = '\0';
+                    FRKERNEL_vForwardLine(s_lineBuf);
+                    s_lineIdx = 0U;
+                }
+            }
+            else if (s_lineIdx < FRKERNEL_LINE_BUF_LEN - 1U)
+            {
+                s_lineBuf[s_lineIdx++] = (char)byte;
+            }
         }
     }
 #endif

@@ -47,8 +47,6 @@ extern SPI_HandleTypeDef hFlashSpi;
 #define FLASH_SPI_CLK_DISABLE() __HAL_RCC_SPI2_CLK_DISABLE()
 #define FLASH_PORT_CLK_ENABLE() __HAL_RCC_GPIOA_CLK_ENABLE()
 
-void HAL_SPI_FLASH_vDeInit(void);
-
 /* Restore the flash bus if a STOP2 sleep parked it (no-op otherwise). Folded
  * into the chip-select so a logging flash write after a wake always finds an
  * awake bus, while idle wakes that don't touch the flash skip the re-init. */
@@ -70,7 +68,7 @@ HAL_StatusTypeDef HAL_SPI_FLASH_vReadPacket(uint8_t *rx, uint16_t len);
 /* -----------------------------------------------------------------------
  * SPI2 — MicroSD card (alternative population of the SPI2 footprint).
  * The MicroSD card and the NOR flash are mutually exclusive hardware
- * (storage_config.h) and share the same SPI2 bus + PA15 CS, so the SD path
+ * (build_config.h) and share the same SPI2 bus + PA15 CS, so the SD path
  * reuses the flash select/transfer primitives. The card additionally needs
  * a software-controllable clock rate: ~250 kHz (/128) for its power-up
  * handshake, then a faster rate (/8) for block transfers.
@@ -89,7 +87,6 @@ void HAL_SPI_SD_vSetSpeed(uint32_t u32Prescaler);
  * Initialises both SPI1 (ACC) and SPI2 (flash) in a single call.
  * ----------------------------------------------------------------------- */
 void HAL_SPI_vInit(void);
-void HAL_SPI_vDeInit(void);
 
 /* Flag both SPI buses as torn down by STOP2; each is re-initialised lazily on
  * its next chip-select. Call from the wake path instead of HAL_SPI_vInit() so

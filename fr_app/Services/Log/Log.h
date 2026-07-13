@@ -36,4 +36,10 @@ void     LOG_vPark(void);
  * concurrently writing the log (e.g. at boot right after LOG_vInit). */
 void     LOG_vStreamToDebug(void);
 
+/* Same content and chunking as LOG_vStreamToDebug, but each chunk is handed
+ * to the given sink instead of hardcoding DEBUG_vPutBuffer -- e.g. FrKernel's
+ * LoRa interface redirects "tag flash stream" over the radio instead of the
+ * debug UART, since the requester has no UART session to read it from. */
+void     LOG_vStreamViaSink(void (*sink)(const uint8_t *data, uint16_t len));
+
 #endif /* SERVICES_LOG_LOG_H_ */

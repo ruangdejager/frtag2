@@ -43,10 +43,11 @@
 
 /* ---- Tiered recovery configuration ----
  *
- * Define ENABLE_LOW_POWER_RECOVERY (project preprocessor symbol) to enable
- * the recovery-mode check and DEVICE_DISCOVERY_vRecoveryMode() state machine
- * below. Leave undefined while time-sync is being driven from another source
- * (e.g. GPS) where a missed-primary recovery cycle is not needed. */
+ * Define ENABLE_LOW_POWER_RECOVERY (fr_app/inc/config/build_config.h) to
+ * enable the recovery-mode check and DEVICE_DISCOVERY_vRecoveryMode() state
+ * machine below. Leave undefined while time-sync is being driven from
+ * another source (e.g. GPS) where a missed-primary recovery cycle is not
+ * needed. */
 
 /* Silence thresholds (seconds without a TimeSync) that select each tier.
  * Tier 1 (Sniff) starts at LOST_PRIMARY_TIMEOUT_MIN (8 h). */
