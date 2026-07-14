@@ -29,7 +29,7 @@
 #include "HexDecode.h"
 #include "OtaStore.h"
 #include "OtaStore_Config.h"
-#include "Version.h"
+#include "version_config.h"
 #include "MeshNetwork.h"
 #include "LoraRadio.h"
 #include "DeviceDiscovery.h"
