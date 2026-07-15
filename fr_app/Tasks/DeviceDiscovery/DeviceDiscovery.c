@@ -35,6 +35,11 @@
 #include "Debug.h"
 #include "FrKernel.h"
 
+/* STORAGE_BACKEND_FLASH comes from build_config.h (included above). */
+#ifdef STORAGE_BACKEND_FLASH
+#  include "Fota.h"
+#endif
+
 /* ---- Private defines ---- */
 #define APP_TASK_STACK_SIZE     (configMINIMAL_STACK_SIZE * 10)
 
@@ -143,7 +148,24 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         osDelay(APP_WAKEUP_BUFFER_MS);
         EVTLOG(LOG_DISCOVERY_START, eDeviceRole);
 
-        if (eDeviceRole == DEVICE_ROLE_PRIMARY)
+        bool bOtaSlot = false;
+#ifdef STORAGE_BACKEND_FLASH
+        /* OTA distribution slot (primary): when a validated image is stored
+         * and this node already runs it, the wake slot serves firmware to the
+         * secondaries instead of running a discovery campaign — the OtaPrep
+         * announcement goes out where the DReq would have. */
+        if (eDeviceRole == DEVICE_ROLE_PRIMARY && FOTA_bDistributePending())
+        {
+            bOtaSlot = true;
+            FOTA_vDistribute();
+        }
+#endif
+
+        if (bOtaSlot)
+        {
+            /* Distribution already ran; no discovery, no logger upload. */
+        }
+        else if (eDeviceRole == DEVICE_ROLE_PRIMARY)
         {
             bool    bDiscoveryFinished = false;
             uint8_t u8WaveCount        = 0;
@@ -196,7 +218,8 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             DBG_LOG("DeviceDiscovery %X: Secondary waiting for timesync.\r\n",
                 LORARADIO_u32GetUniqueId());
 
-            osThreadFlagsClear(DEVICE_DISCOVERY_NOTIFY_TIMESYNC);
+            osThreadFlagsClear(DEVICE_DISCOVERY_NOTIFY_TIMESYNC |
+                               DEVICE_DISCOVERY_NOTIFY_OTA);
 
             /* R3: end the campaign on the FIRST of:
              *   - TimeSync received (clean end),
@@ -214,10 +237,30 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
             for (;;)
             {
-                uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC,
+                uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC |
+                                               DEVICE_DISCOVERY_NOTIFY_OTA,
                                                osFlagsWaitAny,
                                                APP_SECONDARY_POLL_MS);
-                if (!(r & osFlagsError)) { bTimeSync = true; break; }
+                if (!(r & osFlagsError))
+                {
+#ifdef STORAGE_BACKEND_FLASH
+                    /* OTA prep announced instead of a DReq: this wake slot
+                     * becomes a firmware-receive session. On a complete +
+                     * verified image the call resets into the bootloader;
+                     * otherwise fall through to the normal sleep path. */
+                    if ((r & DEVICE_DISCOVERY_NOTIFY_OTA) && FOTA_bPrepPending())
+                    {
+                        FOTA_vSecondaryReceive();
+                        break;
+                    }
+#endif
+                    if (r & DEVICE_DISCOVERY_NOTIFY_TIMESYNC)
+                    {
+                        bTimeSync = true;
+                        break;
+                    }
+                    continue;   /* stray OTA flag without a pending prep */
+                }
 
                 uint32_t u32Now = osKernelGetTickCount();
 
@@ -255,7 +298,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             LORARADIO_u32GetUniqueId());
         EVTLOG(LOG_DISCOVERY_CMPLT, eDeviceRole);
 
-        if (eDeviceRole == DEVICE_ROLE_PRIMARY)
+        if (!bOtaSlot && eDeviceRole == DEVICE_ROLE_PRIMARY)
         {
             MeshDiscoveredNeighbor_t tNeighbors[MESH_MAX_NEIGHBORS];
             uint16_t u16NeighborCount = 0;
@@ -313,11 +356,26 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             else if (u8WakeInterval == 60)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_60_MIN);
             else if (u8WakeInterval == 120) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_120_MIN);
 
-            DEVICE_DISCOVERY_DRIVER_vDisconnectLogger();
-
-            /* ---- Send TimeSync to secondaries ---- */
+            /* ---- Send TimeSync to secondaries ---- *
+             * Sent BEFORE the OTA check so secondaries end their campaign
+             * here rather than waiting out the primary's fr9 round-trip
+             * (which, with the AT+FWCHECK GitHub Pages check, can now run
+             * to OTA_FWREQ_WAIT_MAX_MS). Only the primary talks to fr9 at
+             * all — secondaries have no Farmranger UART link. */
             DEVICE_DISCOVERY_vSendTS();
             EVTLOG(LOG_TX_TS, 1);
+
+#ifdef STORAGE_BACKEND_FLASH
+            /* ---- OTA firmware pull (logger session still up) ----
+             * Ask fr9 to check GitHub Pages for a newer image, then poll
+             * AT+FWREQ (which answers FW,WAIT while fr9's check/download is
+             * in flight). If the logger offers a newer tag firmware, acquire
+             * it into the ext-flash scratchpad. On success this arms the
+             * bootloader and RESETS — nothing after it runs this wake. */
+            FOTA_bUartAcquire();
+#endif
+
+            DEVICE_DISCOVERY_DRIVER_vDisconnectLogger();
 
             osDelay(5000);
         }
@@ -370,12 +428,39 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         EVTLOG(LOG_DEVICE_ENTERING_SLEEP, eDeviceRole);
 
         /* Hold off sleep while an active FrKernel session is in progress.
-         * The user must issue "tag release" (or 5-min inactivity auto-releases). */
+         * The user must issue "tag release" (or 5-min inactivity auto-releases).
+         *
+         * This loop is also the OTA-over-kernel-session rendezvous:
+         *   - Secondary armed with "tag <ID> fwaccept" live-listens here for an
+         *     OtaPrep and runs the receive in-place (resets into the bootloader
+         *     on a verified image).
+         *   - Primary asked with "tag <ID> fwdistribute" (its session kept the
+         *     device awake past the campaign) distributes the staged image from
+         *     ext flash here.
+         * The session's s_bConnected is what parked the AppTask in this loop in
+         * the first place, so no extra wake plumbing is needed. */
         if (FRKERNEL_bIsConnected())
         {
             DBG("DeviceDiscovery: FrKernel session active — waiting for release...\r\n");
             while (FRKERNEL_bIsConnected())
+            {
+#ifdef STORAGE_BACKEND_FLASH
+                if (eDeviceRole == DEVICE_ROLE_SECONDARY &&
+                    FOTA_bAcceptanceArmed() && FOTA_bPrepPending())
+                {
+                    /* Verified image -> resets into the bootloader (no return);
+                     * failure returns here and the session keeps holding. */
+                    FOTA_vSecondaryReceive();
+                }
+                else if (eDeviceRole == DEVICE_ROLE_PRIMARY &&
+                         FOTA_bDistributeRequested())
+                {
+                    FOTA_vClearDistributeRequest();
+                    FOTA_vDistribute();
+                }
+#endif
                 osDelay(500);
+            }
         }
 
         DBG_LOG("DeviceDiscovery: Waiting for synchronized wake-up...\r\n");

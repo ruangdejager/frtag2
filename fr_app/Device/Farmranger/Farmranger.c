@@ -65,6 +65,15 @@ static uint8_t  u8FrRxBufIdx = 0;
 typedef struct { char data[FR_RX_BUF_LEN]; } FrRxLine_t;
 #define FR_LINE_QUEUE_DEPTH  8
 
+/* ---- Raw block capture (OTA firmware pull) ----
+ * While armed (u16CaptureLen > 0 and not yet filled), incoming bytes bypass
+ * the line path straight into the caller's buffer. The RX task only copies —
+ * no parsing, no flash — so capture can't stall reception. Armed/filled/
+ * cancelled from the AppTask; consumed on the RX task (volatile indices). */
+static uint8_t *pu8CaptureBuf;
+static volatile uint16_t u16CaptureLen;   /* capture target (0 = disarmed) */
+static volatile uint16_t u16CaptureIdx;   /* bytes captured so far          */
+
 /* ---- CMSIS-RTOS v2 objects ---- */
 static osThreadId_t  Farmranger_vRxTask_handle;
 static osThreadId_t  Farmranger_vATHandlerTask_handle;
@@ -165,6 +174,14 @@ void FARMRANGER_vRxTask(void *parameters)
         /* Drain all available bytes from the ring buffer */
         while (UART_bReadByte(&farmranger.UartHandle, &byte))
         {
+            /* Raw block capture (OTA pull): bytes bypass the line path. */
+            if (u16CaptureIdx < u16CaptureLen)
+            {
+                pu8CaptureBuf[u16CaptureIdx] = byte;
+                u16CaptureIdx++;
+                continue;
+            }
+
             if (u8FrRxBufIdx < FR_RX_BUF_LEN - 1)
                 acFrRxBuf[u8FrRxBufIdx++] = byte;
 
@@ -606,6 +623,187 @@ bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
 
     DBG_LOG("LogData: all %u attempts failed\r\n", FR_LOG_ATTEMPTS);
     return false;
+}
+
+/* --------------------------------------------------------------------------
+ * Firmware-file pull (OTA acquire) — see Farmranger.h for the protocol
+ * -------------------------------------------------------------------------- */
+
+/* Response timeouts. A 1 KB block at 115200 with the fr9's in-block pacing is
+ * ~150 ms on the wire plus the fr9's modem-filesystem QFREAD turnaround. */
+#define FR_FW_QUERY_TIMEOUT_MS  1500U
+#define FR_FW_BLOCK_TIMEOUT_MS  2000U
+
+typedef struct {
+    FarmrangerFw_e eResult;
+    uint32_t       u32Version;
+    uint32_t       u32FileBytes;
+    uint8_t        u8ExpectedXor;
+} FwQueryCtx_t;
+
+typedef struct {
+    uint32_t u32Offset;
+    uint8_t  u8Xor;
+} FwTrailerCtx_t;
+
+/* "FW,NONE" | "FW,WAIT" | "FW,<verMMmmpp>,<fileBytes>,<xor8hex>" */
+static bool FARMRANGER_bParseFwInfo(const char *line, void *ctx)
+{
+    FwQueryCtx_t *pt = (FwQueryCtx_t *)ctx;
+
+    const char *p = strstr(line, "FW,");
+    if (p == NULL)
+        return false;
+    p += 3;
+
+    if (strncmp(p, "NONE", 4) == 0) { pt->eResult = FARMRANGER_FW_NONE; return true; }
+    if (strncmp(p, "WAIT", 4) == 0) { pt->eResult = FARMRANGER_FW_WAIT; return true; }
+
+    char *pcEnd;
+    uint32_t u32Ver = strtoul(p, &pcEnd, 10);
+    if (pcEnd == p || *pcEnd != ',')
+        return false;
+    uint32_t u32Bytes = strtoul(pcEnd + 1, &pcEnd, 10);
+    if (u32Bytes == 0UL || *pcEnd != ',')
+        return false;
+    uint8_t u8Xor = (uint8_t)strtoul(pcEnd + 1, &pcEnd, 16);
+
+    pt->eResult       = FARMRANGER_FW_AVAILABLE;
+    pt->u32Version    = u32Ver;
+    pt->u32FileBytes  = u32Bytes;
+    pt->u8ExpectedXor = u8Xor;
+    return true;
+}
+
+/* "FB,<offset>,<xor8hex>" — sent by the logger after the raw block bytes. */
+static bool FARMRANGER_bParseFwTrailer(const char *line, void *ctx)
+{
+    FwTrailerCtx_t *pt = (FwTrailerCtx_t *)ctx;
+
+    const char *p = strstr(line, "FB,");
+    if (p == NULL)
+        return false;
+    p += 3;
+
+    char *pcEnd;
+    pt->u32Offset = strtoul(p, &pcEnd, 10);
+    if (pcEnd == p || *pcEnd != ',')
+        return false;
+    pt->u8Xor = (uint8_t)strtoul(pcEnd + 1, NULL, 16);
+    return true;
+}
+
+/* Plain "OK" acknowledgement (AT+FWDONE). ctx is unused. */
+static bool FARMRANGER_bParseOK(const char *line, void *ctx)
+{
+    (void)ctx;
+    return (line != NULL && strstr(line, "OK") != NULL);
+}
+
+/* "+FWCHECK: OK" | "+FWCHECK: BUSY" */
+static bool FARMRANGER_bParseFwCheckAck(const char *line, void *ctx)
+{
+    bool *pbOk = (bool *)ctx;
+
+    if (line == NULL)
+        return false;
+    if (strstr(line, "+FWCHECK: OK") != NULL)   { *pbOk = true;  return true; }
+    if (strstr(line, "+FWCHECK: BUSY") != NULL) { *pbOk = false; return true; }
+    return false;
+}
+
+bool FARMRANGER_bFwCheckRequest(uint32_t u32CurrentVer)
+{
+    char cmd[24];
+    char respBuf[32] = {0};
+    bool bAcked = false;
+
+    snprintf(cmd, sizeof(cmd), "AT+FWCHECK=%lu\r\n", (unsigned long)u32CurrentVer);
+
+    if (!FARMRANGER_bATSend(cmd,
+                            FARMRANGER_bParseFwCheckAck,
+                            respBuf,
+                            sizeof(respBuf),
+                            &bAcked,
+                            FR_FW_QUERY_TIMEOUT_MS))
+    {
+        return false;   /* no response from the logger */
+    }
+
+    return bAcked;   /* false on "+FWCHECK: BUSY" — caller may still poll FWREQ */
+}
+
+FarmrangerFw_e FARMRANGER_eFwQuery(uint32_t *pu32Version, uint32_t *pu32FileBytes,
+                                   uint8_t *pu8ExpectedXor)
+{
+    FwQueryCtx_t tCtx = { .eResult = FARMRANGER_FW_NONE };
+    char respBuf[32] = {0};
+
+    if (!FARMRANGER_bATSend("AT+FWREQ\r\n",
+                            FARMRANGER_bParseFwInfo,
+                            respBuf,
+                            sizeof(respBuf),
+                            &tCtx,
+                            FR_FW_QUERY_TIMEOUT_MS))
+    {
+        return FARMRANGER_FW_NONE;   /* no answer — treat as nothing to fetch */
+    }
+
+    *pu32Version    = tCtx.u32Version;
+    *pu32FileBytes  = tCtx.u32FileBytes;
+    *pu8ExpectedXor = tCtx.u8ExpectedXor;
+    return tCtx.eResult;
+}
+
+bool FARMRANGER_bFwGetBlock(uint32_t u32Offset, uint16_t u16Len, uint8_t *pu8Buf)
+{
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "AT+FWGET=%lu,%u\r\n",
+             (unsigned long)u32Offset, (unsigned)u16Len);
+
+    /* Arm the raw capture BEFORE the command goes out so the first response
+     * byte can never race past the line path. Length is written last — it is
+     * the enable. */
+    pu8CaptureBuf = pu8Buf;
+    u16CaptureIdx = 0U;
+    u16CaptureLen = u16Len;
+
+    FwTrailerCtx_t tTrailer = {0};
+    char respBuf[32] = {0};
+    bool bOk = FARMRANGER_bATSend(cmd,
+                                  FARMRANGER_bParseFwTrailer,
+                                  respBuf,
+                                  sizeof(respBuf),
+                                  &tTrailer,
+                                  FR_FW_BLOCK_TIMEOUT_MS);
+
+    /* Disarm capture whatever happened (lost bytes leave it partly filled —
+     * the trailer line then got eaten by the capture and bOk is false). */
+    uint16_t u16Got = u16CaptureIdx;
+    u16CaptureLen = 0U;
+    u16CaptureIdx = 0U;
+    pu8CaptureBuf = NULL;
+
+    if (!bOk || u16Got != u16Len || tTrailer.u32Offset != u32Offset)
+        return false;
+
+    /* Verify the block against the logger's XOR-8. */
+    uint8_t u8Xor = 0U;
+    for (uint16_t i = 0U; i < u16Len; i++)
+        u8Xor ^= pu8Buf[i];
+
+    return (u8Xor == tTrailer.u8Xor);
+}
+
+bool FARMRANGER_bFwReportDone(bool bOk)
+{
+    char respBuf[32] = {0};
+    return FARMRANGER_bATSend(bOk ? "AT+FWDONE=OK\r\n" : "AT+FWDONE=ERR\r\n",
+                              FARMRANGER_bParseOK,
+                              respBuf,
+                              sizeof(respBuf),
+                              respBuf,
+                              FR_FW_QUERY_TIMEOUT_MS);
 }
 
 /* --------------------------------------------------------------------------

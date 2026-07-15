@@ -59,9 +59,14 @@
 #include "DeviceDiscovery.h"
 
 #include "build_config.h"
+#include "version_config.h"
 #include "DbgLog.h"
+#include "stm32wlxx_hal.h"     /* TAMP->BKP2R for the bootloader version    */
 #ifdef STORAGE_BACKEND_MICROSD
 #  include "AccLog.h"
+#endif
+#ifdef STORAGE_BACKEND_FLASH
+#  include "Fota.h"
 #endif
 
 #if defined(FRKERNEL_INTERFACE_UART) || defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
@@ -248,6 +253,7 @@ static void FRKERNEL_vProcessCommand(const char *line)
             "FrKernel commands:\r\n"
             "  tag -devicereq              this device's ID\r\n"
             "  tag -help                   list commands\r\n"
+            "  tag fwver                   app + bootloader version\r\n"
             "  tag juice                   battery + solar panel voltage (mV)\r\n"
             "  tag discovery schedule      wakeup interval (min)\r\n"
             "  tag prodsleep               enter production sleep (secondary only)\r\n"
@@ -258,6 +264,7 @@ static void FRKERNEL_vProcessCommand(const char *line)
             "FrKernel commands:\r\n"
             "  tag -devicereq              discover all device IDs\r\n"
             "  tag <ID> -help              list commands\r\n"
+            "  tag <ID> fwver              app + bootloader version\r\n"
             "  tag <ID> juice              battery + solar panel voltage (mV)\r\n"
             "  tag <ID> discovery schedule wakeup interval (min)\r\n"
             "  tag <ID> prodsleep          enter production sleep (secondary only)\r\n"
@@ -267,11 +274,15 @@ static void FRKERNEL_vProcessCommand(const char *line)
 #if defined(STORAGE_BACKEND_FLASH) && defined(FRKERNEL_INTERFACE_UART)
         FRKERNEL_vRespond(
             "  tag flash clear             erase ext-flash log\r\n"
-            "  tag flash stream            stream ext-flash log\r\n");
+            "  tag flash stream            stream ext-flash log\r\n"
+            "  tag fwaccept [off]          arm/disarm firmware acceptance (secondary)\r\n"
+            "  tag fwdistribute            distribute staged firmware (primary)\r\n");
 #elif defined(STORAGE_BACKEND_FLASH)
         FRKERNEL_vRespond(
             "  tag <ID> flash clear        erase ext-flash log\r\n"
-            "  tag <ID> flash stream       stream ext-flash log\r\n");
+            "  tag <ID> flash stream       stream ext-flash log\r\n"
+            "  tag <ID> fwaccept [off]     arm/disarm firmware acceptance (secondary)\r\n"
+            "  tag <ID> fwdistribute       distribute staged firmware (primary)\r\n");
 #endif
 #if defined(STORAGE_BACKEND_MICROSD) && defined(FRKERNEL_INTERFACE_UART)
         FRKERNEL_vRespond(
@@ -292,6 +303,19 @@ static void FRKERNEL_vProcessCommand(const char *line)
                  BAT_u16GetVoltage(), SOLAR_u16GetVSolarMV());
         FRKERNEL_vRespond(resp);
     }
+    else if (strcmp(p, "fwver") == 0)
+    {
+        /* App version comes straight from version_config.h (single source
+         * of truth for the build). Bootloader version comes from
+         * TAMP->BKP2R (the bootloader latches it on every boot per
+         * Fota_Config.h's backup-register map). */
+        snprintf(resp, sizeof(resp), "App: v%u.%u.%u  Bootloader: v%lu\r\n",
+                 (unsigned)VERSION_SW_MAJOR,
+                 (unsigned)VERSION_SW_MINOR,
+                 (unsigned)VERSION_SW_PATCH,
+                 (unsigned long)TAMP->BKP2R);
+        FRKERNEL_vRespond(resp);
+    }
     else if (strcmp(p, "discovery schedule") == 0)
     {
         snprintf(resp, sizeof(resp), "Discovery interval: %u min\r\n",
@@ -310,12 +334,50 @@ static void FRKERNEL_vProcessCommand(const char *line)
          * directly to the UART TX ring, interrupt-drained in the background —
          * actually leaves the wire before sleep can park the UART pins mid-
          * transmission (same "let the log line drain" pattern used before
-         * OTASTORE_vArmBootloaderAndReset's reset). Then auto-release so
+         * FOTA_vArmBootloaderAndReset's reset). Then auto-release so
          * sleep proceeds immediately instead of opening a kernel window. */
         osDelay(100);
         s_bConnected = false;
     }
 #ifdef STORAGE_BACKEND_FLASH
+    else if (strcmp(p, "fwaccept") == 0)
+    {
+        /* Arm firmware acceptance (secondary only). The session stays open so
+         * the secondary live-listens for the primary's OtaPrep from the
+         * DeviceDiscovery hold-while-connected loop. */
+        if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_SECONDARY)
+        {
+            FRKERNEL_vRespond("fwaccept: secondary only\r\n");
+        }
+        else
+        {
+            FOTA_vArmAcceptance();
+            FRKERNEL_vRespond("Firmware acceptance ARMED - awaiting OtaPrep\r\n");
+        }
+    }
+    else if (strcmp(p, "fwaccept off") == 0)
+    {
+        FOTA_vDisarmAcceptance();
+        FRKERNEL_vRespond("Firmware acceptance disarmed\r\n");
+    }
+    else if (strcmp(p, "fwdistribute") == 0)
+    {
+        /* Request an on-demand distribution of the staged image (primary
+         * only). The session keeps the primary awake past its campaign so the
+         * hold-while-connected loop runs FOTA_vDistribute(). */
+        if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_PRIMARY)
+        {
+            FRKERNEL_vRespond("fwdistribute: primary only\r\n");
+        }
+        else if (FOTA_bRequestDistribute())
+        {
+            FRKERNEL_vRespond("Firmware distribute requested\r\n");
+        }
+        else
+        {
+            FRKERNEL_vRespond("fwdistribute: no valid image staged\r\n");
+        }
+    }
     else if (strcmp(p, "flash clear") == 0)
     {
         /* Routed through the DbgLog consumer so it can't race log writes. */

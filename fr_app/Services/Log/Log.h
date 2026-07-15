@@ -13,8 +13,12 @@
 
 #include <stdint.h>
 
-#define LOG_FLASH_START_ADDR    0x000000UL
-#define LOG_FLASH_END_ADDR      0x080000UL   /* 512 KB */
+/* Log partition: the upper 272 KB of the 512 KB device. The lower region
+ * (0x00000-0x3BFFF) belongs to the OTA image scratchpad + metadata — see
+ * fr_app/Services/OtaStore/OtaStore_Config.h for the full partition map. */
+#define LOG_FLASH_START_ADDR    0x03C000UL
+#define LOG_FLASH_END_ADDR      0x080000UL
+#define LOG_FLASH_SIZE_BYTES    (LOG_FLASH_END_ADDR - LOG_FLASH_START_ADDR)
 
 void     LOG_vInit(void);
 void     LOG_vWrite(const char *buf, uint16_t len);

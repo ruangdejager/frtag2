@@ -72,7 +72,8 @@
  * found nothing left, regardless of which earlier allocation was the actual
  * tipping point. +1 KB comfortably covers it with margin (chip has ~4.1 KB
  * of RAM sitting idle outside .bss/.data at 44 KB, so this still leaves
- * ~3.1 KB free afterward). */
+ * ~3.1 KB free afterward). This 44 KB base already includes the earlier LoRa
+ * TX queue (24->8 slots) and mesh TX item-size (128->64 B) reductions. */
 #define configTOTAL_HEAP_SIZE                    ((size_t)46080)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_TRACE_FACILITY                 1

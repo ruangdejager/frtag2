@@ -41,12 +41,22 @@ _estack = ORIGIN(RAM) + LENGTH(RAM); /* end of "RAM" Ram type memory */
 _Min_Heap_Size = 0x200; /* required amount of heap  */
 _Min_Stack_Size = 0x400; /* required amount of stack */
 
-/* Memories definition */
+/* Memories definition.
+ *
+ * The first 20 KB of internal flash (0x08000000-0x08004FFF) are reserved for
+ * the OTA bootloader (future project); the application links at 0x08005000
+ * with its vector table remapped there via VECT_TAB_OFFSET (see
+ * Core/Src/system_stm32wlxx.c). The full internal/external flash map and the
+ * bootloader handoff contract live in
+ * fr_app/Services/OtaStore/OtaStore_Config.h — keep these numbers in sync.
+ */
+BOOTLOADER_SIZE = 20K;
+
 MEMORY
 {
   RAM    (xrw)   : ORIGIN = 0x20000000, LENGTH = 64K
   RAM2   (xrw)   : ORIGIN = 0x10000000, LENGTH = 32K
-  FLASH   (rx)   : ORIGIN = 0x08000000, LENGTH = 256K
+  FLASH   (rx)   : ORIGIN = 0x08000000 + BOOTLOADER_SIZE, LENGTH = 256K - BOOTLOADER_SIZE
 }
 
 /* Sections */
@@ -57,6 +67,18 @@ SECTIONS
   {
     . = ALIGN(4);
     KEEP(*(.isr_vector)) /* Startup code */
+    . = ALIGN(4);
+  } >FLASH
+
+  /* Firmware-version header (FwVersion_t, see version_config.c) at a fixed
+   * address the OTA bootloader reads directly — must match OTA_FW_INFO_ADDR
+   * in Fota_Config.h (ORIGIN(FLASH) + 0x200). Explicit address forces this
+   * section to always land at the same offset regardless of vector-table
+   * size, rather than floating right after .isr_vector. */
+  .fw_info ORIGIN(FLASH) + 0x200 :
+  {
+    . = ALIGN(4);
+    KEEP(*(.fw_info))
     . = ALIGN(4);
   } >FLASH
 
