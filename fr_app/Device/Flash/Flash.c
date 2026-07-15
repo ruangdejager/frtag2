@@ -20,6 +20,37 @@
  * access transparently wakes it first via FLASH_vEnsureAwake(). */
 static bool bInDpd = false;
 
+/* This device is shared: Log.c (driven by DBGLOG_vConsumerTask, its own
+ * thread) and OtaStore.c (driven by the AppTask) both call straight into
+ * this driver's public functions. Every one of those functions is a
+ * multi-step SPI transaction bracketed by CS select/deselect; on a
+ * preemptive scheduler, a task switch mid-transaction lets a second task
+ * start its own Select/Write/Read/Deselect sequence on the same physical
+ * CS/MOSI/MISO lines while the first transaction is still open, corrupting
+ * both. Splitting the address space between the log partition and the OTA
+ * scratchpad (the assumption an earlier version of this file's comment
+ * made) does NOT protect against this — SPI bus ownership, not the target
+ * address, is what needs to be exclusive. Recursive because the internal
+ * helpers below (FLASH_bWaitReady -> FLASH_bDeviceBusy ->
+ * FLASH_u8ReadStatusReg, etc.) call back into other public entry points
+ * from the same task while it already holds the lock. */
+static osMutexId_t xFlashMutex = NULL;
+
+static void FLASH_vLock(void)
+{
+    if (xFlashMutex == NULL)
+    {
+        const osMutexAttr_t attr = { .attr_bits = osMutexRecursive };
+        xFlashMutex = osMutexNew(&attr);
+    }
+    osMutexAcquire(xFlashMutex, osWaitForever);
+}
+
+static void FLASH_vUnlock(void)
+{
+    osMutexRelease(xFlashMutex);
+}
+
 /* --------------------------------------------------------------------------
  * Internal helpers
  * -------------------------------------------------------------------------- */
@@ -161,6 +192,8 @@ static uint8_t FLASH_u8ReadStatusReg2(void)
 
 void FLASH_vInit(void)
 {
+    FLASH_vLock();
+
     FLASH_vReleaseDeepPowerDown();
     osDelay(1);
 
@@ -183,6 +216,7 @@ void FLASH_vInit(void)
         DBG("FLASH: JEDEC ID mismatch - got %02X %02X %02X (expected mfr %02X) - "
             "no flash fitted, flash logging disabled\r\n",
             id[0], id[1], id[2], FLASH_MANUFACTURER_ID);
+        FLASH_vUnlock();
         return;
     }
 
@@ -223,15 +257,20 @@ void FLASH_vInit(void)
 
 //    FLASH_vChipErase();
 
+    FLASH_vUnlock();
 }
 
 bool FLASH_bDeviceBusy(void)
 {
-    return (FLASH_u8ReadStatusReg() & FLASH_STATUS_WIP) != 0U;
+    FLASH_vLock();
+    bool bBusy = (FLASH_u8ReadStatusReg() & FLASH_STATUS_WIP) != 0U;
+    FLASH_vUnlock();
+    return bBusy;
 }
 
 uint8_t FLASH_u8ReadStatusReg(void)
 {
+    FLASH_vLock();
     FLASH_vEnsureAwake();   /* chokepoint: every read/write/erase polls here */
     uint8_t cmd = FLASH_CMD_READ_STATUS;
     /* Default to "busy" so that a failed/short SPI read can never be
@@ -243,11 +282,13 @@ uint8_t FLASH_u8ReadStatusReg(void)
     if (FLASH_DRIVER_vRead(&status, 1) != HAL_OK)
         status = FLASH_STATUS_WIP;
     FLASH_DRIVER_vDeselect();
+    FLASH_vUnlock();
     return status;
 }
 
 bool FLASH_bVerifyDevice(void)
 {
+    FLASH_vLock();
     FLASH_vEnsureAwake();
     uint8_t cmd    = FLASH_CMD_JEDEC_ID;
     uint8_t id[3]  = {0};
@@ -255,13 +296,19 @@ bool FLASH_bVerifyDevice(void)
     FLASH_DRIVER_vWrite(&cmd, 1);
     FLASH_DRIVER_vRead(id, 3);
     FLASH_DRIVER_vDeselect();
-    return id[0] == FLASH_MANUFACTURER_ID;
+    bool bOk = (id[0] == FLASH_MANUFACTURER_ID);
+    FLASH_vUnlock();
+    return bOk;
 }
 
 bool FLASH_vRead(uint32_t addr, uint8_t *buf, uint16_t len)
 {
+    FLASH_vLock();
     if (!bDevicePresent)
+    {
+        FLASH_vUnlock();
         return false;
+    }
 
     uint8_t cmd[4] = {
         FLASH_CMD_READ,
@@ -270,19 +317,27 @@ bool FLASH_vRead(uint32_t addr, uint8_t *buf, uint16_t len)
         (uint8_t)((addr      ) & 0xFFU),
     };
     if (!FLASH_bWaitReady())
+    {
+        FLASH_vUnlock();
         return false;
+    }
 
     FLASH_DRIVER_vSelect();
     bool bOk = (FLASH_DRIVER_vWrite(cmd, 4) == HAL_OK) &&
                (FLASH_DRIVER_vRead(buf, len) == HAL_OK);
     FLASH_DRIVER_vDeselect();
+    FLASH_vUnlock();
     return bOk;
 }
 
 bool FLASH_vPageWrite(uint32_t addr, const uint8_t *buf, uint16_t len)
 {
+    FLASH_vLock();
     if (!bDevicePresent)
+    {
+        FLASH_vUnlock();
         return false;
+    }
 
     uint8_t cmd[4] = {
         FLASH_CMD_PAGE_PROGRAM,
@@ -291,7 +346,10 @@ bool FLASH_vPageWrite(uint32_t addr, const uint8_t *buf, uint16_t len)
         (uint8_t)((addr      ) & 0xFFU),
     };
     if (!FLASH_bWaitReady())
+    {
+        FLASH_vUnlock();
         return false;
+    }
 
     FLASH_vWriteEnable();
     FLASH_DRIVER_vSelect();
@@ -300,13 +358,18 @@ bool FLASH_vPageWrite(uint32_t addr, const uint8_t *buf, uint16_t len)
     FLASH_DRIVER_vDeselect();
     if (!bOk)
         FLASH_vWriteDisable();   /* never leave the device armed (WEL=1) */
+    FLASH_vUnlock();
     return bOk;
 }
 
 bool FLASH_vSectorErase(uint32_t addr)
 {
+    FLASH_vLock();
     if (!bDevicePresent)
+    {
+        FLASH_vUnlock();
         return false;
+    }
 
     uint8_t cmd[4] = {
         FLASH_CMD_SECTOR_ERASE,
@@ -315,7 +378,10 @@ bool FLASH_vSectorErase(uint32_t addr)
         (uint8_t)((addr      ) & 0xFFU),
     };
     if (!FLASH_bWaitReady())
+    {
+        FLASH_vUnlock();
         return false;
+    }
 
     FLASH_vWriteEnable();
     FLASH_DRIVER_vSelect();
@@ -323,13 +389,18 @@ bool FLASH_vSectorErase(uint32_t addr)
     FLASH_DRIVER_vDeselect();
     if (!bOk)
         FLASH_vWriteDisable();   /* never leave the device armed (WEL=1) */
+    FLASH_vUnlock();
     return bOk;
 }
 
 bool FLASH_vBlockErase(uint32_t addr)
 {
+    FLASH_vLock();
     if (!bDevicePresent)
+    {
+        FLASH_vUnlock();
         return false;
+    }
 
     uint8_t cmd[4] = {
         FLASH_CMD_BLOCK_ERASE,
@@ -338,7 +409,10 @@ bool FLASH_vBlockErase(uint32_t addr)
         (uint8_t)((addr      ) & 0xFFU),
     };
     if (!FLASH_bWaitReady())
+    {
+        FLASH_vUnlock();
         return false;
+    }
 
     FLASH_vWriteEnable();
     FLASH_DRIVER_vSelect();
@@ -346,17 +420,25 @@ bool FLASH_vBlockErase(uint32_t addr)
     FLASH_DRIVER_vDeselect();
     if (!bOk)
         FLASH_vWriteDisable();   /* never leave the device armed (WEL=1) */
+    FLASH_vUnlock();
     return bOk;
 }
 
 bool FLASH_vChipErase(void)
 {
+    FLASH_vLock();
     if (!bDevicePresent)
+    {
+        FLASH_vUnlock();
         return false;
+    }
 
     uint8_t cmd = FLASH_CMD_CHIP_ERASE;
     if (!FLASH_bWaitReady())
+    {
+        FLASH_vUnlock();
         return false;
+    }
 
     /* A chip erase is exactly the operation used to recover a stuck device, so
      * clear any latched block protection first - otherwise the erase is
@@ -372,27 +454,38 @@ bool FLASH_vChipErase(void)
     if (!bOk)
     {
         FLASH_vWriteDisable();   /* never leave the device armed (WEL=1) */
+        FLASH_vUnlock();
         return false;
     }
 
-    return FLASH_bWaitReadyTimeout(FLASH_CHIP_ERASE_TIMEOUT_MS);
+    bool bReady = FLASH_bWaitReadyTimeout(FLASH_CHIP_ERASE_TIMEOUT_MS);
+    FLASH_vUnlock();
+    return bReady;
 }
 
 void FLASH_vDeepPowerDown(void)
 {
-    if (bInDpd) return;     /* already parked — don't churn SPI */
+    FLASH_vLock();
+    if (bInDpd)
+    {
+        FLASH_vUnlock();
+        return;     /* already parked — don't churn SPI */
+    }
     uint8_t cmd = FLASH_CMD_DEEP_PWR_DOWN;
     FLASH_DRIVER_vSelect();
     FLASH_DRIVER_vWrite(&cmd, 1);
     FLASH_DRIVER_vDeselect();
     bInDpd = true;
+    FLASH_vUnlock();
 }
 
 void FLASH_vReleaseDeepPowerDown(void)
 {
+    FLASH_vLock();
     uint8_t cmd = FLASH_CMD_RESUME;
     FLASH_DRIVER_vSelect();
     FLASH_DRIVER_vWrite(&cmd, 1);
     FLASH_DRIVER_vDeselect();
     bInDpd = false;
+    FLASH_vUnlock();
 }

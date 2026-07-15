@@ -37,7 +37,7 @@
 
 /* STORAGE_BACKEND_FLASH comes from build_config.h (included above). */
 #ifdef STORAGE_BACKEND_FLASH
-#  include "OtaUpdate.h"
+#  include "Fota.h"
 #endif
 
 /* ---- Private defines ---- */
@@ -154,10 +154,10 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
          * and this node already runs it, the wake slot serves firmware to the
          * secondaries instead of running a discovery campaign — the OtaPrep
          * announcement goes out where the DReq would have. */
-        if (eDeviceRole == DEVICE_ROLE_PRIMARY && OTAUPDATE_bDistributePending())
+        if (eDeviceRole == DEVICE_ROLE_PRIMARY && FOTA_bDistributePending())
         {
             bOtaSlot = true;
-            OTAUPDATE_vDistribute();
+            FOTA_vDistribute();
         }
 #endif
 
@@ -248,9 +248,9 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                      * becomes a firmware-receive session. On a complete +
                      * verified image the call resets into the bootloader;
                      * otherwise fall through to the normal sleep path. */
-                    if ((r & DEVICE_DISCOVERY_NOTIFY_OTA) && OTAUPDATE_bPrepPending())
+                    if ((r & DEVICE_DISCOVERY_NOTIFY_OTA) && FOTA_bPrepPending())
                     {
-                        OTAUPDATE_vSecondaryReceive();
+                        FOTA_vSecondaryReceive();
                         break;
                     }
 #endif
@@ -356,19 +356,26 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             else if (u8WakeInterval == 60)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_60_MIN);
             else if (u8WakeInterval == 120) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_120_MIN);
 
+            /* ---- Send TimeSync to secondaries ---- *
+             * Sent BEFORE the OTA check so secondaries end their campaign
+             * here rather than waiting out the primary's fr9 round-trip
+             * (which, with the AT+FWCHECK GitHub Pages check, can now run
+             * to OTA_FWREQ_WAIT_MAX_MS). Only the primary talks to fr9 at
+             * all — secondaries have no Farmranger UART link. */
+            DEVICE_DISCOVERY_vSendTS();
+            EVTLOG(LOG_TX_TS, 1);
+
 #ifdef STORAGE_BACKEND_FLASH
             /* ---- OTA firmware pull (logger session still up) ----
-             * If the logger offers a newer tag firmware, acquire it into the
-             * ext-flash scratchpad. On success this arms the bootloader and
-             * RESETS — nothing after it runs this wake. */
-            OTAUPDATE_bUartAcquire();
+             * Ask fr9 to check GitHub Pages for a newer image, then poll
+             * AT+FWREQ (which answers FW,WAIT while fr9's check/download is
+             * in flight). If the logger offers a newer tag firmware, acquire
+             * it into the ext-flash scratchpad. On success this arms the
+             * bootloader and RESETS — nothing after it runs this wake. */
+            FOTA_bUartAcquire();
 #endif
 
             DEVICE_DISCOVERY_DRIVER_vDisconnectLogger();
-
-            /* ---- Send TimeSync to secondaries ---- */
-            DEVICE_DISCOVERY_vSendTS();
-            EVTLOG(LOG_TX_TS, 1);
 
             osDelay(5000);
         }
@@ -439,17 +446,17 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             {
 #ifdef STORAGE_BACKEND_FLASH
                 if (eDeviceRole == DEVICE_ROLE_SECONDARY &&
-                    OTAUPDATE_bAcceptanceArmed() && OTAUPDATE_bPrepPending())
+                    FOTA_bAcceptanceArmed() && FOTA_bPrepPending())
                 {
                     /* Verified image -> resets into the bootloader (no return);
                      * failure returns here and the session keeps holding. */
-                    OTAUPDATE_vSecondaryReceive();
+                    FOTA_vSecondaryReceive();
                 }
                 else if (eDeviceRole == DEVICE_ROLE_PRIMARY &&
-                         OTAUPDATE_bDistributeRequested())
+                         FOTA_bDistributeRequested())
                 {
-                    OTAUPDATE_vClearDistributeRequest();
-                    OTAUPDATE_vDistribute();
+                    FOTA_vClearDistributeRequest();
+                    FOTA_vDistribute();
                 }
 #endif
                 osDelay(500);

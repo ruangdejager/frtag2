@@ -638,6 +638,7 @@ typedef struct {
     FarmrangerFw_e eResult;
     uint32_t       u32Version;
     uint32_t       u32FileBytes;
+    uint8_t        u8ExpectedXor;
 } FwQueryCtx_t;
 
 typedef struct {
@@ -645,7 +646,7 @@ typedef struct {
     uint8_t  u8Xor;
 } FwTrailerCtx_t;
 
-/* "FW,NONE" | "FW,WAIT" | "FW,<verMMmmpp>,<fileBytes>" */
+/* "FW,NONE" | "FW,WAIT" | "FW,<verMMmmpp>,<fileBytes>,<xor8hex>" */
 static bool FARMRANGER_bParseFwInfo(const char *line, void *ctx)
 {
     FwQueryCtx_t *pt = (FwQueryCtx_t *)ctx;
@@ -663,12 +664,14 @@ static bool FARMRANGER_bParseFwInfo(const char *line, void *ctx)
     if (pcEnd == p || *pcEnd != ',')
         return false;
     uint32_t u32Bytes = strtoul(pcEnd + 1, &pcEnd, 10);
-    if (u32Bytes == 0UL)
+    if (u32Bytes == 0UL || *pcEnd != ',')
         return false;
+    uint8_t u8Xor = (uint8_t)strtoul(pcEnd + 1, &pcEnd, 16);
 
-    pt->eResult      = FARMRANGER_FW_AVAILABLE;
-    pt->u32Version   = u32Ver;
-    pt->u32FileBytes = u32Bytes;
+    pt->eResult       = FARMRANGER_FW_AVAILABLE;
+    pt->u32Version    = u32Ver;
+    pt->u32FileBytes  = u32Bytes;
+    pt->u8ExpectedXor = u8Xor;
     return true;
 }
 
@@ -697,7 +700,41 @@ static bool FARMRANGER_bParseOK(const char *line, void *ctx)
     return (line != NULL && strstr(line, "OK") != NULL);
 }
 
-FarmrangerFw_e FARMRANGER_eFwQuery(uint32_t *pu32Version, uint32_t *pu32FileBytes)
+/* "+FWCHECK: OK" | "+FWCHECK: BUSY" */
+static bool FARMRANGER_bParseFwCheckAck(const char *line, void *ctx)
+{
+    bool *pbOk = (bool *)ctx;
+
+    if (line == NULL)
+        return false;
+    if (strstr(line, "+FWCHECK: OK") != NULL)   { *pbOk = true;  return true; }
+    if (strstr(line, "+FWCHECK: BUSY") != NULL) { *pbOk = false; return true; }
+    return false;
+}
+
+bool FARMRANGER_bFwCheckRequest(uint32_t u32CurrentVer)
+{
+    char cmd[24];
+    char respBuf[32] = {0};
+    bool bAcked = false;
+
+    snprintf(cmd, sizeof(cmd), "AT+FWCHECK=%lu\r\n", (unsigned long)u32CurrentVer);
+
+    if (!FARMRANGER_bATSend(cmd,
+                            FARMRANGER_bParseFwCheckAck,
+                            respBuf,
+                            sizeof(respBuf),
+                            &bAcked,
+                            FR_FW_QUERY_TIMEOUT_MS))
+    {
+        return false;   /* no response from the logger */
+    }
+
+    return bAcked;   /* false on "+FWCHECK: BUSY" — caller may still poll FWREQ */
+}
+
+FarmrangerFw_e FARMRANGER_eFwQuery(uint32_t *pu32Version, uint32_t *pu32FileBytes,
+                                   uint8_t *pu8ExpectedXor)
 {
     FwQueryCtx_t tCtx = { .eResult = FARMRANGER_FW_NONE };
     char respBuf[32] = {0};
@@ -712,8 +749,9 @@ FarmrangerFw_e FARMRANGER_eFwQuery(uint32_t *pu32Version, uint32_t *pu32FileByte
         return FARMRANGER_FW_NONE;   /* no answer — treat as nothing to fetch */
     }
 
-    *pu32Version   = tCtx.u32Version;
-    *pu32FileBytes = tCtx.u32FileBytes;
+    *pu32Version    = tCtx.u32Version;
+    *pu32FileBytes  = tCtx.u32FileBytes;
+    *pu8ExpectedXor = tCtx.u8ExpectedXor;
     return tCtx.eResult;
 }
 

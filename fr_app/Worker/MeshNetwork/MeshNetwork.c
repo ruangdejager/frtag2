@@ -32,7 +32,7 @@
 
 #include "build_config.h"
 #ifdef STORAGE_BACKEND_FLASH
-#include "OtaUpdate.h"
+#include "Fota.h"
 #endif
 
 #include "GPS.h"
@@ -946,10 +946,10 @@ void MESHNETWORK_vParserTask(void *pvParameters)
             case MeshPktType_OtaChunk:
             case MeshPktType_OtaPoll:
             case MeshPktType_OtaReport:
-                /* Direct (non-mesh) OTA traffic: dispatched to the OtaUpdate
+                /* Direct (non-mesh) OTA traffic: dispatched to the Fota
                  * worker, never entered into the forward ring, never
                  * re-forwarded. */
-                OTAUPDATE_vOnLoraPacket(tRx.buffer, tRx.length);
+                FOTA_vOnLoraPacket(tRx.buffer, tRx.length);
                 break;
 #endif
             default:

@@ -53,7 +53,7 @@
 #include "flashLog.h"
 #include "Flash.h"
 #include "Log.h"
-#include "OtaStore.h"
+#include "Fota.h"
 #include "DbgLog.h"
 
 #ifdef STORAGE_BACKEND_MICROSD
@@ -134,8 +134,9 @@ void INIT_vInitialization(void *parameters)
     MICROSD_vInit();
 #else
     FLASH_vInit();
-    /* One-time OTA partition-layout migration (see OtaStore_Config.h). */
-    OTASTORE_vInit();
+    /* One-time OTA partition migration + latch installed-version into
+     * TAMP->BKP3R for the bootloader to compare against (see Fota_Config.h). */
+    FOTA_vInit();
 #endif
     LOG_vInit();
 
@@ -233,7 +234,7 @@ void INIT_vInitialization(void *parameters)
      * vPortSuppressTicksAndSleep()), so delaying it here is what makes the
      * boot log's completion a precondition of the first sleep, not a race
      * against it (same "let the log line drain" pattern used before
-     * FrKernel's prodsleep and OTASTORE_vArmBootloaderAndReset's reset). */
+     * FrKernel's prodsleep and FOTA_vArmBootloaderAndReset's reset). */
     osDelay(100);
 
     systemReadyForSleep = true;

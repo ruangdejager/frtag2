@@ -70,6 +70,18 @@ SECTIONS
     . = ALIGN(4);
   } >FLASH
 
+  /* Firmware-version header (FwVersion_t, see version_config.c) at a fixed
+   * address the OTA bootloader reads directly — must match OTA_FW_INFO_ADDR
+   * in Fota_Config.h (ORIGIN(FLASH) + 0x200). Explicit address forces this
+   * section to always land at the same offset regardless of vector-table
+   * size, rather than floating right after .isr_vector. */
+  .fw_info ORIGIN(FLASH) + 0x200 :
+  {
+    . = ALIGN(4);
+    KEEP(*(.fw_info))
+    . = ALIGN(4);
+  } >FLASH
+
   /* The program code and other data into "FLASH" Rom type memory */
   .text :
   {
