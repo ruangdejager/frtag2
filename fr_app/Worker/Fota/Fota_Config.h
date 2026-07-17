@@ -142,8 +142,33 @@ typedef struct
 #define OTA_LORA_MAX_TARGETS      8U      /* secondaries served per session    */
 #define OTA_LORA_PREP_REPEATS     5U      /* OtaPrep announcements, 1 s apart  */
 #define OTA_LORA_PREP_GAP_MS      1000U
-#define OTA_LORA_CHUNK_GAP_MS     15U     /* pause between chunk transmissions */
-#define OTA_LORA_POLL_TIMEOUT_MS  2500U   /* wait for one OtaReport            */
+#define OTA_LORA_CHUNK_GAP_MS     100U    /* pause after each chunk TX, before
+                                             the next chunk's flash read. Not
+                                             just radio pacing: the SX126x PA's
+                                             current spike during TX sags the
+                                             shared supply rail, and a flash
+                                             read issued too soon after reads
+                                             back corrupted bytes — confirmed
+                                             on hardware (isolated single-TX
+                                             test: a read right after TX was
+                                             wrong, a second back-to-back
+                                             re-read was ALSO wrong and
+                                             different again, but a third read
+                                             ~65 ms after TX matched the known-
+                                             good value exactly). 15 ms was
+                                             not enough settle time; 100 ms
+                                             gives comfortable margin. */
+#define OTA_LORA_POLL_TIMEOUT_MS  6000U   /* wait for one OtaReport. Needs to
+                                             cover the primary's own poll TX
+                                             sitting behind remaining chunks
+                                             in the radio TX queue (up to
+                                             ~1 s under a 64-chunk blast),
+                                             plus secondary CAD + reply
+                                             airtime + primary RX. 2500 ms
+                                             was the boundary and every
+                                             post-mid-session window was
+                                             timing out just as the reply
+                                             arrived on the air.            */
 #define OTA_LORA_REPAIR_ROUNDS    3U      /* repair passes per window          */
 #define OTA_LORA_RX_IDLE_MS       20000U  /* secondary: session silence abort  */
 #define OTA_LORA_SESSION_MAX_MS   (12UL * 60UL * 1000UL)

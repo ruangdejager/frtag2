@@ -105,6 +105,14 @@ typedef struct {
 typedef struct {
     uint32_t     u32UtcTimestamp;
     WakeupInterval tWakeupInterval;
+    uint32_t     u32StagedFwVersion;  /* MMmmpp of the image in the primary's
+                                        * ext-flash scratchpad, 0 if none
+                                        * valid — see FOTA_bGetMeta(). Lets
+                                        * every secondary that hears the
+                                        * end-of-campaign TimeSync learn
+                                        * whether an update is available
+                                        * without a dedicated OtaPrep round
+                                        * trip. */
 } MeshPktTimeSync_t;
 
 /* ---- Forward ring ---- */
@@ -164,7 +172,8 @@ void MESHNETWORK_vParserTask(void *pvParameters);
 
 bool MESHNETWORK_bStartDiscoveryRound(uint32_t u32DreqId);
 void MESHNETWORK_vSendTimeSync(uint32_t u32UtcTimestamp,
-                               WakeupInterval tWakeupInterval);
+                               WakeupInterval tWakeupInterval,
+                               uint32_t u32StagedFwVersion);
 
 /* Stop whatever dreq this node is currently beaconing (secondary campaign end —
  * the caller doesn't know the node's internal beacon dreq id). */
@@ -207,5 +216,9 @@ void MESHNETWORK_vResetTimeSyncAccepted(void);
 void MESHNETWORK_vResetNodeRole(void);
 void MESHNETWORK_vIncrDreqWaveCnt(void);
 void MESHNETWORK_vResetDreqWaveCnt(void);
+
+/* One-line traffic summary (DReq/beacons/acks heard, messages forwarded)
+ * since the last MESHNETWORK_vResetDreqWaveCnt() — call at campaign end. */
+void MESHNETWORK_vLogCampaignStats(const char *pcTag);
 
 #endif /* WORKER_MESHNETWORK_MESHNETWORK_H_ */

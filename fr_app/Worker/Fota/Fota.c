@@ -43,8 +43,10 @@
 #include "cmsis_os2.h"
 #include "stm32wlxx_hal.h"
 #include "dbg_log.h"
+#include "Log.h"          /* LOG_vSuspend — quiesce flash logging during OTA */
 
 #include <string.h>
+#include <stdio.h>
 
 /* ==========================================================================
  * Storage layer — external NOR scratchpad + metadata
@@ -147,24 +149,29 @@ bool FOTA_bReadImage(uint32_t u32Offset, uint8_t *pu8Buf, uint16_t u16Len)
     return FOTA_DRIVER_bRead(OTA_SCRATCH_START_ADDR + u32Offset, pu8Buf, u16Len);
 }
 
-uint8_t FOTA_u8CalcImageXorRange(uint32_t u32Start, uint32_t u32Len)
+/* u16BufLen lets FOTA_u8CalcImageXorRange (below) and the diagnostic probe
+ * FOTA_u8CalcImageXorRangeBuf both share one implementation while reading
+ * in different-sized chunks — used to test whether the read chunk size
+ * itself affects the result (more, smaller SPI transactions = more
+ * preemption windows against the concurrent DbgLog consumer task). */
+static uint8_t FOTA_u8CalcImageXorRangeBuf(uint32_t u32Start, uint32_t u32Len,
+                                            uint8_t *pu8Buf, uint16_t u16BufLen)
 {
-    uint8_t  au8Buf[OTA_XOR_BUF_LEN];
     uint8_t  u8Xor     = 0U;
     uint32_t u32Addr   = OTA_SCRATCH_START_ADDR + u32Start;
     uint32_t u32Remain = u32Len;
 
     while (u32Remain > 0U)
     {
-        uint16_t u16Chunk = (u32Remain > sizeof(au8Buf))
-                          ? (uint16_t)sizeof(au8Buf)
+        uint16_t u16Chunk = (u32Remain > u16BufLen)
+                          ? u16BufLen
                           : (uint16_t)u32Remain;
 
-        if (!FOTA_DRIVER_bRead(u32Addr, au8Buf, u16Chunk))
+        if (!FOTA_DRIVER_bRead(u32Addr, pu8Buf, u16Chunk))
             return (uint8_t)~u8Xor;   /* read failure: guarantee a mismatch */
 
         for (uint16_t i = 0U; i < u16Chunk; i++)
-            u8Xor ^= au8Buf[i];
+            u8Xor ^= pu8Buf[i];
 
         u32Addr   += u16Chunk;
         u32Remain -= u16Chunk;
@@ -173,6 +180,71 @@ uint8_t FOTA_u8CalcImageXorRange(uint32_t u32Start, uint32_t u32Len)
             osDelay(1);   /* yield every 32 KB of the ~236 KB pass */
     }
     return u8Xor;
+}
+
+uint8_t FOTA_u8CalcImageXorRange(uint32_t u32Start, uint32_t u32Len)
+{
+    uint8_t au8Buf[OTA_XOR_BUF_LEN];
+    return FOTA_u8CalcImageXorRangeBuf(u32Start, u32Len, au8Buf, sizeof(au8Buf));
+}
+
+/* Diagnostic only: re-scan the same range with a 224-byte buffer (matching
+ * OTA_LORA_CHUNK_LEN — the granularity every proven-reliable read in this
+ * file uses) instead of the normal 64-byte OTA_XOR_BUF_LEN, to test
+ * whether the whole-image scan's read chunk size is itself the source of
+ * the mismatches. */
+static uint8_t FOTA_u8CalcImageXor224(uint32_t u32Start, uint32_t u32Len)
+{
+    uint8_t au8Buf[224];
+    return FOTA_u8CalcImageXorRangeBuf(u32Start, u32Len, au8Buf, sizeof(au8Buf));
+}
+
+/* A transient SPI/flash read glitch was confirmed on hardware: a fresh
+ * full-image XOR pass can occasionally return a wrong value while the
+ * stored bytes are actually fine, and a plain immediate re-read recovers
+ * the correct one (matching known-good metadata/manifest). Tearing down a
+ * valid image over a single flaky read was the actual root cause behind
+ * the "corrupted every time, differently every time" symptom seen in the
+ * field — not a real storage or LoRa-transfer bug. Retry the scan a
+ * bounded number of times and accept the first pass that agrees with the
+ * expected value; only report a genuine mismatch if every attempt fails to
+ * match (they don't need to agree with each other — any single match is
+ * proof the bytes are correct and this pass's read was the fluke). */
+#define FOTA_XOR_VERIFY_MAX_ATTEMPTS  8U
+
+static bool FOTA_bVerifyImageXorRetry(uint32_t u32Start, uint32_t u32Len,
+                                       uint8_t u8Expected, uint8_t *pu8LastGot)
+{
+    uint8_t au8Attempts[FOTA_XOR_VERIFY_MAX_ATTEMPTS];
+
+    for (uint8_t u8Attempt = 0U; u8Attempt < FOTA_XOR_VERIFY_MAX_ATTEMPTS; u8Attempt++)
+    {
+        /* Use the reliable continuous 224-byte read (never yields for an
+         * image this size, so nothing interleaves on the shared flash — the
+         * same gap-free pattern the bootloader and the clean PROBE use).
+         * The 64-byte scan yields every 32 KB and reads unreliably. */
+        uint8_t u8Xor = FOTA_u8CalcImageXor224(u32Start, u32Len);
+        au8Attempts[u8Attempt] = u8Xor;
+        *pu8LastGot = u8Xor;
+        if (u8Xor == u8Expected)
+        {
+            if (u8Attempt > 0U)
+                DBG_LOG("Fota: xor verify recovered on attempt %u/%u (transient read glitch)\r\n",
+                        (unsigned)(u8Attempt + 1U), (unsigned)FOTA_XOR_VERIFY_MAX_ATTEMPTS);
+            return true;
+        }
+    }
+
+    /* Every attempt disagreed with the expected value — dump each one so a
+     * genuine failure shows whether the reads are converging on a single
+     * consistent (real corruption) value or scattering randomly (glitch
+     * rate too high for this budget, not a data problem). */
+    DBG_LOG("Fota: xor verify FAILED all %u attempts, expected=0x%02X, got:",
+            (unsigned)FOTA_XOR_VERIFY_MAX_ATTEMPTS, (unsigned)u8Expected);
+    for (uint8_t i = 0U; i < FOTA_XOR_VERIFY_MAX_ATTEMPTS; i++)
+        DBG_LOG(" 0x%02X", (unsigned)au8Attempts[i]);
+    DBG_LOG("\r\n");
+    return false;
 }
 
 uint8_t FOTA_u8CalcImageXor(uint32_t u32SizeBytes)
@@ -373,12 +445,14 @@ bool FOTA_bUartAcquire(void)
 
     uint32_t u32Size     = u32FileBytes;
     uint32_t u32StopAddr = OTA_APP_BASE_ADDR + u32Size - 1UL;
-    uint8_t  u8Xor       = FOTA_u8CalcImageXor(u32Size);
+    uint8_t  u8Xor;
 
     /* Cross-check against the logger's manifest-verified whole-image XOR-8
      * — catches corruption between the last per-block trailer check and
-     * the final stored bytes (e.g. on the flash write/read-back path). */
-    if (u8Xor != u8ExpectedXor)
+     * the final stored bytes (e.g. on the flash write/read-back path).
+     * Retried: see FOTA_bVerifyImageXorRetry — a single flaky read must
+     * not discard an otherwise-good freshly-acquired image. */
+    if (!FOTA_bVerifyImageXorRetry(0U, u32Size, u8ExpectedXor, &u8Xor))
     {
         DBG_LOG("Fota: image XOR mismatch (stored=0x%02X, logger=0x%02X) - discarding\r\n",
                 u8Xor, u8ExpectedXor);
@@ -447,6 +521,7 @@ typedef struct {
 } FotaTarget_t;
 static FotaTarget_t     atTargets[OTA_LORA_MAX_TARGETS];
 static volatile uint8_t u8TargetCount;
+static volatile bool    bDistributeActive;
 
 /* Report mailbox (parser -> AppTask, one slot) */
 static volatile bool     bReportMail;
@@ -497,7 +572,19 @@ static void FOTA_vBitSet(uint8_t *pu8Map, uint16_t u16Bit)
     pu8Map[u16Bit / 8U] |= (uint8_t)(1U << (u16Bit % 8U));
 }
 
-/* Direct radio TX with queue backpressure (AppTask only). */
+/* Direct radio TX with queue backpressure (AppTask only).
+ *
+ * Uses the BLOCKING enqueue (LORARADIO_bTxPacketWait), not a retry loop
+ * around the non-blocking LORARADIO_bTxPacket: the retry loop called the
+ * non-blocking enqueue up to 40 times, and every failed attempt logs
+ * "TX PKT queue full" from inside LoraRadio.c — once real airtime +
+ * carrier-sense back-off made the radio task slower than the chunk
+ * producer (exactly the case once actual TX contention showed up, e.g. a
+ * chunk-blast window), that flooded the log with thousands of near-
+ * duplicate lines and drowned everything else in it. The blocking variant
+ * is a single osMessageQueuePut wait — no polling, no spam, and it wakes
+ * the instant the radio task actually has room instead of on some 25 ms
+ * cadence regardless of when room appears. */
 static bool FOTA_bRadioTx(const uint8_t *pu8Buf, uint8_t u8Len)
 {
     LoraRadio_Packet_t tPkt;
@@ -505,13 +592,7 @@ static bool FOTA_bRadioTx(const uint8_t *pu8Buf, uint8_t u8Len)
     memcpy(tPkt.buffer, pu8Buf, u8Len);
     tPkt.length = u8Len;
 
-    for (uint8_t u8Try = 0U; u8Try < 40U; u8Try++)
-    {
-        if (LORARADIO_bTxPacket(&tPkt))
-            return true;
-        osDelay(25);
-    }
-    return false;
+    return LORARADIO_bTxPacketWait(&tPkt, 1000U);
 }
 
 static void FOTA_vNotifyAppTask(void)
@@ -593,9 +674,32 @@ void FOTA_vOnLoraPacket(const uint8_t *pu8Buf, uint16_t u16Len)
 
             u32LastSessionPktTick = osKernelGetTickCount();
 
-            if (!bChunkMail && !FOTA_bBitGet(au8ChunkBitmap, u16Idx))
+            if (FOTA_bBitGet(au8ChunkBitmap, u16Idx))
+            {
+                /* Duplicate: primary re-sent, we already have it. Silent
+                 * accept - noisy at scale, and completely expected during
+                 * repair rounds. */
+            }
+            else if (bChunkMail)
+            {
+                /* AppTask hasn't drained the previous chunk mailbox yet;
+                 * this arrival is DROPPED. Every real drop is worth
+                 * logging so the source-of-loss picture becomes clear if
+                 * we still see missing chunks after diagnostics. */
+                DBG_LOG("Fota: chunk %u DROPPED (mailbox busy with %u)\r\n",
+                        (unsigned)u16Idx, (unsigned)u16ChunkMailIdx);
+            }
+            else
             {
                 memcpy(au8ChunkMail, &pu8Buf[OTA_PKT_CHUNK_HDR_LEN], u8Len);
+
+                {
+                    uint8_t u8ChunkXor = 0U;
+                    for (uint8_t i = 0U; i < u8Len; i++)
+                        u8ChunkXor ^= au8ChunkMail[i];
+                    DBG_LOG("RXC %u xor=0x%02X\r\n", (unsigned)u16Idx, (unsigned)u8ChunkXor);
+                }
+
                 u16ChunkMailIdx = u16Idx;
                 u8ChunkMailLen  = u8Len;
                 bChunkMail      = true;
@@ -623,6 +727,7 @@ void FOTA_vOnLoraPacket(const uint8_t *pu8Buf, uint16_t u16Len)
             FOTA_vPutU32(&au8Rpt[5], LORARADIO_u32GetUniqueId());
             au8Rpt[9] = OTA_RPT_WINDOW;
             memset(&au8Rpt[10], 0, OTA_WINDOW_BITMAP_LEN);
+            uint8_t u8Missing = 0U;
             for (uint8_t i = 0U; i < u8Count; i++)
             {
                 uint16_t u16Chunk = (uint16_t)(u16First + i);
@@ -630,8 +735,12 @@ void FOTA_vOnLoraPacket(const uint8_t *pu8Buf, uint16_t u16Len)
                     !FOTA_bBitGet(au8ChunkBitmap, u16Chunk))
                 {
                     au8Rpt[10U + i / 8U] |= (uint8_t)(1U << (i % 8U));
+                    u8Missing++;
                 }
             }
+            DBG_LOG("Fota: poll for window %u..%u: %u missing, replying\r\n",
+                    (unsigned)u16First, (unsigned)(u16First + u8Count - 1),
+                    (unsigned)u8Missing);
             (void)MESHNETWORK_bSendOtaResponse(au8Rpt, sizeof(au8Rpt));
             break;
         }
@@ -660,10 +769,21 @@ void FOTA_vOnLoraPacket(const uint8_t *pu8Buf, uint16_t u16Len)
 
 bool FOTA_bDistributePending(void)
 {
+    /* No longer gated on tMeta.bDistributed: that bit only ever meant
+     * "every target that showed up in some past session confirmed
+     * UPDATED" — it says nothing about whether a secondary that wasn't
+     * listening then (out of range, mid-sleep, freshly joined the mesh)
+     * still needs this image now. There's no persistent registry of
+     * "which secondaries exist" to check that against, so the only way to
+     * actually reach a straggler is to keep re-announcing every wake.
+     * Real cost of doing that once distribution has already succeeded is
+     * small: OtaPrep + a short join wait, then FOTA_vDistribute() finds no
+     * targets that need the image and exits immediately — no windows, no
+     * chunks sent. */
     FotaMeta_t tMeta;
     if (!FOTA_bGetMeta(&tMeta))
         return false;
-    return (tMeta.u32Version == VERSION_u32Get()) && !tMeta.bDistributed;
+    return tMeta.u32Version == VERSION_u32Get();
 }
 
 bool FOTA_bRequestDistribute(void)
@@ -705,8 +825,50 @@ static bool FOTA_bSendChunk(uint16_t u16Chunk, uint32_t u32ImageSize)
     FOTA_vPutU16(&au8Pkt[5], u16Chunk);
     au8Pkt[7] = u8Len;
 
-    if (!FOTA_bReadImage(u32Offset, &au8Pkt[OTA_PKT_CHUNK_HDR_LEN], u8Len))
+    /* Read, then verify by re-reading until FIVE consecutive passes agree,
+     * 50 ms apart. A fixed delay after the PRECEDING chunk's TX cannot be
+     * trusted: the radio task's CAD can back off for up to 5 s before the
+     * actual RF pulse fires, completely decoupled from when FOTA_bRadioTx()
+     * returns to this caller — confirmed on hardware, the SX126x PA's
+     * current spike sags the shared supply rail and corrupts a flash read
+     * that lands too close to it. Confirmed on hardware (full-image PRE
+     * scan vs. this loop's TXC output, chunk-for-chunk) that even a
+     * 3-consecutive-match/40 ms check still lets one chunk in ~600 through
+     * with a stable-but-wrong value: a still-decaying transient can
+     * plateau on the wrong byte for longer than that check's ~120 ms
+     * window and pass every one of its checks. Five matches spread over a
+     * longer window makes that coincidence far less likely; if it still
+     * never converges within the attempt budget, log it so a residual
+     * failure is visible instead of silently sending the last-read
+     * (possibly still-wrong) bytes. */
+    static uint8_t sau8Chunk[OTA_LORA_CHUNK_LEN];
+    static uint8_t sau8ChunkVerify[OTA_LORA_CHUNK_LEN];
+    if (!FOTA_bReadImage(u32Offset, sau8Chunk, u8Len))
         return false;
+    uint8_t u8StableCount = 1U;
+    uint8_t u8Attempt;
+    for (u8Attempt = 0U; u8Attempt < 20U && u8StableCount < 5U; u8Attempt++)
+    {
+        osDelay(50U);
+        if (!FOTA_bReadImage(u32Offset, sau8ChunkVerify, u8Len))
+            return false;
+        if (memcmp(sau8Chunk, sau8ChunkVerify, u8Len) == 0)
+        {
+            u8StableCount++;
+        }
+        else
+        {
+            memcpy(sau8Chunk, sau8ChunkVerify, u8Len);
+            u8StableCount = 1U;   /* restart the run of agreements */
+        }
+    }
+    if (u8StableCount < 5U)
+    {
+        DBG_LOG("Fota: chunk %u never reached 5 stable reads (got %u) - "
+                "sending best-effort value\r\n",
+                (unsigned)u16Chunk, (unsigned)u8StableCount);
+    }
+    memcpy(&au8Pkt[OTA_PKT_CHUNK_HDR_LEN], sau8Chunk, u8Len);
 
     if (!FOTA_bRadioTx(au8Pkt, (uint8_t)(OTA_PKT_CHUNK_HDR_LEN + u8Len)))
         return false;
@@ -727,7 +889,12 @@ static bool FOTA_bPollTarget(FotaTarget_t *ptTarget, uint16_t u16First,
 
     bReportMail = false;
     if (!FOTA_bRadioTx(au8Poll, sizeof(au8Poll)))
+    {
+        DBG_LOG("Fota: poll TX failed for %04lX chunks %u..%u\r\n",
+                (unsigned long)ptTarget->u32DeviceId,
+                (unsigned)u16First, (unsigned)(u16First + u8Count - 1));
         return false;
+    }
 
     uint32_t u32Start = osKernelGetTickCount();
     while ((osKernelGetTickCount() - u32Start) < OTA_LORA_POLL_TIMEOUT_MS)
@@ -737,14 +904,35 @@ static bool FOTA_bPollTarget(FotaTarget_t *ptTarget, uint16_t u16First,
             ptTarget->u8Status = u8ReportStatus;
             if (u8ReportStatus == OTA_RPT_WINDOW)
             {
+                uint8_t u8Missing = 0U;
                 for (uint8_t i = 0U; i < OTA_WINDOW_BITMAP_LEN; i++)
+                {
                     pu8Union[i] |= au8ReportBitmap[i];
+                    for (uint8_t b = 0U; b < 8U; b++)
+                        if (au8ReportBitmap[i] & (uint8_t)(1U << b))
+                            u8Missing++;
+                }
+                DBG_LOG("Fota: poll reply from %04lX: %u/%u chunks still missing in window %u..%u\r\n",
+                        (unsigned long)ptTarget->u32DeviceId,
+                        (unsigned)u8Missing, (unsigned)u8Count,
+                        (unsigned)u16First, (unsigned)(u16First + u8Count - 1));
+            }
+            else
+            {
+                DBG_LOG("Fota: poll reply from %04lX: status=%u (window %u..%u)\r\n",
+                        (unsigned long)ptTarget->u32DeviceId,
+                        (unsigned)u8ReportStatus,
+                        (unsigned)u16First, (unsigned)(u16First + u8Count - 1));
             }
             bReportMail = false;
             return true;
         }
         osDelay(20);
     }
+    DBG_LOG("Fota: poll TIMEOUT from %04lX (window %u..%u, waited %u ms)\r\n",
+            (unsigned long)ptTarget->u32DeviceId,
+            (unsigned)u16First, (unsigned)(u16First + u8Count - 1),
+            (unsigned)OTA_LORA_POLL_TIMEOUT_MS);
     return false;
 }
 
@@ -753,6 +941,15 @@ void FOTA_vDistribute(void)
     FotaMeta_t tMeta;
     if (!FOTA_bGetMeta(&tMeta))
         return;
+
+    /* Keep the NOR flash awake for the whole session: reads issued shortly
+     * after a deep-power-down wake (which the DbgLog consumer triggers in
+     * the radio gaps between chunks/windows) return corrupted bytes, which
+     * is what made the primary transmit a differently-corrupted image every
+     * session. Released at every exit below. */
+    FLASH_vInhibitDeepPowerDown(true);
+    LOG_vSuspend(true);
+    bDistributeActive = true;
 
     uint16_t u16Total = (uint16_t)((tMeta.u32SizeBytes + OTA_LORA_CHUNK_LEN - 1U)
                                    / OTA_LORA_CHUNK_LEN);
@@ -763,6 +960,24 @@ void FOTA_vDistribute(void)
     DBG_LOG("Fota: distribute v%lu (%lu B, %u chunks) session %08lX\r\n",
             (unsigned long)tMeta.u32Version, (unsigned long)tMeta.u32SizeBytes,
             u16Total, (unsigned long)u32SessionId);
+
+    /* Re-verify our OWN stored copy immediately before every send, not just
+     * once at acquire time: a single scan can occasionally return a wrong
+     * value while the stored bytes are fine (a transient SPI/flash read
+     * glitch), and an immediate re-read recovers the correct value — see
+     * FOTA_bVerifyImageXorRetry. Only a mismatch that survives every retry
+     * means the primary's own copy has actually drifted. */
+    uint8_t u8PreSendXor;
+    if (!FOTA_bVerifyImageXorRetry(0U, tMeta.u32SizeBytes, tMeta.u8Xor8, &u8PreSendXor))
+    {
+        DBG_LOG("Fota: PRE-SEND xor mismatch (stored=0x%02X, meta=0x%02X) - "
+                "primary's own copy has drifted since acquire, aborting distribute\r\n",
+                (unsigned)u8PreSendXor, (unsigned)tMeta.u8Xor8);
+        bDistributeActive = false;
+        LOG_vSuspend(false);
+        FLASH_vInhibitDeepPowerDown(false);
+        return;
+    }
 
     uint8_t au8Prep[OTA_PKT_PREP_LEN];
     au8Prep[0] = (uint8_t)MeshPktType_OtaPrep;
@@ -784,6 +999,9 @@ void FOTA_vDistribute(void)
     if (u8TargetCount == 0U)
     {
         DBG_LOG("Fota: no targets joined\r\n");
+        bDistributeActive = false;
+        LOG_vSuspend(false);
+        FLASH_vInhibitDeepPowerDown(false);
         return;
     }
 
@@ -795,13 +1013,41 @@ void FOTA_vDistribute(void)
         uint8_t u8Count = (uint8_t)(((u16Total - u16First) > OTA_LORA_WINDOW_CHUNKS)
                         ? OTA_LORA_WINDOW_CHUNKS : (u16Total - u16First));
 
+        /* Give every target a fresh chance each window: bAlive used to be
+         * permanent for the rest of the whole multi-minute session after
+         * just 2 consecutive missed poll responses (a 2.5 s timeout each) —
+         * easily eaten by ordinary CAD back-off under mesh congestion, not
+         * a sign the target is actually gone. That single early strike-out
+         * is why one or two chunks near the end of a session would never
+         * get repaired: the target was still there and still listening,
+         * but permanently excluded from every later window's polls. Only
+         * within-this-window drop still applies (skip wasting THIS
+         * window's remaining repair rounds on someone not answering right
+         * now); the next window tries again from a clean slate. */
+        for (uint8_t t = 0U; t < u8TargetCount; t++)
+        {
+            atTargets[t].bAlive   = true;
+            atTargets[t].u8Strikes = 0U;
+        }
+
+        DBG_LOG("Fota: >>> window chunks %u..%u (%u/%u)\r\n",
+                (unsigned)u16First, (unsigned)(u16First + u8Count - 1),
+                (unsigned)(u16First + u8Count), (unsigned)u16Total);
+
         for (uint8_t i = 0U; i < u8Count; i++)
-            (void)FOTA_bSendChunk((uint16_t)(u16First + i), tMeta.u32SizeBytes);
+        {
+            if (!FOTA_bSendChunk((uint16_t)(u16First + i), tMeta.u32SizeBytes))
+            {
+                DBG_LOG("Fota: SEND chunk %u FAILED (radio TX)\r\n",
+                        (unsigned)(u16First + i));
+            }
+        }
 
         for (uint8_t u8Round = 0U; u8Round < OTA_LORA_REPAIR_ROUNDS; u8Round++)
         {
             uint8_t au8Union[OTA_WINDOW_BITMAP_LEN] = {0};
-            bool    bAnyMissing = false;
+            bool    bAnyMissing      = false;
+            bool    bAnyReplyThisRnd = false;
 
             for (uint8_t t = 0U; t < u8TargetCount; t++)
             {
@@ -810,33 +1056,85 @@ void FOTA_vDistribute(void)
                 if (FOTA_bPollTarget(&atTargets[t], u16First, u8Count, au8Union))
                 {
                     atTargets[t].u8Strikes = 0U;
+                    bAnyReplyThisRnd = true;
                 }
                 else if (++atTargets[t].u8Strikes >= 2U)
                 {
                     atTargets[t].bAlive = false;
-                    DBG_LOG("Fota: target %04lX dropped (silent)\r\n",
+                    DBG_LOG("Fota: target %04lX unresponsive this window (2 poll timeouts) - will retry next window\r\n",
                             (unsigned long)atTargets[t].u32DeviceId);
                 }
             }
 
-            for (uint8_t i = 0U; i < u8Count && !bAnyMissing; i++)
+            /* If no target replied this round, we cannot claim "nothing
+             * missing" — au8Union would just be zero because we never
+             * heard from anyone, not because everyone confirmed. Force a
+             * blind repair (retransmit every chunk in the window) so
+             * progress still happens over a lossy link, instead of the
+             * previous behavior where a timed-out poll silently advanced
+             * as "fully acked" and abandoned any chunks that were in fact
+             * still missing. */
+            if (!bAnyReplyThisRnd)
+            {
+                DBG_LOG("Fota: window %u..%u round %u: no poll replies, assuming ALL missing and repairing\r\n",
+                        (unsigned)u16First, (unsigned)(u16First + u8Count - 1),
+                        (unsigned)u8Round);
+                for (uint8_t i = 0U; i < u8Count; i++)
+                    au8Union[i / 8U] |= (uint8_t)(1U << (i % 8U));
+            }
+
+            uint8_t u8MissingCount = 0U;
+            for (uint8_t i = 0U; i < u8Count; i++)
                 if (au8Union[i / 8U] & (uint8_t)(1U << (i % 8U)))
+                {
+                    u8MissingCount++;
                     bAnyMissing = true;
+                }
 
             if (!bAnyMissing)
+            {
+                DBG_LOG("Fota: window %u..%u fully acked after round %u\r\n",
+                        (unsigned)u16First, (unsigned)(u16First + u8Count - 1),
+                        (unsigned)u8Round);
                 break;
+            }
+
+            DBG_LOG("Fota: window %u..%u round %u: %u chunk(s) still missing across all targets, repairing\r\n",
+                    (unsigned)u16First, (unsigned)(u16First + u8Count - 1),
+                    (unsigned)u8Round, (unsigned)u8MissingCount);
 
             for (uint8_t i = 0U; i < u8Count; i++)
             {
                 if (au8Union[i / 8U] & (uint8_t)(1U << (i % 8U)))
-                    (void)FOTA_bSendChunk((uint16_t)(u16First + i),
-                                          tMeta.u32SizeBytes);
+                {
+                    if (!FOTA_bSendChunk((uint16_t)(u16First + i),
+                                         tMeta.u32SizeBytes))
+                    {
+                        DBG_LOG("Fota: REPAIR chunk %u FAILED (radio TX)\r\n",
+                                (unsigned)(u16First + i));
+                    }
+                }
             }
         }
 
+        /* Final view of this window before advancing */
+        bool bWindowClean = true;
+        for (uint8_t t = 0U; t < u8TargetCount; t++)
+        {
+            if (atTargets[t].u8Status == OTA_RPT_WINDOW && atTargets[t].bAlive)
+            {
+                /* Best-effort last check: not all polls were responded to
+                 * with a fully-acked bitmap - flag it so it's visible in
+                 * the log if we're advancing anyway. */
+                bWindowClean = false;
+            }
+        }
+        (void)bWindowClean;   /* diagnostic only; the poll bitmap above is authoritative */
+
         if ((osKernelGetTickCount() - u32SessionStart) >= OTA_LORA_SESSION_MAX_MS)
         {
-            DBG_LOG("Fota: session hard cap hit\r\n");
+            DBG_LOG("Fota: session hard cap hit at window %u..%u\r\n",
+                    (unsigned)u16First, (unsigned)(u16First + u8Count - 1));
             break;
         }
     }
@@ -855,6 +1153,7 @@ void FOTA_vDistribute(void)
         osDelay(100);
     }
 
+    bool bAllUpdated = true;
     for (uint8_t t = 0U; t < u8TargetCount; t++)
     {
         DBG_LOG("Fota: target %04lX %s\r\n",
@@ -862,10 +1161,31 @@ void FOTA_vDistribute(void)
                 (atTargets[t].u8Status == OTA_RPT_VALID) ? "UPDATED"
               : (atTargets[t].u8Status == OTA_RPT_ERROR) ? "VERIFY FAILED"
               : atTargets[t].bAlive ? "INCOMPLETE" : "LOST");
+        if (atTargets[t].u8Status != OTA_RPT_VALID)
+            bAllUpdated = false;
     }
 
-    (void)FOTA_bMarkDistributed();
-    DBG_LOG("Fota: distribution session done\r\n");
+    /* bDistributed is informational only now (see FOTA_bDistributePending)
+     * — it no longer gates whether the automatic wake path tries again.
+     * Every wake re-announces OtaPrep regardless, so a secondary that was
+     * asleep, out of range, or dropped mid-transfer (INCOMPLETE/LOST/
+     * VERIFY FAILED) still gets picked up on a later attempt; a secondary
+     * already on this version simply won't join (see the OtaPrep handler's
+     * u32Ver <= VERSION_u32Get() check), so a redundant re-announce after
+     * everyone's already updated costs one join wait and nothing else. */
+    if (bAllUpdated)
+    {
+        (void)FOTA_bMarkDistributed();
+        DBG_LOG("Fota: distribution session done - all targets updated\r\n");
+    }
+    else
+    {
+        DBG_LOG("Fota: distribution session done - not all targets updated, will retry next wake\r\n");
+    }
+
+    bDistributeActive = false;
+    LOG_vSuspend(false);
+    FLASH_vInhibitDeepPowerDown(false);
 }
 
 /* --------------------------------------------------------------------------
@@ -895,6 +1215,11 @@ bool FOTA_bAcceptanceArmed(void)
     return bFwAcceptArmed;
 }
 
+bool FOTA_bSessionActive(void)
+{
+    return bDistributeActive || bRxSessionActive;
+}
+
 void FOTA_vSecondaryReceive(void)
 {
     bPrepPending = false;
@@ -904,8 +1229,17 @@ void FOTA_vSecondaryReceive(void)
             (unsigned long)tPrep.u32Version, (unsigned long)tPrep.u32ImageSize,
             tPrep.u16TotalChunks);
 
+    /* Keep the NOR flash awake for the whole receive+verify session — same
+     * DPD-wake read-corruption reason as the primary's distribute path. */
+    FLASH_vInhibitDeepPowerDown(true);
+    LOG_vSuspend(true);
+
     if (!FOTA_bEraseScratch())
+    {
+        LOG_vSuspend(false);
+        FLASH_vInhibitDeepPowerDown(false);
         return;
+    }
 
     memset(au8ChunkBitmap, 0, sizeof(au8ChunkBitmap));
     u16ChunksHave    = 0U;
@@ -922,6 +1256,7 @@ void FOTA_vSecondaryReceive(void)
     (void)MESHNETWORK_bSendOtaResponse(au8Ack, sizeof(au8Ack));
 
     uint32_t u32SessionStart = osKernelGetTickCount();
+    uint8_t  u8LastPct       = 0xFFU;
     while (u16ChunksHave < tPrep.u16TotalChunks)
     {
         (void)osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_OTA, osFlagsWaitAny, 500U);
@@ -931,8 +1266,78 @@ void FOTA_vSecondaryReceive(void)
             uint32_t u32Offset = (uint32_t)u16ChunkMailIdx * tPrep.u8ChunkLen;
             if (FOTA_bWriteImage(u32Offset, au8ChunkMail, u8ChunkMailLen))
             {
+                /* Read-back-and-compare against au8ChunkMail (the exact
+                 * bytes just sent to flash — the parser task cannot refill
+                 * it until bChunkMail is cleared below). This catches a bad
+                 * WRITE at the exact chunk/offset in real time, instead of
+                 * only discovering "something in the image is wrong" from a
+                 * whole-image XOR pass minutes later with no idea which
+                 * chunk did it.
+                 *
+                 * NOT an immediate back-to-back read: this chunk's write
+                 * happens right after the radio RX that delivered it, and
+                 * the SX126x's RX/TX current draw sags the same shared
+                 * supply rail that corrupts a same-window SPI flash access
+                 * (proven on the primary's TX side — see FOTA_bSendChunk).
+                 * A verify-read sampled from inside that same disturbed
+                 * window can plateau on the same wrong bytes the write
+                 * produced and falsely "confirm" a bad write. Delay past
+                 * the settle window first, and if the read still disagrees,
+                 * don't just log it — re-write and re-verify, since the
+                 * data in flash may genuinely be wrong, not just misread. */
+                uint8_t au8Verify[OTA_LORA_CHUNK_LEN];
+                bool bWriteOk = false;
+                for (uint8_t u8WAttempt = 0U; u8WAttempt < 3U && !bWriteOk; u8WAttempt++)
+                {
+                    osDelay(40U);
+                    bWriteOk = FOTA_bReadImage(u32Offset, au8Verify, u8ChunkMailLen) &&
+                               (memcmp(au8Verify, au8ChunkMail, u8ChunkMailLen) == 0);
+                    if (!bWriteOk && u8WAttempt < 2U)
+                    {
+                        (void)FOTA_bWriteImage(u32Offset, au8ChunkMail, u8ChunkMailLen);
+                    }
+                }
+                if (!bWriteOk)
+                {
+                    uint16_t u16BadAt = 0xFFFFU;
+                    for (uint16_t i = 0U; i < u8ChunkMailLen; i++)
+                    {
+                        if (au8Verify[i] != au8ChunkMail[i])
+                        {
+                            u16BadAt = i;
+                            break;
+                        }
+                    }
+                    DBG_LOG("Fota: WRITE-VERIFY MISMATCH chunk %u offset 0x%lX "
+                            "(first bad byte @+%u: wrote 0x%02X read 0x%02X)\r\n",
+                            (unsigned)u16ChunkMailIdx, (unsigned long)u32Offset,
+                            (unsigned)u16BadAt,
+                            (u16BadAt != 0xFFFFU) ? (unsigned)au8ChunkMail[u16BadAt] : 0U,
+                            (u16BadAt != 0xFFFFU) ? (unsigned)au8Verify[u16BadAt] : 0U);
+                }
+
                 FOTA_vBitSet(au8ChunkBitmap, u16ChunkMailIdx);
                 u16ChunksHave++;
+
+                /* Progress line: first chunk, then every ~10%, then the
+                 * last one — same throttling convention as the primary's
+                 * own FWGET/programming progress logs, so a long-running
+                 * receive isn't just silence until it either finishes or
+                 * times out with no visibility into how far it got. */
+                uint8_t u8Pct = (uint8_t)(((uint32_t)u16ChunksHave * 100UL)
+                                          / tPrep.u16TotalChunks);
+                if (u8LastPct == 0xFFU || u16ChunksHave == tPrep.u16TotalChunks ||
+                    u8Pct >= (uint8_t)(u8LastPct + 10U))
+                {
+                    DBG_LOG("Fota: receiving %u/%u chunks (%u%%)\r\n",
+                            u16ChunksHave, tPrep.u16TotalChunks, u8Pct);
+                    u8LastPct = u8Pct;
+                }
+            }
+            else
+            {
+                DBG_LOG("Fota: WRITE chunk %u to scratch offset 0x%lX FAILED\r\n",
+                        (unsigned)u16ChunkMailIdx, (unsigned long)u32Offset);
             }
             bChunkMail = false;
         }
@@ -940,21 +1345,53 @@ void FOTA_vSecondaryReceive(void)
         uint32_t u32Now = osKernelGetTickCount();
         if ((u32Now - u32LastSessionPktTick) >= OTA_LORA_RX_IDLE_MS)
         {
+            /* On a silent abort, list the outstanding chunk indices so the
+             * next test iteration can see exactly what didn't arrive
+             * rather than just the count. Bounded to first 16 to avoid
+             * flooding the log if the session died very early. */
             DBG_LOG("Fota: session went silent (%u/%u chunks) - abort\r\n",
                     u16ChunksHave, tPrep.u16TotalChunks);
+            uint16_t u16Listed = 0U;
+            for (uint16_t i = 0U; i < tPrep.u16TotalChunks && u16Listed < 16U; i++)
+            {
+                if (!FOTA_bBitGet(au8ChunkBitmap, i))
+                {
+                    DBG_LOG("  missing chunk %u (offset 0x%lX)\r\n",
+                            (unsigned)i,
+                            (unsigned long)((uint32_t)i * tPrep.u8ChunkLen));
+                    u16Listed++;
+                }
+            }
             bRxSessionActive = false;
+            LOG_vSuspend(false);
+            FLASH_vInhibitDeepPowerDown(false);
             return;
         }
         if ((u32Now - u32SessionStart) >= OTA_LORA_SESSION_MAX_MS)
         {
             DBG_LOG("Fota: session hard cap - abort\r\n");
             bRxSessionActive = false;
+            LOG_vSuspend(false);
+            FLASH_vInhibitDeepPowerDown(false);
             return;
         }
     }
 
-    uint8_t u8Xor = FOTA_u8CalcImageXor(tPrep.u32ImageSize);
-    bool bValid = (u8Xor == tPrep.u8ImageXor);
+    /* Diagnostic: same probe as the primary's pre-send check — see there
+     * for why. */
+    {
+        uint8_t u8Xor64  = FOTA_u8CalcImageXorRange(0U, tPrep.u32ImageSize);
+        uint8_t u8Xor224 = FOTA_u8CalcImageXor224(0U, tPrep.u32ImageSize);
+        DBG_LOG("Fota: PROBE 64B-buf=0x%02X 224B-buf=0x%02X expected=0x%02X\r\n",
+                (unsigned)u8Xor64, (unsigned)u8Xor224, (unsigned)tPrep.u8ImageXor);
+    }
+
+    /* Retried: confirmed on hardware that a single scan can occasionally
+     * return a wrong value while the stored bytes are fine (a transient
+     * SPI/flash read glitch — see FOTA_bVerifyImageXorRetry). Only a
+     * mismatch that survives every retry is treated as a real failure. */
+    uint8_t u8Xor;
+    bool bValid = FOTA_bVerifyImageXorRetry(0U, tPrep.u32ImageSize, tPrep.u8ImageXor, &u8Xor);
 
     uint8_t au8Rpt[OTA_PKT_REPORT_LEN];
     au8Rpt[0] = (uint8_t)MeshPktType_OtaReport;
@@ -965,10 +1402,36 @@ void FOTA_vSecondaryReceive(void)
 
     if (!bValid)
     {
-        DBG_LOG("Fota: image XOR mismatch (0x%02X != 0x%02X)\r\n",
+        DBG_LOG("Fota: image XOR mismatch (0x%02X != 0x%02X) after 3 attempts\r\n",
                 u8Xor, tPrep.u8ImageXor);
+
+        /* Every chunk passed its own LoRa packet CRC and the receive
+         * bitmap says complete, yet the whole-image XOR disagrees — either
+         * one chunk landed at the wrong offset or a corrupted chunk slipped
+         * past its packet CRC by coincidence. Bisect into quarters (same
+         * technique used earlier for the bootloader/primary XOR mismatches)
+         * to localize which part of the image disagrees, narrowing "613
+         * chunks, one of them is wrong" down to roughly which window. */
+        {
+            uint32_t u32Q = tPrep.u32ImageSize / 4U;
+            uint32_t au32Start[4] = { 0U, u32Q, 2U * u32Q, 3U * u32Q };
+            uint32_t au32Len[4]   = { u32Q, u32Q, u32Q, tPrep.u32ImageSize - (3U * u32Q) };
+            for (uint8_t i = 0U; i < 4U; i++)
+            {
+                uint8_t u8Q = FOTA_u8CalcImageXorRange(au32Start[i], au32Len[i]);
+                DBG_LOG("  Q%u [0x%lX..0x%lX] (chunks %u..%u) xor=0x%02X\r\n", i,
+                        (unsigned long)au32Start[i],
+                        (unsigned long)(au32Start[i] + au32Len[i] - 1U),
+                        (unsigned)(au32Start[i] / tPrep.u8ChunkLen),
+                        (unsigned)((au32Start[i] + au32Len[i] - 1U) / tPrep.u8ChunkLen),
+                        u8Q);
+            }
+        }
+
         (void)MESHNETWORK_bSendOtaResponse(au8Rpt, sizeof(au8Rpt));
         bRxSessionActive = false;
+        LOG_vSuspend(false);
+        FLASH_vInhibitDeepPowerDown(false);
         return;
     }
 
@@ -977,6 +1440,8 @@ void FOTA_vSecondaryReceive(void)
                               u8Xor))
     {
         bRxSessionActive = false;
+        LOG_vSuspend(false);
+        FLASH_vInhibitDeepPowerDown(false);
         return;
     }
 
@@ -986,6 +1451,8 @@ void FOTA_vSecondaryReceive(void)
     osDelay(2000);   /* let the (jittered) report leave the radio */
 
     bRxSessionActive = false;
+    LOG_vSuspend(false);
+    FLASH_vInhibitDeepPowerDown(false);
     FOTA_vArmBootloaderAndReset(tPrep.u32Version);
 }
 

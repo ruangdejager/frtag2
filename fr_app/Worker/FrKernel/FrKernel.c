@@ -8,7 +8,8 @@
  *   checks FRKERNEL_bIsConnected() before entering deep sleep and waits
  *   until the session is released.  The user releases explicitly with
  *   "tag release" (or "tag <ID> release" on LoRa), or the session
- *   auto-releases after FRKERNEL_INACTIVITY_TIMEOUT_MS of inactivity.
+ *   auto-releases after FRKERNEL_INACTIVITY_TIMEOUT_MS of inactivity. One
+ *   shared session/timeout, not per-transport — see FrKernel_Config.h.
  *
  * UART path:
  *   UART2_vNotifyOnRX() (overrides weak HAL callback) → thread flag →
@@ -18,6 +19,14 @@
  * LoRa path:
  *   MESHNETWORK_vOnFrKernelPacket() (overrides weak MeshNetwork callback) →
  *   enqueue FrKernelPkt_t → parse → LORARADIO_bTxPacket() response.
+ *
+ * Both may be compiled in together (FRKERNEL_INTERFACE_UART and _LORA both
+ * defined): FRKERNEL_vTask services either source as it arrives (a thread
+ * flag per transport wakes it), and every command carries a FrKernelXport_e
+ * tag through FRKERNEL_vProcessCommand/FRKERNEL_vRespond so the reply goes
+ * back out the same transport the request came in on, and so LoRa's
+ * mandatory "<ID>" address prefix is only required/parsed for LoRa-sourced
+ * commands.
  *
  * LoRa-bridge path (bench test rig — see FrKernel_Config.h):
  *   Same UART line accumulation as the UART path, but a completed line is
@@ -75,6 +84,23 @@
 
 /* -------------------------------------------------------------------------- */
 
+#define FRKERNEL_FLAG_UART  0x01U
+#define FRKERNEL_FLAG_LORA  0x02U
+
+#if defined(FRKERNEL_INTERFACE_UART) || defined(FRKERNEL_INTERFACE_LORA)
+/* Which transport a command arrived on — threaded through
+ * FRKERNEL_vProcessCommand/FRKERNEL_vRespond so the reply goes back out the
+ * same side it came in on, and so LoRa's "<ID>" address prefix is only
+ * required for LoRa-sourced commands. In a solo build only one value is
+ * ever produced/consumed; the runtime branches on it still compile fine
+ * (the other transport's actual I/O code is compiled out separately by its
+ * own #ifdef, per function below). */
+typedef enum {
+    FRKERNEL_XPORT_UART,
+    FRKERNEL_XPORT_LORA,
+} FrKernelXport_e;
+#endif
+
 static osThreadId_t      s_taskHandle   = NULL;
 static volatile bool     s_bConnected   = false;
 static volatile uint32_t s_u32LastCmdTick = 0U;
@@ -130,7 +156,7 @@ void FRKERNEL_vInit(void)
 /* -------------------------------------------------------------------------- */
 
 #if defined(FRKERNEL_INTERFACE_UART) || defined(FRKERNEL_INTERFACE_LORA)
-static void FRKERNEL_vRespond(const char *msg)
+static void FRKERNEL_vRespond(FrKernelXport_e eXport, const char *msg)
 {
     /* Any TX extends an active session (covers bulk/slow data scenarios) */
     if (s_bConnected)
@@ -139,19 +165,27 @@ static void FRKERNEL_vRespond(const char *msg)
     uint16_t len = (uint16_t)strlen(msg);
 
 #ifdef FRKERNEL_INTERFACE_UART
-    DEBUG_vPutBuffer((const uint8_t *)msg, len);
-
-#elif defined(FRKERNEL_INTERFACE_LORA)
-    LoraRadio_Packet_t pkt = {0};
-    pkt.buffer[0] = (uint8_t)MeshPktType_FrKernel;
-    /* Cap so type byte + payload + radio-appended CRC fit the uint8_t length
-     * field (255): payload <= LORA_MAX_PACKET_SIZE - 3. The old "- 1" cap
-     * made pkt.length wrap to 0 for max-length responses. */
-    if (len > (uint16_t)(LORA_MAX_PACKET_SIZE - 3))
-        len = (uint16_t)(LORA_MAX_PACKET_SIZE - 3);
-    memcpy(&pkt.buffer[1], msg, len);
-    pkt.length = (uint8_t)(len + 1U);
-    LORARADIO_bTxPacket(&pkt);
+    if (eXport == FRKERNEL_XPORT_UART)
+    {
+        DEBUG_vPutBuffer((const uint8_t *)msg, len);
+        return;
+    }
+#endif
+#ifdef FRKERNEL_INTERFACE_LORA
+    if (eXport == FRKERNEL_XPORT_LORA)
+    {
+        LoraRadio_Packet_t pkt = {0};
+        pkt.buffer[0] = (uint8_t)MeshPktType_FrKernel;
+        /* Cap so type byte + payload + radio-appended CRC fit the uint8_t
+         * length field (255): payload <= LORA_MAX_PACKET_SIZE - 3. The old
+         * "- 1" cap made pkt.length wrap to 0 for max-length responses. */
+        if (len > (uint16_t)(LORA_MAX_PACKET_SIZE - 3))
+            len = (uint16_t)(LORA_MAX_PACKET_SIZE - 3);
+        memcpy(&pkt.buffer[1], msg, len);
+        pkt.length = (uint8_t)(len + 1U);
+        LORARADIO_bTxPacket(&pkt);
+        return;
+    }
 #endif
 }
 
@@ -201,7 +235,7 @@ static void FRKERNEL_vLoraLogSink(const uint8_t *data, uint16_t len)
 
 /* -------------------------------------------------------------------------- */
 
-static void FRKERNEL_vProcessCommand(const char *line)
+static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
 {
     /* Must start with "tag" */
     if (strncmp(line, FRKERNEL_CMD_PREFIX, 3U) != 0) return;
@@ -212,33 +246,43 @@ static void FRKERNEL_vProcessCommand(const char *line)
     char resp[FRKERNEL_RESP_BUF_LEN];
 
     /* -devicereq: broadcast — every device responds, no addressing check.
-     * Does not start a session on LoRa (any device may respond to a scan). */
+     * Does not start a session over LoRa (any device may respond to a
+     * scan); over UART there's exactly one device on the wire, so it's
+     * effectively addressed already. */
     if (strcmp(p, "-devicereq") == 0)
     {
         snprintf(resp, sizeof(resp), "Device ID: %04" PRIX32 "\r\n",
                  LORARADIO_u32GetUniqueId());
-        FRKERNEL_vRespond(resp);
+        FRKERNEL_vRespond(eXport, resp);
 #ifdef FRKERNEL_INTERFACE_UART
-        s_bConnected      = true;
-        s_u32LastCmdTick  = osKernelGetTickCount();
+        if (eXport == FRKERNEL_XPORT_UART)
+        {
+            s_bConnected      = true;
+            s_u32LastCmdTick  = osKernelGetTickCount();
+        }
 #endif
         return;
     }
 
 #ifdef FRKERNEL_INTERFACE_LORA
-    /* All other LoRa commands must be addressed: "tag <XXXX> <cmd>" */
-    char    *end;
-    uint32_t targetId = (uint32_t)strtoul(p, &end, 16);
-    if (end == p || *end != ' ') return;                    /* malformed */
-    if (targetId != LORARADIO_u32GetUniqueId()) return;     /* not for us */
-    p = end + 1;                                            /* skip "<ID> " */
+    /* LoRa commands must be addressed: "tag <XXXX> <cmd>". UART commands
+     * (eXport == FRKERNEL_XPORT_UART) skip this — there's only one device
+     * on the wire, no address needed. */
+    if (eXport == FRKERNEL_XPORT_LORA)
+    {
+        char    *end;
+        uint32_t targetId = (uint32_t)strtoul(p, &end, 16);
+        if (end == p || *end != ' ') return;                /* malformed */
+        if (targetId != LORARADIO_u32GetUniqueId()) return;  /* not for us */
+        p = end + 1;                                         /* skip "<ID> " */
+    }
 #endif
 
     /* release: close the session so the device can enter deep sleep */
     if (strcmp(p, "release") == 0)
     {
         s_bConnected = false;
-        FRKERNEL_vRespond("Released\r\n");
+        FRKERNEL_vRespond(eXport, "Released\r\n");
         return;
     }
 
@@ -248,50 +292,69 @@ static void FRKERNEL_vProcessCommand(const char *line)
 
     if (strcmp(p, "-help") == 0)
     {
+        bool bAddressed = true;
 #ifdef FRKERNEL_INTERFACE_UART
-        FRKERNEL_vRespond(
-            "FrKernel commands:\r\n"
-            "  tag -devicereq              this device's ID\r\n"
-            "  tag -help                   list commands\r\n"
-            "  tag fwver                   app + bootloader version\r\n"
-            "  tag juice                   battery + solar panel voltage (mV)\r\n"
-            "  tag discovery schedule      wakeup interval (min)\r\n"
-            "  tag prodsleep               enter production sleep (secondary only)\r\n"
-            "  tag release                 release device for sleep\r\n"
-        );
-#else
-        FRKERNEL_vRespond(
-            "FrKernel commands:\r\n"
-            "  tag -devicereq              discover all device IDs\r\n"
-            "  tag <ID> -help              list commands\r\n"
-            "  tag <ID> fwver              app + bootloader version\r\n"
-            "  tag <ID> juice              battery + solar panel voltage (mV)\r\n"
-            "  tag <ID> discovery schedule wakeup interval (min)\r\n"
-            "  tag <ID> prodsleep          enter production sleep (secondary only)\r\n"
-            "  tag <ID> release            release device for sleep\r\n"
-        );
+        if (eXport == FRKERNEL_XPORT_UART)
+        {
+            bAddressed = false;
+            FRKERNEL_vRespond(eXport,
+                "FrKernel commands:\r\n"
+                "  tag -devicereq              this device's ID\r\n"
+                "  tag -help                   list commands\r\n"
+                "  tag fwver                   app + bootloader version\r\n"
+                "  tag juice                   battery + solar panel voltage (mV)\r\n"
+                "  tag discovery schedule      wakeup interval (min)\r\n"
+                "  tag prodsleep               enter production sleep (secondary only)\r\n"
+                "  tag release                 release device for sleep\r\n"
+            );
+        }
 #endif
-#if defined(STORAGE_BACKEND_FLASH) && defined(FRKERNEL_INTERFACE_UART)
-        FRKERNEL_vRespond(
-            "  tag flash clear             erase ext-flash log\r\n"
-            "  tag flash stream            stream ext-flash log\r\n"
-            "  tag fwaccept [off]          arm/disarm firmware acceptance (secondary)\r\n"
-            "  tag fwdistribute            distribute staged firmware (primary)\r\n");
-#elif defined(STORAGE_BACKEND_FLASH)
-        FRKERNEL_vRespond(
-            "  tag <ID> flash clear        erase ext-flash log\r\n"
-            "  tag <ID> flash stream       stream ext-flash log\r\n"
-            "  tag <ID> fwaccept [off]     arm/disarm firmware acceptance (secondary)\r\n"
-            "  tag <ID> fwdistribute       distribute staged firmware (primary)\r\n");
+        if (bAddressed)
+        {
+            FRKERNEL_vRespond(eXport,
+                "FrKernel commands:\r\n"
+                "  tag -devicereq              discover all device IDs\r\n"
+                "  tag <ID> -help              list commands\r\n"
+                "  tag <ID> fwver              app + bootloader version\r\n"
+                "  tag <ID> juice              battery + solar panel voltage (mV)\r\n"
+                "  tag <ID> discovery schedule wakeup interval (min)\r\n"
+                "  tag <ID> prodsleep          enter production sleep (secondary only)\r\n"
+                "  tag <ID> release            release device for sleep\r\n"
+            );
+        }
+#ifdef STORAGE_BACKEND_FLASH
+        if (!bAddressed)
+        {
+            FRKERNEL_vRespond(eXport,
+                "  tag flash clear             erase ext-flash log\r\n"
+                "  tag flash eraseall           erase entire ext-flash (log + staged OTA image)\r\n"
+                "  tag flash stream            stream ext-flash log\r\n"
+                "  tag fwaccept [off]          arm/disarm firmware acceptance (secondary)\r\n"
+                "  tag fwdistribute            distribute staged firmware (primary)\r\n");
+        }
+        else
+        {
+            FRKERNEL_vRespond(eXport,
+                "  tag <ID> flash clear        erase ext-flash log\r\n"
+                "  tag <ID> flash eraseall     erase entire ext-flash (log + staged OTA image)\r\n"
+                "  tag <ID> flash stream       stream ext-flash log\r\n"
+                "  tag <ID> fwaccept [off]     arm/disarm firmware acceptance (secondary)\r\n"
+                "  tag <ID> fwdistribute       distribute staged firmware (primary)\r\n");
+        }
 #endif
-#if defined(STORAGE_BACKEND_MICROSD) && defined(FRKERNEL_INTERFACE_UART)
-        FRKERNEL_vRespond(
-            "  tag sd clear                wipe MicroSD (logs + acc)\r\n"
-            "  tag sd log stream           stream MicroSD log\r\n");
-#elif defined(STORAGE_BACKEND_MICROSD)
-        FRKERNEL_vRespond(
-            "  tag <ID> sd clear           wipe MicroSD (logs + acc)\r\n"
-            "  tag <ID> sd log stream      stream MicroSD log\r\n");
+#ifdef STORAGE_BACKEND_MICROSD
+        if (!bAddressed)
+        {
+            FRKERNEL_vRespond(eXport,
+                "  tag sd clear                wipe MicroSD (logs + acc)\r\n"
+                "  tag sd log stream           stream MicroSD log\r\n");
+        }
+        else
+        {
+            FRKERNEL_vRespond(eXport,
+                "  tag <ID> sd clear           wipe MicroSD (logs + acc)\r\n"
+                "  tag <ID> sd log stream      stream MicroSD log\r\n");
+        }
 #endif
     }
     else if (strcmp(p, "juice") == 0)
@@ -301,7 +364,7 @@ static void FRKERNEL_vProcessCommand(const char *line)
          * plain static-variable read that defaults to 0 if never inited. */
         snprintf(resp, sizeof(resp), "Battery: %u mV  Solar: %u mV\r\n",
                  BAT_u16GetVoltage(), SOLAR_u16GetVSolarMV());
-        FRKERNEL_vRespond(resp);
+        FRKERNEL_vRespond(eXport, resp);
     }
     else if (strcmp(p, "fwver") == 0)
     {
@@ -314,18 +377,18 @@ static void FRKERNEL_vProcessCommand(const char *line)
                  (unsigned)VERSION_SW_MINOR,
                  (unsigned)VERSION_SW_PATCH,
                  (unsigned long)TAMP->BKP2R);
-        FRKERNEL_vRespond(resp);
+        FRKERNEL_vRespond(eXport, resp);
     }
     else if (strcmp(p, "discovery schedule") == 0)
     {
         snprintf(resp, sizeof(resp), "Discovery interval: %u min\r\n",
                  MESHNETWORK_u8GetWakeupInterval());
-        FRKERNEL_vRespond(resp);
+        FRKERNEL_vRespond(eXport, resp);
     }
     else if (strcmp(p, "prodsleep") == 0)
     {
         DEVICE_DISCOVERY_vEnterProductionSleep();
-        FRKERNEL_vRespond("ProductionSleep entered — wakes on Vsolar >= 3000 mV\r\n");
+        FRKERNEL_vRespond(eXport, "ProductionSleep entered — wakes on Vsolar >= 3000 mV\r\n");
 
         /* prodsleep is a terminal command: don't linger in an open session
          * waiting for "tag release" or the 5-min inactivity timeout, or
@@ -347,18 +410,18 @@ static void FRKERNEL_vProcessCommand(const char *line)
          * DeviceDiscovery hold-while-connected loop. */
         if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_SECONDARY)
         {
-            FRKERNEL_vRespond("fwaccept: secondary only\r\n");
+            FRKERNEL_vRespond(eXport, "fwaccept: secondary only\r\n");
         }
         else
         {
             FOTA_vArmAcceptance();
-            FRKERNEL_vRespond("Firmware acceptance ARMED - awaiting OtaPrep\r\n");
+            FRKERNEL_vRespond(eXport, "Firmware acceptance ARMED - awaiting OtaPrep\r\n");
         }
     }
     else if (strcmp(p, "fwaccept off") == 0)
     {
         FOTA_vDisarmAcceptance();
-        FRKERNEL_vRespond("Firmware acceptance disarmed\r\n");
+        FRKERNEL_vRespond(eXport, "Firmware acceptance disarmed\r\n");
     }
     else if (strcmp(p, "fwdistribute") == 0)
     {
@@ -367,35 +430,49 @@ static void FRKERNEL_vProcessCommand(const char *line)
          * hold-while-connected loop runs FOTA_vDistribute(). */
         if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_PRIMARY)
         {
-            FRKERNEL_vRespond("fwdistribute: primary only\r\n");
+            FRKERNEL_vRespond(eXport, "fwdistribute: primary only\r\n");
         }
         else if (FOTA_bRequestDistribute())
         {
-            FRKERNEL_vRespond("Firmware distribute requested\r\n");
+            FRKERNEL_vRespond(eXport, "Firmware distribute requested\r\n");
         }
         else
         {
-            FRKERNEL_vRespond("fwdistribute: no valid image staged\r\n");
+            FRKERNEL_vRespond(eXport, "fwdistribute: no valid image staged\r\n");
         }
     }
     else if (strcmp(p, "flash clear") == 0)
     {
         /* Routed through the DbgLog consumer so it can't race log writes. */
         DBGLOG_vRequestErase();
-        FRKERNEL_vRespond("Ext-flash log erase requested\r\n");
+        FRKERNEL_vRespond(eXport, "Ext-flash log erase requested\r\n");
+    }
+    else if (strcmp(p, "flash eraseall") == 0)
+    {
+        /* Whole-chip erase: log AND the OTA image scratchpad/metadata below
+         * it. Destroys any staged-but-not-yet-installed OTA image along
+         * with the log — deliberate full field-unit reset, not routine
+         * maintenance, hence the distinct command name from "flash clear". */
+        DBGLOG_vRequestEraseAll();
+        FRKERNEL_vRespond(eXport, "Full ext-flash erase requested (log + staged OTA image)\r\n");
     }
     else if (strcmp(p, "flash stream") == 0)
     {
-        /* consumer streams oldest -> newest, on whichever transport this
-         * session arrived on -- a LoRa session has no UART to read a
-         * UART-routed dump from. */
+        /* consumer streams oldest -> newest, on whichever transport THIS
+         * command arrived on -- a LoRa command has no UART session to read
+         * a UART-routed dump from. */
 #ifdef FRKERNEL_INTERFACE_LORA
-        DBGLOG_vRequestDumpVia(FRKERNEL_vLoraLogSink);
-        FRKERNEL_vRespond("Streaming ext-flash log via LoRa...\r\n");
-#else
-        DBGLOG_vRequestDump();
-        FRKERNEL_vRespond("Streaming ext-flash log...\r\n");
+        if (eXport == FRKERNEL_XPORT_LORA)
+        {
+            DBGLOG_vRequestDumpVia(FRKERNEL_vLoraLogSink);
+            FRKERNEL_vRespond(eXport, "Streaming ext-flash log via LoRa...\r\n");
+        }
+        else
 #endif
+        {
+            DBGLOG_vRequestDump();
+            FRKERNEL_vRespond(eXport, "Streaming ext-flash log...\r\n");
+        }
     }
 #endif
 #ifdef STORAGE_BACKEND_MICROSD
@@ -405,18 +482,18 @@ static void FRKERNEL_vProcessCommand(const char *line)
          * (deferred to the movement task). Both avoid racing their owners. */
         DBGLOG_vRequestErase();
         ACCLOG_vRequestErase();
-        FRKERNEL_vRespond("MicroSD wipe requested (logs + acc data)\r\n");
+        FRKERNEL_vRespond(eXport, "MicroSD wipe requested (logs + acc data)\r\n");
     }
     else if (strcmp(p, "sd log stream") == 0)
     {
         DBGLOG_vRequestDump();   /* log region only; no acc-data stream by design */
-        FRKERNEL_vRespond("Streaming MicroSD log...\r\n");
+        FRKERNEL_vRespond(eXport, "Streaming MicroSD log...\r\n");
     }
 #endif
     else
     {
         snprintf(resp, sizeof(resp), "Unknown: '%s'. Try 'tag -help'\r\n", p);
-        FRKERNEL_vRespond(resp);
+        FRKERNEL_vRespond(eXport, resp);
     }
 }
 #endif /* FRKERNEL_INTERFACE_UART || FRKERNEL_INTERFACE_LORA */
@@ -460,7 +537,7 @@ static void FRKERNEL_vForwardLine(const char *line)
 void UART2_vNotifyOnRX(void)
 {
     if (s_taskHandle != NULL)
-        osThreadFlagsSet(s_taskHandle, 0x01U);
+        osThreadFlagsSet(s_taskHandle, FRKERNEL_FLAG_UART);
 }
 #endif
 
@@ -474,6 +551,8 @@ void MESHNETWORK_vOnFrKernelPacket(const uint8_t *buf, uint8_t len)
     memcpy(pkt.data, buf, pkt.len);
     pkt.data[pkt.len] = '\0';
     osMessageQueuePut(s_rxQueue, &pkt, 0U, 0U);    /* non-blocking, ISR-safe */
+    if (s_taskHandle != NULL)
+        osThreadFlagsSet(s_taskHandle, FRKERNEL_FLAG_LORA);
 }
 #elif defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
 
@@ -539,12 +618,18 @@ static void FRKERNEL_vTask(void *arg)
 {
     (void)arg;
 
-#ifdef FRKERNEL_INTERFACE_UART
+#if defined(FRKERNEL_INTERFACE_UART) || defined(FRKERNEL_INTERFACE_LORA)
     for (;;)
     {
-        /* Timed wait so the inactivity check runs even with no input */
-        osThreadFlagsWait(0x01U, osFlagsWaitAny, FRKERNEL_POLL_INTERVAL_MS);
+        /* Wakes on either transport's flag; timed out so the inactivity
+         * check still runs during a quiet period on both. In a solo build
+         * only one flag is ever set (the other transport's ISR/callback
+         * that would set it isn't compiled in), so this behaves exactly
+         * like the old single-transport wait. */
+        osThreadFlagsWait(FRKERNEL_FLAG_UART | FRKERNEL_FLAG_LORA,
+                          osFlagsWaitAny, FRKERNEL_POLL_INTERVAL_MS);
 
+#ifdef FRKERNEL_INTERFACE_UART
         uint8_t byte;
         while (DEBUG_bReadByte(&byte))
         {
@@ -557,7 +642,7 @@ static void FRKERNEL_vTask(void *arg)
                 if (s_lineIdx > 0U)
                 {
                     s_lineBuf[s_lineIdx] = '\0';
-                    FRKERNEL_vProcessCommand(s_lineBuf);
+                    FRKERNEL_vProcessCommand(FRKERNEL_XPORT_UART, s_lineBuf);
                     s_lineIdx = 0U;
                 }
             }
@@ -566,30 +651,28 @@ static void FRKERNEL_vTask(void *arg)
                 s_lineBuf[s_lineIdx++] = (char)byte;
             }
         }
+#endif
 
-        /* Inactivity auto-release */
+#ifdef FRKERNEL_INTERFACE_LORA
+        FrKernelPkt_t pkt;
+        while (osMessageQueueGet(s_rxQueue, &pkt, NULL, 0U) == osOK)
+            FRKERNEL_vProcessCommand(FRKERNEL_XPORT_LORA, (const char *)pkt.data);
+#endif
+
+        /* Inactivity auto-release. Notify on every compiled-in transport —
+         * this is a rare, low-frequency event (once per idle session), not
+         * per-packet traffic, so announcing it on both sides in a dual
+         * build is harmless and keeps either terminal informed. */
         if (s_bConnected &&
             (osKernelGetTickCount() - s_u32LastCmdTick) >= FRKERNEL_INACTIVITY_TIMEOUT_MS)
         {
             s_bConnected = false;
-            FRKERNEL_vRespond("FrKernel: session timed out\r\n");
-        }
-    }
-
-#elif defined(FRKERNEL_INTERFACE_LORA)
-    FrKernelPkt_t pkt;
-    for (;;)
-    {
-        /* Timed wait so the inactivity check runs even with no packets */
-        if (osMessageQueueGet(s_rxQueue, &pkt, NULL, FRKERNEL_POLL_INTERVAL_MS) == osOK)
-            FRKERNEL_vProcessCommand((const char *)pkt.data);
-
-        /* Inactivity auto-release */
-        if (s_bConnected &&
-            (osKernelGetTickCount() - s_u32LastCmdTick) >= FRKERNEL_INACTIVITY_TIMEOUT_MS)
-        {
-            s_bConnected = false;
-            FRKERNEL_vRespond("FrKernel: session timed out\r\n");
+#ifdef FRKERNEL_INTERFACE_UART
+            FRKERNEL_vRespond(FRKERNEL_XPORT_UART, "FrKernel: session timed out\r\n");
+#endif
+#ifdef FRKERNEL_INTERFACE_LORA
+            FRKERNEL_vRespond(FRKERNEL_XPORT_LORA, "FrKernel: session timed out\r\n");
+#endif
         }
     }
 
@@ -599,7 +682,7 @@ static void FRKERNEL_vTask(void *arg)
      * inactivity tracking, there is nothing local for it to gate. */
     for (;;)
     {
-        osThreadFlagsWait(0x01U, osFlagsWaitAny, osWaitForever);
+        osThreadFlagsWait(FRKERNEL_FLAG_UART, osFlagsWaitAny, osWaitForever);
 
         uint8_t byte;
         while (DEBUG_bReadByte(&byte))

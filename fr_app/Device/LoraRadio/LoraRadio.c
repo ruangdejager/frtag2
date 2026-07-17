@@ -214,14 +214,23 @@ void LORARADIO_vRadioTask(void *arg)
             LORARADIO_DRIVER_vEnterRxMode(0);
         }
 
-        /* ---------- ERRORS ---------- */
+        /* ---------- ERRORS ----------
+         * Log every hardware-detected packet fault. These paths used to be
+         * completely silent, which made it impossible to distinguish "no
+         * packet was on the air" from "packet arrived corrupted and got
+         * dropped by the SX126x's own LoRa CRC check". During OTA
+         * distribution debugging especially, these lines are what tells
+         * you whether an intermittent 1-chunk-missing pattern is a real
+         * RF corruption event vs. some upstream logic bug. */
         if (events & RADIO_EVT_CRC_ERROR)
         {
+            DBG_LOG("LoraRadio: RX CRC error (packet dropped by hardware)\r\n");
             SUBGRF_ClearIrqStatus(IRQ_CRC_ERROR);
             LORARADIO_DRIVER_vEnterRxMode(0);
         }
         if (events & RADIO_EVT_HEADER_ERROR)
         {
+            DBG_LOG("LoraRadio: RX header error (packet dropped by hardware)\r\n");
             SUBGRF_ClearIrqStatus(IRQ_HEADER_ERROR);
             LORARADIO_DRIVER_vEnterRxMode(0);
         }
@@ -285,6 +294,16 @@ void LORARADIO_vEventTimeout(void)     { LORARADIO_vNotifyFromISR(RADIO_EVT_TIME
 void LORARADIO_vEventCADDetected(void) { LORARADIO_vNotifyFromISR(RADIO_EVT_CAD_BUSY);     }
 void LORARADIO_vEventCADClear(void)    { LORARADIO_vNotifyFromISR(RADIO_EVT_CAD_CLEAR);    }
 
+/* Byte-wise XOR fold — a weak checksum, but kept as such deliberately for
+ * over-the-air compatibility with older firmware in the field. A real CRC
+ * upgrade is a hard protocol break (mixed old/new mesh drops every packet
+ * between mismatched pairs, including the OTA packets that would deliver
+ * the upgrade) so we rely on the SX126x's own hardware LoRa CRC (enabled
+ * via LORA_CRC_ON in the packet params, and its failure reported through
+ * IRQ_CRC_ERROR / RADIO_EVT_CRC_ERROR) as the primary line of defence
+ * against RF corruption; this app-layer check is a secondary sanity check
+ * only. Do NOT change this to a real CRC without a coordinated flash of
+ * every device on the mesh via SWD. */
 static uint8_t LORARADIO_u8CRC8_Calculate(const uint8_t *data, uint16_t len)
 {
     uint8_t crc = 0x00;

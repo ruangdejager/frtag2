@@ -2,9 +2,16 @@
  * FrKernel_Config.h
  *
  * Compile-time configuration for the FrKernel command interface.
- * Transport is selected in fr_app/inc/config/build_config.h — exactly one of:
+ * Transport is selected in fr_app/inc/config/build_config.h — either or
+ * both of:
  *   FRKERNEL_INTERFACE_UART        — debug UART (bench use)
  *   FRKERNEL_INTERFACE_LORA        — LoRa radio (deployed device)
+ * Defining both lets the same build answer "tag <cmd>" over UART and
+ * "tag <ID> <cmd>" over the mesh at the same time, sharing one session
+ * (FRKERNEL_bIsConnected()/inactivity timer aren't per-transport — a
+ * command on either side keeps the device awake and extends the timeout).
+ *
+ * Or, mutually exclusive with both of the above:
  *   FRKERNEL_INTERFACE_LORA_BRIDGE — UART<->LoRa relay (bench test rig: a
  *                                    primary that forwards whatever's typed
  *                                    over UART out as a LoRa FrKernel command

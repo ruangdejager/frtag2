@@ -38,6 +38,7 @@
 /* STORAGE_BACKEND_FLASH comes from build_config.h (included above). */
 #ifdef STORAGE_BACKEND_FLASH
 #  include "Fota.h"
+#  include "version_config.h"
 #endif
 
 /* ---- Private defines ---- */
@@ -148,24 +149,20 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         osDelay(APP_WAKEUP_BUFFER_MS);
         EVTLOG(LOG_DISCOVERY_START, eDeviceRole);
 
-        bool bOtaSlot = false;
-#ifdef STORAGE_BACKEND_FLASH
-        /* OTA distribution slot (primary): when a validated image is stored
-         * and this node already runs it, the wake slot serves firmware to the
-         * secondaries instead of running a discovery campaign — the OtaPrep
-         * announcement goes out where the DReq would have. */
-        if (eDeviceRole == DEVICE_ROLE_PRIMARY && FOTA_bDistributePending())
-        {
-            bOtaSlot = true;
-            FOTA_vDistribute();
-        }
-#endif
-
-        if (bOtaSlot)
-        {
-            /* Distribution already ran; no discovery, no logger upload. */
-        }
-        else if (eDeviceRole == DEVICE_ROLE_PRIMARY)
+        /* The primary's discovery campaign always runs — a staged image
+         * pending distribution used to skip it entirely (an "OTA distribution
+         * slot" that sent OtaPrep where the DReq would have gone), which
+         * meant TimeSync (and the staged-fw-version it now carries — see
+         * MESHNETWORK_vHandleTimeSync auto-arm) never went out on any wake
+         * where a distribution was pending. Since that's every wake from the
+         * moment this node finishes its own self-update until distribution
+         * succeeds, it permanently starved secondaries of the one signal
+         * that arms them, and every distribute attempt found "no targets
+         * joined" forever. The campaign now always runs first; distribution
+         * (if pending) is attempted right after this wake's own TimeSync,
+         * so freshly-armed secondaries are still awake for it — see the
+         * "wait for OtaPrep" window on the secondary side below. */
+        if (eDeviceRole == DEVICE_ROLE_PRIMARY)
         {
             bool    bDiscoveryFinished = false;
             uint8_t u8WaveCount        = 0;
@@ -278,8 +275,37 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             }
 
             if (bTimeSync)
+            {
                 DBG_LOG("DeviceDiscovery: Secondary %04X: TimeSync received\r\n",
                     LORARADIO_u32GetUniqueId());
+
+#ifdef STORAGE_BACKEND_FLASH
+                /* If armed (this wake's TimeSync auto-arm, or a still-armed
+                 * leftover from a prior wake), the primary may follow this
+                 * very TimeSync with a distribute session in the SAME wake
+                 * (see the primary path above) — stay awake for a bounded
+                 * window to catch that OtaPrep instead of immediately
+                 * falling through to sleep, which is what silently starved
+                 * every distribute attempt of any targets before. */
+                if (FOTA_bAcceptanceArmed())
+                {
+                    DBG_LOG("DeviceDiscovery: Secondary %04X: armed - waiting up to %u ms for OtaPrep\r\n",
+                        LORARADIO_u32GetUniqueId(), APP_OTA_PREP_WAIT_MS);
+
+                    uint32_t u32WaitStart = osKernelGetTickCount();
+                    while ((osKernelGetTickCount() - u32WaitStart) < APP_OTA_PREP_WAIT_MS)
+                    {
+                        uint32_t r2 = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_OTA,
+                                                        osFlagsWaitAny, APP_SECONDARY_POLL_MS);
+                        if (!(r2 & osFlagsError) && FOTA_bPrepPending())
+                        {
+                            FOTA_vSecondaryReceive();
+                            break;
+                        }
+                    }
+                }
+#endif
+            }
             else
                 DBG_LOG("DeviceDiscovery: Secondary %04X: campaign end (silence/cap)\r\n",
                     LORARADIO_u32GetUniqueId());
@@ -296,9 +322,10 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
          * ---------------------------------------------------------------- */
         DBG_LOG("DeviceDiscovery %X: Discovery complete.\r\n",
             LORARADIO_u32GetUniqueId());
+        MESHNETWORK_vLogCampaignStats("campaign");
         EVTLOG(LOG_DISCOVERY_CMPLT, eDeviceRole);
 
-        if (!bOtaSlot && eDeviceRole == DEVICE_ROLE_PRIMARY)
+        if (eDeviceRole == DEVICE_ROLE_PRIMARY)
         {
             MeshDiscoveredNeighbor_t tNeighbors[MESH_MAX_NEIGHBORS];
             uint16_t u16NeighborCount = 0;
@@ -366,6 +393,36 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             EVTLOG(LOG_TX_TS, 1);
 
 #ifdef STORAGE_BACKEND_FLASH
+            /* ---- LoRa distribution to secondaries (if a staged image is
+             * ready) ----
+             * Right after TimeSync, before the fr9 UART check: secondaries
+             * that just auto-armed off this wake's TimeSync are still awake
+             * for a bounded window waiting for exactly this OtaPrep (see
+             * APP_OTA_PREP_WAIT_MS on the secondary side) — putting the fr9
+             * round trip (up to OTA_FWREQ_WAIT_MAX_MS) first would burn
+             * through that window for nothing. */
+            if (FOTA_bDistributePending())
+            {
+                FOTA_vDistribute();
+            }
+            else
+            {
+                /* Silent skip here used to be indistinguishable in the log
+                 * from "distribute never even got checked" — log exactly
+                 * why nothing happened instead of just falling through to
+                 * the fr9 check with no trace. Only two reasons left to
+                 * skip: FOTA_bDistributePending() no longer treats "every
+                 * target from a past session confirmed" as a permanent
+                 * stop, since that has no way to know about a secondary
+                 * that wasn't listening then — see there for why. */
+                FotaMeta_t tFotaMeta;
+                if (!FOTA_bGetMeta(&tFotaMeta))
+                    DBG_LOG("Fota: distribute check - no valid image staged\r\n");
+                else if (tFotaMeta.u32Version != VERSION_u32Get())
+                    DBG_LOG("Fota: distribute check - staged v%lu != running v%lu, skip\r\n",
+                            (unsigned long)tFotaMeta.u32Version, (unsigned long)VERSION_u32Get());
+            }
+
             /* ---- OTA firmware pull (logger session still up) ----
              * Ask fr9 to check GitHub Pages for a newer image, then poll
              * AT+FWREQ (which answers FW,WAIT while fr9's check/download is
@@ -535,6 +592,24 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                 DBG_LOG("DeviceDiscovery: Solar activation (%lu mW) — exiting ProductionSleep\r\n",
                     SOLAR_u32GetPowerMW());
 
+                /* Fire a GPS fix immediately on takeoff, not just at the next
+                 * scheduled 3-min pre-trigger: a device that just spent an
+                 * unbounded stretch in ProductionSleep (no RTC-correcting
+                 * TimeSync while asleep) is exactly the case most likely to
+                 * have a drifted RTC, so get it corrected as early as
+                 * possible instead of waiting. Own dedicated sleep-lock
+                 * reference (released inside GPS_vPowerOff()), independent
+                 * of the kernel-window lock acquired above (released
+                 * separately at the AppTask loop end) — see the GPS
+                 * pre-trigger below for the same acquire/POWER_CLASS_NORMAL
+                 * pattern. */
+                if (POWER_tGetState() & POWER_CLASS_NORMAL)
+                {
+                    SYSTEM_vSleepLockAcquire();
+                    DBG_LOG("DeviceDiscovery: GPS acquire on ProductionSleep wake (5 min timeout)\r\n");
+                    GPS_vRequestFix(true, 300);
+                }
+
                 /* Open a FrKernel window instead of an autonomous discovery
                  * campaign (same path the shake-wakeup trigger uses); the
                  * kernel's own 5-min inactivity timeout — or an explicit
@@ -558,6 +633,16 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
 
                 DBG_LOG("DeviceDiscovery: Solar activation (%u mV) — exiting ProductionSleep\r\n",
                     SOLAR_u16GetVSolarMV());
+
+                /* See the ENABLE_SOLAR_POWER_SENSE branch above for why this
+                 * fires a GPS fix immediately (RTC correction on takeoff)
+                 * with its own dedicated sleep-lock reference. */
+                if (POWER_tGetState() & POWER_CLASS_NORMAL)
+                {
+                    SYSTEM_vSleepLockAcquire();
+                    DBG_LOG("DeviceDiscovery: GPS acquire on ProductionSleep wake (5 min timeout)\r\n");
+                    GPS_vRequestFix(true, 300);
+                }
 
                 osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
             }
@@ -713,7 +798,23 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
 static void DEVICE_DISCOVERY_vSendTS(void)
 {
     DBG_LOG("\r\n--- START TIMESYNC ---\r\n");
-    MESHNETWORK_vSendTimeSync(RTC_u64GetUTC(), MESHNETWORK_tGetWakeupInterval());
+
+    /* Advertise whatever image is currently staged in ext flash (0 if none
+     * valid) so every secondary that hears this campaign's TimeSync learns
+     * an update exists and can auto-arm itself — see
+     * MESHNETWORK_vHandleTimeSync. This is the same image
+     * FOTA_vDistribute() will later broadcast on its own dedicated wake
+     * slot; announcing it here costs 4 bytes and one flash-metadata read,
+     * no dedicated round trip. */
+    uint32_t u32StagedVer = 0U;
+#ifdef STORAGE_BACKEND_FLASH
+    FotaMeta_t tMeta;
+    if (FOTA_bGetMeta(&tMeta) && tMeta.bValid)
+        u32StagedVer = tMeta.u32Version;
+#endif
+
+    MESHNETWORK_vSendTimeSync(RTC_u64GetUTC(), MESHNETWORK_tGetWakeupInterval(),
+                               u32StagedVer);
 }
 
 /* --------------------------------------------------------------------------
@@ -750,6 +851,17 @@ void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
     {
         eProductionState = PRODUCTION_ACTIVE;
         DBG_LOG("DeviceDiscovery: Kernel wakeup — exiting ProductionSleep\r\n");
+
+        /* Same rationale as the solar wake path: get the RTC corrected as
+         * early as possible after an unbounded ProductionSleep stretch,
+         * not just at the next scheduled pre-trigger. Own dedicated
+         * sleep-lock reference, released inside GPS_vPowerOff(). */
+        if (POWER_tGetState() & POWER_CLASS_NORMAL)
+        {
+            SYSTEM_vSleepLockAcquire();
+            DBG_LOG("DeviceDiscovery: GPS acquire on ProductionSleep wake (5 min timeout)\r\n");
+            GPS_vRequestFix(true, 300);
+        }
     }
 
     osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);

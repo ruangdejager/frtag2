@@ -33,6 +33,7 @@
 #include "build_config.h"
 #ifdef STORAGE_BACKEND_FLASH
 #include "Fota.h"
+#include "version_config.h"
 #endif
 
 #include "GPS.h"
@@ -150,6 +151,15 @@ static uint16_t u16MsgCounter        = 0;
 static uint64_t u64LastPrimaryHeardTick = 0;
 static int16_t  i16BestDreqRssi      = -256;
 static uint8_t  u8PrimaryDreqWaveCnt = 0;
+
+/* Campaign-level traffic counters — a one-line DBG_LOG summary in place of
+ * a DBG_LOG per packet. Reset at MESHNETWORK_vResetDreqWaveCnt() (already
+ * called at every campaign start); read/logged via
+ * MESHNETWORK_vLogCampaignStats() at campaign end. */
+static uint16_t u16StatDReqHeard;
+static uint16_t u16StatBeaconsHeard;
+static uint16_t u16StatAcksHeard;
+static uint16_t u16StatMsgsForwarded;
 
 /* Tick of the most recent received discovery packet (any type).
  * Updated in every handler so DeviceDiscovery can detect mesh activity
@@ -353,11 +363,12 @@ static bool MESHNETWORK_bEncodeTimeSync(const MeshPktTimeSync_t *ptTS,
                                          size_t u32BufLen,
                                          size_t *pu32Written)
 {
-    if (u32BufLen < 6) return false;
+    if (u32BufLen < 10) return false;
     pBuf[0] = (uint8_t)MeshPktType_TimeSync;
     write_u32_be(&pBuf[1], ptTS->u32UtcTimestamp);
     pBuf[5] = (uint8_t)ptTS->tWakeupInterval;
-    *pu32Written = 6;
+    write_u32_be(&pBuf[6], ptTS->u32StagedFwVersion);
+    *pu32Written = 10;
     return true;
 }
 
@@ -586,7 +597,7 @@ static bool MESHNETWORK_bSendPacket(const uint8_t *pBuf, size_t u32Len)
         osThreadFlagsSet(xMeshTxTaskHandle, MESH_TX_FLAG_QUEUE);
 
 #ifdef MESH_LOG_VERBOSE
-    DBG_LOG("MeshNetwork: Queued TX (len=%u, jitter=%lu ms)\r\n",
+    DBG("MeshNetwork: Queued TX (len=%u, jitter=%lu ms)\r\n",
         (unsigned)u32Len, jitterMs);
 #endif
     return true;
@@ -605,8 +616,9 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
     uint8_t  u8SenderHopCount = pBuf[5];
     uint8_t  u8WaveCnt        = pBuf[6];
 
-    DBG_LOG("MeshNetwork: DReq: dreq=%08X origin=%04X hop=%u rssi=%d\r\n",
+    DBG("MeshNetwork: DReq: dreq=%08X origin=%04X hop=%u rssi=%d\r\n",
         u32DreqId, u32OriginId, u8SenderHopCount, s16Rssi);
+    u16StatDReqHeard++;
 
     uint32_t u32LogValue;
     FLASHLOG_vEncodeRXLogValue(&u32LogValue, (uint16_t)u32OriginId, s16Rssi, u8WaveCnt);
@@ -636,13 +648,14 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
                     FORWARD_vAdd(u32DreqId);
                     MESHNETWORK_bSendPacket(u8Out, u32OutLen);
                     DBG("MeshNetwork: DReq forwarded\r\n");
+                    u16StatMsgsForwarded++;
                     EVTLOG(LOG_TX_DREQ, 2);
                 }
             }
 #ifdef MESH_LOG_VERBOSE
             else
             {
-                DBG_LOG("MeshNetwork: DReq seen before\r\n");
+                DBG("MeshNetwork: DReq seen before\r\n");
             }
 #endif
         }
@@ -712,10 +725,11 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
         }
     }
 
-    DBG_LOG("MeshNetwork: Beacon: dev=%04X dreq=%08X hop=%u wave=%X bat=%u rssi=%d move=%u gps=%u\r\n",
+    DBG("MeshNetwork: Beacon: dev=%04X dreq=%08X hop=%u wave=%X bat=%u rssi=%d move=%u gps=%u\r\n",
         tBeacon.u32DeviceId, tBeacon.u32DreqId, tBeacon.u8HopCount,
         tBeacon.dreqWaveDisc, tBeacon.u16BatMv, tBeacon.i16Rssi,
         tBeacon.u8MoveState, tBeacon.bGpsValid);
+    u16StatBeaconsHeard++;
 
     uint32_t u32LogValue;
     FLASHLOG_vEncodeRXLogValue(&u32LogValue, (uint16_t)tBeacon.u32DeviceId,
@@ -726,7 +740,7 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
     if (FORWARD_bHasSeen(tBeacon.u32BeaconMsgId))
     {
 #ifdef MESH_LOG_VERBOSE
-        DBG_LOG("MeshNetwork: Beacon seen before\r\n");
+        DBG("MeshNetwork: Beacon seen before\r\n");
 #endif
         tLastBeaconHeardTick = osKernelGetTickCount();
         return;
@@ -757,6 +771,7 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
         {
             MESHNETWORK_bSendPacket(u8Buf, u32TempLen);
             DBG("MeshNetwork: Forwarding Beacon\r\n");
+            u16StatMsgsForwarded++;
             EVTLOG(LOG_TX_BEACON, 2);
         }
     }
@@ -791,8 +806,9 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
     for (uint8_t i = 0; i < u8AckCount; i++)
         u32Ids[i] = read_u32_be(&pBuf[10 + 4 * i]);
 
-    DBG_LOG("MeshNetwork: DAck: ackId=%08X dreq=%08X count=%u\r\n",
+    DBG("MeshNetwork: DAck: ackId=%08X dreq=%08X count=%u\r\n",
         u32AckMsgId, u32DreqId, u8AckCount);
+    u16StatAcksHeard++;
 
     uint32_t u32LogValue;
     FLASHLOG_vEncodeRXLogValue(&u32LogValue, (uint16_t)(u32DreqId >> 16),
@@ -802,7 +818,7 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
     if (FORWARD_bHasSeen(u32AckMsgId))
     {
 #ifdef MESH_LOG_VERBOSE
-        DBG_LOG("MeshNetwork: Ack seen before\r\n");
+        DBG("MeshNetwork: Ack seen before\r\n");
 #endif
         return;
     }
@@ -812,6 +828,7 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
     {
         MESHNETWORK_bSendPacket(pBuf, u32Len);
         DBG("MeshNetwork: Ack forwarded\r\n");
+        u16StatMsgsForwarded++;
         EVTLOG(LOG_TX_ACK, 2);
     }
 
@@ -839,14 +856,16 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
                                          size_t u32Len,
                                          int16_t s16Rssi)
 {
-    if (u32Len < 6) return;
+    if (u32Len < 10) return;
 
     u32LastDiscoveryPktTick = osKernelGetTickCount();
 
-    uint32_t       u32Utc    = read_u32_be(&pBuf[1]);
-    WakeupInterval tInterval = (WakeupInterval)pBuf[5];
+    uint32_t       u32Utc       = read_u32_be(&pBuf[1]);
+    WakeupInterval tInterval    = (WakeupInterval)pBuf[5];
+    uint32_t       u32StagedVer = read_u32_be(&pBuf[6]);
 
-    DBG_LOG("MeshNetwork: TimeSync: utc=%u interval=%u\r\n", u32Utc, tInterval);
+    DBG("MeshNetwork: TimeSync: utc=%u interval=%u fwVer=%lu\r\n",
+            u32Utc, tInterval, (unsigned long)u32StagedVer);
 
     uint32_t u32LogValue;
     FLASHLOG_vEncodeRXLogValue(&u32LogValue, 0, s16Rssi, 0);
@@ -859,7 +878,7 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
     if (bTimeSyncUtcValid && (int32_t)(u32Utc - u32LastTimeSyncUtc) <= 0)
     {
 #ifdef MESH_LOG_VERBOSE
-        DBG_LOG("MeshNetwork: TimeSync seen before\r\n");
+        DBG("MeshNetwork: TimeSync seen before\r\n");
 #endif
         return;
     }
@@ -888,6 +907,22 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
         bTimeSyncAcceptedThisWake = true;
         DBG_LOG("MeshNetwork: TimeSync applied: %u interval=%u\r\n", u32Utc, tInterval);
 
+#ifdef STORAGE_BACKEND_FLASH
+        /* Auto-arm firmware acceptance straight off the version the
+         * primary just announced — no "tag <ID> fwaccept" needed. Each
+         * campaign re-evaluates this, so a secondary that missed the
+         * actual distribution wake (asleep, out of range, etc.) simply
+         * re-arms on the next TimeSync it hears until it catches up.
+         * Flash-backend only: Fota's OTA storage lives on ext-NOR, which
+         * a MicroSD-backend build doesn't have. */
+        if (u32StagedVer > VERSION_u32Get() && !FOTA_bAcceptanceArmed())
+        {
+            DBG_LOG("MeshNetwork: TimeSync offers newer fw v%lu (running v%lu) - auto-arming acceptance\r\n",
+                    (unsigned long)u32StagedVer, (unsigned long)VERSION_u32Get());
+            FOTA_vArmAcceptance();
+        }
+#endif
+
         osThreadId_t xAppTask = DEVICE_DISCOVERY_xGetTaskHandle();
         if (xAppTask != NULL)
             osThreadFlagsSet(xAppTask, DEVICE_DISCOVERY_NOTIFY_TIMESYNC);
@@ -895,12 +930,13 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
 #ifdef MESH_LOG_VERBOSE
     else
     {
-        DBG_LOG("MeshNetwork: TimeSync seen (already accepted this wake)\r\n");
+        DBG("MeshNetwork: TimeSync seen (already accepted this wake)\r\n");
     }
 #endif
 
     MESHNETWORK_bSendPacket(pBuf, u32Len);
     DBG("MeshNetwork: TimeSync forwarded\r\n");
+    u16StatMsgsForwarded++;
     EVTLOG(LOG_TX_TS, 2);
 }
 
@@ -923,6 +959,24 @@ void MESHNETWORK_vParserTask(void *pvParameters)
         if (tRx.length < 1) continue;
 
         MeshPktType_e eType = (MeshPktType_e)tRx.buffer[0];
+
+#ifdef STORAGE_BACKEND_FLASH
+        /* FOTA takes priority: while a distribute or receive session is
+         * active, ordinary mesh traffic (beacons, DReq/DAck, TimeSync,
+         * FrKernel) adds nothing but radio/CPU contention right when a
+         * chunk read/write is most vulnerable to it (a nearby TX/RX's
+         * supply-rail sag corrupting a flash access — see the findings in
+         * FOTA_bSendChunk). Drop it outright rather than processing or
+         * forwarding it; the OTA packet types below are never affected by
+         * this check. */
+        if (eType != MeshPktType_OtaPrep && eType != MeshPktType_OtaPrepAck &&
+            eType != MeshPktType_OtaChunk && eType != MeshPktType_OtaPoll &&
+            eType != MeshPktType_OtaReport && FOTA_bSessionActive())
+        {
+            continue;
+        }
+#endif
+
         switch (eType)
         {
             case MeshPktType_DReq:
@@ -990,7 +1044,7 @@ static void MESHNETWORK_vTxTask(void *pvParameters)
                 osDelay(tItem.u32ReadyTick - now);   /* wait out the TX jitter */
 
 #ifdef MESH_LOG_VERBOSE
-            DBG_LOG("MeshNetwork: TX (len=%u)\r\n", tItem.u16Len);
+            DBG("MeshNetwork: TX (len=%u)\r\n", tItem.u16Len);
 #endif
             MESHNETWORK_bTxSendRaw(tItem.u8Buf, tItem.u16Len);
         }
@@ -1082,11 +1136,13 @@ bool MESHNETWORK_bStartDiscoveryRound(uint32_t u32DreqId)
 }
 
 void MESHNETWORK_vSendTimeSync(uint32_t u32UtcTimestamp,
-                               WakeupInterval tWakeupInterval)
+                               WakeupInterval tWakeupInterval,
+                               uint32_t u32StagedFwVersion)
 {
     MeshPktTimeSync_t tTs = {
-        .u32UtcTimestamp = u32UtcTimestamp,
-        .tWakeupInterval = tWakeupInterval
+        .u32UtcTimestamp     = u32UtcTimestamp,
+        .tWakeupInterval     = tWakeupInterval,
+        .u32StagedFwVersion  = u32StagedFwVersion,
     };
     uint8_t u8Buf[16];
     size_t  u32Len = 0;
@@ -1096,8 +1152,8 @@ void MESHNETWORK_vSendTimeSync(uint32_t u32UtcTimestamp,
     u32LastTimeSyncUtc = u32UtcTimestamp;
     bTimeSyncUtcValid  = true;
     MESHNETWORK_bSendPacket(u8Buf, u32Len);
-    DBG_LOG("MeshNetwork: TimeSync sent %u interval=%u\r\n",
-        u32UtcTimestamp, tWakeupInterval);
+    DBG_LOG("MeshNetwork: TimeSync sent %u interval=%u fwVer=%lu\r\n",
+        u32UtcTimestamp, tWakeupInterval, (unsigned long)u32StagedFwVersion);
 }
 
 /* Snapshot the node role under the mutex (parser task uses this instead of
@@ -1290,7 +1346,25 @@ void MESHNETWORK_vFlushTxQueue(void)
 }
 
 void MESHNETWORK_vIncrDreqWaveCnt(void) { u8PrimaryDreqWaveCnt++; }
-void MESHNETWORK_vResetDreqWaveCnt(void) { u8PrimaryDreqWaveCnt = 0; }
+void MESHNETWORK_vResetDreqWaveCnt(void)
+{
+    u8PrimaryDreqWaveCnt = 0;
+    u16StatDReqHeard      = 0U;
+    u16StatBeaconsHeard   = 0U;
+    u16StatAcksHeard      = 0U;
+    u16StatMsgsForwarded  = 0U;
+}
+
+/* One-line campaign traffic summary in place of a DBG_LOG per packet —
+ * call at campaign end (or wave end, if a per-wave breakdown is wanted)
+ * from DeviceDiscovery.c. Does not reset the counters itself; call
+ * MESHNETWORK_vResetDreqWaveCnt() to start a fresh campaign's tally. */
+void MESHNETWORK_vLogCampaignStats(const char *pcTag)
+{
+    DBG_LOG("MeshNetwork: %s stats - DReq heard=%u beacons heard=%u acks heard=%u forwarded=%u\r\n",
+            pcTag, (unsigned)u16StatDReqHeard, (unsigned)u16StatBeaconsHeard,
+            (unsigned)u16StatAcksHeard, (unsigned)u16StatMsgsForwarded);
+}
 
 /* Small OTA responses (PrepAck/Report) ride the normal jittered mesh TX
  * queue — the jitter de-correlates many secondaries answering one OtaPrep,

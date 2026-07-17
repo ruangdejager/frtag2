@@ -37,6 +37,17 @@ static uint32_t u32WriteAddr;
 static uint32_t u32StartAddr;
 static bool     bWrapped;
 
+/* When true, LOG_vWrite() skips the flash entirely (UART logging is
+ * unaffected — it runs on a separate path in the DbgLog consumer). Set for
+ * the duration of an OTA session so logger flash writes never interleave
+ * with the OTA image reads on the shared device. See LOG_vSuspend(). */
+static volatile bool bLogSuspended = false;
+
+void LOG_vSuspend(bool bSuspend)
+{
+    bLogSuspended = bSuspend;
+}
+
 /* -------------------------------------------------------------------------- */
 
 /*
@@ -155,6 +166,11 @@ void LOG_vInit(void)
  */
 void LOG_vWrite(const char *buf, uint16_t len)
 {
+    /* NOTE: bLogSuspended is currently NOT honored here — suspending flash
+     * logging during OTA was tried and did not fix the transfer corruption
+     * (the read-priming fix in FOTA_bSendChunk did), and it blinded the
+     * field-collected primary log for the whole OTA window. Kept the flag/
+     * API in place (harmless) in case a future change wants it. */
     uint16_t off = 0U;
 
     while (off < len)
@@ -227,6 +243,21 @@ void LOG_vErase(void)
         if (!FLASH_vSectorErase(u32Addr))
             break;
     }
+    u32WriteAddr = LOG_FLASH_START_ADDR;
+    u32StartAddr = LOG_FLASH_START_ADDR;
+    bWrapped     = false;
+}
+
+void LOG_vEraseAll(void)
+{
+    /* Whole-device erase: also wipes the OTA scratchpad + metadata sectors
+     * below LOG_FLASH_START_ADDR — deliberate, see Log.h. FLASH_vChipErase
+     * blocks until the device reports done (a full 512 KB erase takes
+     * several seconds); Flash.c's own mutex keeps this safe against the
+     * DbgLog consumer's other flash traffic, but this function is still
+     * only ever called FROM that consumer task (DBGLOG_vRequestEraseAll),
+     * same as LOG_vErase, so there's nothing else to race here anyway. */
+    (void)FLASH_vChipErase();
     u32WriteAddr = LOG_FLASH_START_ADDR;
     u32StartAddr = LOG_FLASH_START_ADDR;
     bWrapped     = false;

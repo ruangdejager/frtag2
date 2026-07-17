@@ -128,4 +128,15 @@ void FOTA_vArmAcceptance(void);
 void FOTA_vDisarmAcceptance(void);
 bool FOTA_bAcceptanceArmed(void);
 
+/* --------------------------------------------------------------------------
+ * Session priority
+ * -------------------------------------------------------------------------- */
+
+/* True while a distribute (primary) or receive (secondary) session is
+ * actively running. MeshNetwork's dispatch drops every non-OTA packet type
+ * while this is true, so ordinary mesh traffic (beacons, DReq/DAck,
+ * TimeSync, FrKernel) can't add radio/CPU contention during a transfer —
+ * see FOTA_bSessionActive() call site in MeshNetwork.c. */
+bool FOTA_bSessionActive(void);
+
 #endif /* WORKER_FOTA_FOTA_H_ */

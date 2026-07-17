@@ -60,6 +60,12 @@ void DBGLOG_vRequestDumpVia(void (*sink)(const uint8_t *data, uint16_t len));
  * log writes on the shared storage device. */
 void DBGLOG_vRequestErase(void);
 
+/* Flash backend only: ask the consumer task to erase the ENTIRE ext-flash
+ * device -- log partition AND the OTA image scratchpad + metadata below it
+ * (LOG_vEraseAll), not just the log. Destroys any staged-but-not-yet-
+ * installed OTA image. Same consumer-task rationale as DBGLOG_vRequestErase. */
+void DBGLOG_vRequestEraseAll(void);
+
 /* Compatibility wrappers (UART-only / flash-only). */
 void DBGLOG_vPutDebug(const char *format, ...);
 void DBGLOG_vPutLog(const char *format, ...);
