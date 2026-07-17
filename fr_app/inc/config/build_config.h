@@ -22,7 +22,11 @@
 #define CONFIG_BUILD_CONFIG_H_
 
 /* --------------------------------------------------------------------------
- * FrKernel command-interface transport — select exactly one.
+ * FrKernel command-interface transport — either or both of UART/LORA, OR
+ * LORA_BRIDGE alone (mutually exclusive with the other two — it's a
+ * dedicated bench-rig mode, see FrKernel_Config.h). Defining both UART and
+ * LORA lets the same build answer "tag <cmd>" over the debug UART and
+ * "tag <ID> <cmd>" over the mesh at the same time.
  * See fr_app/Worker/FrKernel/FrKernel_Config.h.
  * -------------------------------------------------------------------------- */
  #define FRKERNEL_INTERFACE_UART        /* debug UART (bench use) */
@@ -59,9 +63,13 @@
 /* --------------------------------------------------------------------------
  * Compile-time guards
  * -------------------------------------------------------------------------- */
-#if (defined(FRKERNEL_INTERFACE_UART) + defined(FRKERNEL_INTERFACE_LORA) + \
-     defined(FRKERNEL_INTERFACE_LORA_BRIDGE)) != 1
-#  error "build_config.h: define exactly one of FRKERNEL_INTERFACE_UART, FRKERNEL_INTERFACE_LORA, FRKERNEL_INTERFACE_LORA_BRIDGE"
+#if defined(FRKERNEL_INTERFACE_LORA_BRIDGE) && \
+    (defined(FRKERNEL_INTERFACE_UART) || defined(FRKERNEL_INTERFACE_LORA))
+#  error "build_config.h: FRKERNEL_INTERFACE_LORA_BRIDGE is exclusive of FRKERNEL_INTERFACE_UART/_LORA"
+#endif
+#if !defined(FRKERNEL_INTERFACE_LORA_BRIDGE) && \
+    !defined(FRKERNEL_INTERFACE_UART) && !defined(FRKERNEL_INTERFACE_LORA)
+#  error "build_config.h: define FRKERNEL_INTERFACE_LORA_BRIDGE, or at least one of FRKERNEL_INTERFACE_UART/_LORA"
 #endif
 
 #if defined(STORAGE_BACKEND_FLASH) == defined(STORAGE_BACKEND_MICROSD)

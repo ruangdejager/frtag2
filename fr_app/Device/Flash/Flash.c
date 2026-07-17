@@ -20,6 +20,11 @@
  * access transparently wakes it first via FLASH_vEnsureAwake(). */
 static bool bInDpd = false;
 
+/* When true, FLASH_vDeepPowerDown() is suppressed and the chip is kept
+ * awake. Set for the duration of an OTA session — see
+ * FLASH_vInhibitDeepPowerDown() in Flash.h. */
+static bool bDpdInhibited = false;
+
 /* This device is shared: Log.c (driven by DBGLOG_vConsumerTask, its own
  * thread) and OtaStore.c (driven by the AppTask) both call straight into
  * this driver's public functions. Every one of those functions is a
@@ -463,9 +468,23 @@ bool FLASH_vChipErase(void)
     return bReady;
 }
 
+void FLASH_vInhibitDeepPowerDown(bool bInhibit)
+{
+    FLASH_vLock();
+    bDpdInhibited = bInhibit;
+    if (bInhibit)
+        FLASH_vEnsureAwake();   /* wake now; keep it awake for the session */
+    FLASH_vUnlock();
+}
+
 void FLASH_vDeepPowerDown(void)
 {
     FLASH_vLock();
+    if (bDpdInhibited)
+    {
+        FLASH_vUnlock();
+        return;     /* OTA in progress — keep the chip awake */
+    }
     if (bInDpd)
     {
         FLASH_vUnlock();

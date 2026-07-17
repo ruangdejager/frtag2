@@ -28,4 +28,13 @@ bool    FLASH_vChipErase(void);
 void    FLASH_vDeepPowerDown(void);
 void    FLASH_vReleaseDeepPowerDown(void);
 
+/* Inhibit (true) or re-allow (false) deep-power-down parking. While
+ * inhibited, FLASH_vDeepPowerDown() is a no-op and the device is woken
+ * immediately, so the chip stays continuously awake. Used to bracket an
+ * OTA session: reads issued shortly after a DPD wake were observed to
+ * return corrupted bytes (the bootloader, which never parks the chip
+ * mid-verify, reads the same image cleanly), so for the multi-minute OTA
+ * transfer we keep the flash awake the whole time. */
+void    FLASH_vInhibitDeepPowerDown(bool bInhibit);
+
 #endif /* DEVICE_FLASH_FLASH_H_ */

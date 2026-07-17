@@ -29,6 +29,16 @@
 /* Primary issues at most this many DReq waves per campaign (R8). */
 #define APP_PRIMARY_MAX_WAVES              5U
 
+/* Secondary, flash backend only: once armed (see MESHNETWORK_vHandleTimeSync
+ * auto-arm off the staged-fw version carried in TimeSync), how long to keep
+ * listening for the OtaPrep the primary sends right after TimeSync in the
+ * SAME wake (Fota's OTA_LORA_PREP_REPEATS * OTA_LORA_PREP_GAP_MS = 5 s of
+ * repeats) before giving up and proceeding to sleep like normal. Bounded
+ * deliberately short (not the whole distribute session) so an unarmed-
+ * this-wake secondary never pays for it, and an armed one that doesn't hear
+ * a prep this wake just tries again next wake. */
+#define APP_OTA_PREP_WAIT_MS               15000U
+
 /* GPS pre-trigger lead time: how many seconds before each scheduled wake the
  * wake-schedule task asks the GPS module for a fresh fix. The dispatcher runs
  * asynchronously; the AppTask never blocks waiting for it. */

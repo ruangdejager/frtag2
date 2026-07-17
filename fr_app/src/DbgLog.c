@@ -54,6 +54,9 @@ static osMutexId_t       xFmtMutex   = NULL;
 static osThreadId_t      xConsumer   = NULL;
 static volatile bool     bDumpRequested = false;
 static volatile bool     bEraseRequested = false;
+#ifdef STORAGE_BACKEND_FLASH
+static volatile bool     bEraseAllRequested = false;
+#endif
 static void            (*pfnDumpSink)(const uint8_t *data, uint16_t len) = NULL;
 
 /* Count of whole messages dropped because the ring was full. Incremented under
@@ -237,6 +240,15 @@ void DBGLOG_vRequestErase(void)
         osThreadFlagsSet(xConsumer, DBGLOG_WAKE_FLAG);
 }
 
+void DBGLOG_vRequestEraseAll(void)
+{
+#ifdef STORAGE_BACKEND_FLASH
+    bEraseAllRequested = true;
+    if (xConsumer != NULL)
+        osThreadFlagsSet(xConsumer, DBGLOG_WAKE_FLAG);
+#endif
+}
+
 /* -------------------------------------------------------------------------- */
 
 static void DBGLOG_vConsumerTask(void *arg)
@@ -255,6 +267,16 @@ static void DBGLOG_vConsumerTask(void *arg)
             bEraseRequested = false;
             LOG_vErase();
         }
+
+#ifdef STORAGE_BACKEND_FLASH
+        /* Whole-device erase (log + OTA scratchpad/metadata) — same
+         * consumer-task rationale, flash backend only (see LOG_vEraseAll). */
+        if (bEraseAllRequested)
+        {
+            bEraseAllRequested = false;
+            LOG_vEraseAll();
+        }
+#endif
 
         /* Stream the persisted log on request — done here so the consumer
          * remains the only writer of the debug transport. */

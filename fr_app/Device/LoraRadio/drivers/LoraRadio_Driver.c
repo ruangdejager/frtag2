@@ -74,9 +74,18 @@ void LORARADIO_DRIVER_vInit(uint8_t *pUniqueID)
     /* Workaround: Optimising Inverted IQ (DS_SX1261-2_V1.2 §15.4) */
     SUBGRF_WriteRegister(0x0736, SUBGRF_ReadRegister(0x0736) | (1 << 2));
 
-    SUBGRF_SetDioIrqParams(IRQ_TX_DONE | IRQ_RX_TX_TIMEOUT | IRQ_RX_DONE,
+    /* Enable CRC + header error IRQs from init too, not just from
+     * vEnterRxMode later. The SX126x's own LoRa hardware CRC check
+     * (LORA_CRC_ON above) is our primary integrity guarantee against RF
+     * corruption; without these IRQ bits, a corrupted packet is silently
+     * dropped by the chip with zero indication to firmware, which makes
+     * intermittent packet loss during OTA distribution look like radio
+     * silence. Routed through LoraRadio.c's RX_DONE-mode-restart handling
+     * so we can also log the event for correlation with OTA activity. */
+    SUBGRF_SetDioIrqParams(IRQ_TX_DONE | IRQ_RX_TX_TIMEOUT | IRQ_RX_DONE
+                                       | IRQ_CRC_ERROR    | IRQ_HEADER_ERROR,
                            IRQ_TX_DONE | IRQ_RX_TX_TIMEOUT,
-                           IRQ_RX_DONE,
+                           IRQ_RX_DONE | IRQ_CRC_ERROR    | IRQ_HEADER_ERROR,
                            IRQ_RADIO_NONE);
 
     if (pUniqueID != NULL)
@@ -131,10 +140,47 @@ bool LORARADIO_DRIVER_bTransmitPayload(uint8_t *payload, uint8_t payload_length)
     SUBGRF_SendPayload(payload, payload_length, 0x00);
 
     /* Wait for TX_DONE — must be called from the radio task only (waits on
-     * its own thread flags).  ALL_FLAGS clears every pending bit so no stale
-     * event is left in the notification word after this returns. */
-    uint32_t r = osThreadFlagsWait(ALL_FLAGS, osFlagsWaitAny, 1000);
-    bool bSuccess = (!(r & osFlagsError) && (r & RADIO_EVT_TX_DONE));
+     * its own thread flags). Loop instead of a single wait: RADIO_EVT_
+     * TX_PENDING is self-noise here — LORARADIO_bTxPacket() sets it
+     * unconditionally on every enqueue, including the NEXT packet's, which
+     * routinely happens while THIS packet's transmission is still in
+     * flight during a burst (e.g. the OTA chunk blast, which queues up to
+     * 8 packets back to back). A single ALL_FLAGS wait treats that as
+     * "something happened, not TX_DONE" and reports a false failure before
+     * the real TX_DONE IRQ — whose airtime hasn't even elapsed yet — ever
+     * has a chance to arrive. Same hazard LORARADIO_bCarrierSense() already
+     * strips for CAD (see its comment); it just wasn't applied here too.
+     * Strip the self-noise and keep waiting on the remaining budget; only
+     * report failure on a genuine timeout or an explicit RX_TX_TIMEOUT. */
+    uint32_t u32Start = osKernelGetTickCount();
+    bool bSuccess = false;
+    for (;;)
+    {
+        uint32_t u32Elapsed = osKernelGetTickCount() - u32Start;
+        if (u32Elapsed >= 1000U)
+            break;   /* genuine timeout */
+
+        uint32_t r = osThreadFlagsWait(ALL_FLAGS, osFlagsWaitAny, 1000U - u32Elapsed);
+        if (r & osFlagsError)
+            break;   /* genuine timeout */
+
+        r &= ~RADIO_EVT_TX_PENDING;   /* self-noise, see comment above */
+
+        if (r & RADIO_EVT_TX_DONE)
+        {
+            bSuccess = true;
+            break;
+        }
+        if (r & RADIO_EVT_TIMEOUT)
+            break;   /* genuine radio-reported failure */
+
+        /* r == 0: only our own TX_PENDING fired — spurious wake, keep
+         * waiting. Any other, genuinely foreign bit (e.g. RX_DONE from
+         * ambient mesh traffic) is dropped here rather than stashed —
+         * LoraRadio.c's stash is private to that file — same as this
+         * function's prior behavior for anything that wasn't TX_DONE. */
+    }
+
     if (bSuccess)
         DBG("LoraRadio: TX done\r\n");
     else
