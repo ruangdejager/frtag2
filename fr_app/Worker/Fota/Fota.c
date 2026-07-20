@@ -456,6 +456,15 @@ bool FOTA_bUartAcquire(void)
     {
         DBG_LOG("Fota: image XOR mismatch (stored=0x%02X, logger=0x%02X) - discarding\r\n",
                 u8Xor, u8ExpectedXor);
+        /* Confirmed corrupt (every retry attempt disagreed with the
+         * expected value, see FOTA_bVerifyImageXorRetry) - don't leave
+         * known-bad bytes sitting in scratch for the next acquire to
+         * partially overwrite. Metadata was never committed for this
+         * image (that happens below, after this check), so nothing else
+         * currently treats this scratch as valid - this is cleanup, not
+         * a state-consistency fix. */
+        if (!FOTA_bEraseScratch())
+            DBG_LOG("Fota: scratch erase after acquire xor mismatch FAILED\r\n");
         (void)FARMRANGER_bFwReportDone(false);
         return false;
     }
@@ -973,6 +982,17 @@ void FOTA_vDistribute(void)
         DBG_LOG("Fota: PRE-SEND xor mismatch (stored=0x%02X, meta=0x%02X) - "
                 "primary's own copy has drifted since acquire, aborting distribute\r\n",
                 (unsigned)u8PreSendXor, (unsigned)tMeta.u8Xor8);
+
+        /* Confirmed corrupt, not a transient glitch (every retry attempt
+         * disagreed - see FOTA_bVerifyImageXorRetry). Leaving a known-bad
+         * image staged means every subsequent wake re-fails this exact
+         * same check forever. Erase scratch + metadata so
+         * FOTA_bGetMeta()/the distribute-pending check see "nothing
+         * staged" and the next FOTA_bUartAcquire() naturally re-pulls a
+         * fresh copy instead of retrying a corrupt one indefinitely. */
+        if (!FOTA_bEraseScratch())
+            DBG_LOG("Fota: scratch erase after PRE-SEND mismatch FAILED\r\n");
+
         bDistributeActive = false;
         LOG_vSuspend(false);
         FLASH_vInhibitDeepPowerDown(false);
@@ -1427,6 +1447,15 @@ void FOTA_vSecondaryReceive(void)
                         u8Q);
             }
         }
+
+        /* Confirmed corrupt (every retry attempt disagreed - see
+         * FOTA_bVerifyImageXorRetry), diagnostic bisection above already
+         * read whatever's there. Erase rather than leave known-bad bytes
+         * staged: metadata was never committed for this receive (that
+         * happens below, after this check), so this is cleanup, not a
+         * state-consistency fix. */
+        if (!FOTA_bEraseScratch())
+            DBG_LOG("Fota: scratch erase after receive xor mismatch FAILED\r\n");
 
         (void)MESHNETWORK_bSendOtaResponse(au8Rpt, sizeof(au8Rpt));
         bRxSessionActive = false;

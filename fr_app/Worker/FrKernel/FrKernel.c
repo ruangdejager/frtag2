@@ -40,6 +40,13 @@
  *   tag -devicereq              broadcast; every device replies with its ID
  *   UART:  tag <cmd>
  *   LoRa:  tag <ID> <cmd>       only the addressed device replies
+ *   LoRa:  tag * <cmd>          bulk: every device runs the action command
+ *                               silently (DBG_LOG only, no over-air reply —
+ *                               see FRKERNEL_vAck). Query commands (-help,
+ *                               juice, fwver, discovery schedule, flash
+ *                               stream, sd log stream) are dropped under
+ *                               "*" instead of flooding the air with every
+ *                               device's answer — see FRKERNEL_bQueryOnlyCmd.
  *
  *   <cmd>:
  *     -help               list all commands
@@ -189,6 +196,43 @@ static void FRKERNEL_vRespond(FrKernelXport_e eXport, const char *msg)
 #endif
 }
 
+/* Acknowledge a command's result. Under a normal single-target "tag <ID>
+ * <cmd>", behaves exactly like FRKERNEL_vRespond. Under a bulk "tag *
+ * <cmd>" (bBulk == true), every addressed device would otherwise reply
+ * over the air at once — collisions on a shared channel, and a flood the
+ * operator didn't ask to receive N times. Instead just DBG_LOG the result
+ * locally so it's visible on the device's own bench UART, and send
+ * nothing over the radio. */
+static void FRKERNEL_vAck(FrKernelXport_e eXport, bool bBulk, const char *msg)
+{
+    if (bBulk)
+    {
+        size_t len = strlen(msg);
+        while (len > 0U && (msg[len - 1U] == '\r' || msg[len - 1U] == '\n'))
+            len--;
+        DBG_LOG("FrKernel bulk: %.*s\r\n", (int)len, msg);
+        return;
+    }
+    FRKERNEL_vRespond(eXport, msg);
+}
+
+/* Commands that only report state (never change it). Excluded from bulk
+ * "tag * <cmd>" addressing entirely — every device replying to a query at
+ * once is exactly the over-air flood bulk mode exists to avoid, and unlike
+ * action commands there's no local result worth DBG_LOG-only either (the
+ * whole point of a query is the answer leaving the device). */
+static bool FRKERNEL_bQueryOnlyCmd(const char *p)
+{
+    static const char *const apacQueries[] = {
+        "-help", "juice", "fwver", "discovery schedule",
+        "flash stream", "sd log stream",
+    };
+    for (size_t i = 0U; i < (sizeof(apacQueries) / sizeof(apacQueries[0])); i++)
+        if (strcmp(p, apacQueries[i]) == 0)
+            return true;
+    return false;
+}
+
 #if defined(FRKERNEL_INTERFACE_LORA) && defined(STORAGE_BACKEND_FLASH)
 /* DbgLog's dump sink for "tag flash stream" on the LoRa interface: there's no
  * UART session to read a UART-routed dump from, so the dump goes out as
@@ -244,6 +288,10 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
     if (*p == ' ') p++;
 
     char resp[FRKERNEL_RESP_BUF_LEN];
+    bool bBulk = false;    /* set below for LoRa "tag * <cmd>"; always
+                             * declared so FRKERNEL_vAck has a uniform call
+                             * signature regardless of which transports are
+                             * compiled in. */
 
     /* -devicereq: broadcast — every device responds, no addressing check.
      * Does not start a session over LoRa (any device may respond to a
@@ -265,16 +313,31 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
     }
 
 #ifdef FRKERNEL_INTERFACE_LORA
-    /* LoRa commands must be addressed: "tag <XXXX> <cmd>". UART commands
-     * (eXport == FRKERNEL_XPORT_UART) skip this — there's only one device
-     * on the wire, no address needed. */
+    /* LoRa commands must be addressed: "tag <XXXX> <cmd>" or the bulk
+     * wildcard "tag * <cmd>" (every device runs it, no over-air reply —
+     * see FRKERNEL_vAck). UART commands (eXport == FRKERNEL_XPORT_UART)
+     * skip this — there's only one device on the wire, no address needed. */
     if (eXport == FRKERNEL_XPORT_LORA)
     {
-        char    *end;
-        uint32_t targetId = (uint32_t)strtoul(p, &end, 16);
-        if (end == p || *end != ' ') return;                /* malformed */
-        if (targetId != LORARADIO_u32GetUniqueId()) return;  /* not for us */
-        p = end + 1;                                         /* skip "<ID> " */
+        if (p[0] == '*' && p[1] == ' ')
+        {
+            bBulk = true;
+            p += 2;
+        }
+        else
+        {
+            char    *end;
+            uint32_t targetId = (uint32_t)strtoul(p, &end, 16);
+            if (end == p || *end != ' ') return;                /* malformed */
+            if (targetId != LORARADIO_u32GetUniqueId()) return;  /* not for us */
+            p = end + 1;                                         /* skip "<ID> " */
+        }
+
+        /* Queries never run under a bulk address — every device replying
+         * at once is the exact flood bulk mode exists to avoid, and
+         * there's no local-only result worth DBG_LOG-ing either. */
+        if (bBulk && FRKERNEL_bQueryOnlyCmd(p))
+            return;
     }
 #endif
 
@@ -282,7 +345,7 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
     if (strcmp(p, "release") == 0)
     {
         s_bConnected = false;
-        FRKERNEL_vRespond(eXport, "Released\r\n");
+        FRKERNEL_vAck(eXport, bBulk, "Released\r\n");
         return;
     }
 
@@ -320,6 +383,8 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                 "  tag <ID> discovery schedule wakeup interval (min)\r\n"
                 "  tag <ID> prodsleep          enter production sleep (secondary only)\r\n"
                 "  tag <ID> release            release device for sleep\r\n"
+                "  tag * <cmd>                 bulk: every device runs <cmd> silently\r\n"
+                "                              (DBG_LOG only, no reply; action cmds only)\r\n"
             );
         }
 #ifdef STORAGE_BACKEND_FLASH
@@ -388,7 +453,7 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
     else if (strcmp(p, "prodsleep") == 0)
     {
         DEVICE_DISCOVERY_vEnterProductionSleep();
-        FRKERNEL_vRespond(eXport, "ProductionSleep entered — wakes on Vsolar >= 3000 mV\r\n");
+        FRKERNEL_vAck(eXport, bBulk, "ProductionSleep entered — wakes on Vsolar >= 3000 mV\r\n");
 
         /* prodsleep is a terminal command: don't linger in an open session
          * waiting for "tag release" or the 5-min inactivity timeout, or
@@ -410,18 +475,18 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
          * DeviceDiscovery hold-while-connected loop. */
         if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_SECONDARY)
         {
-            FRKERNEL_vRespond(eXport, "fwaccept: secondary only\r\n");
+            FRKERNEL_vAck(eXport, bBulk, "fwaccept: secondary only\r\n");
         }
         else
         {
             FOTA_vArmAcceptance();
-            FRKERNEL_vRespond(eXport, "Firmware acceptance ARMED - awaiting OtaPrep\r\n");
+            FRKERNEL_vAck(eXport, bBulk, "Firmware acceptance ARMED - awaiting OtaPrep\r\n");
         }
     }
     else if (strcmp(p, "fwaccept off") == 0)
     {
         FOTA_vDisarmAcceptance();
-        FRKERNEL_vRespond(eXport, "Firmware acceptance disarmed\r\n");
+        FRKERNEL_vAck(eXport, bBulk, "Firmware acceptance disarmed\r\n");
     }
     else if (strcmp(p, "fwdistribute") == 0)
     {
@@ -430,22 +495,22 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
          * hold-while-connected loop runs FOTA_vDistribute(). */
         if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_PRIMARY)
         {
-            FRKERNEL_vRespond(eXport, "fwdistribute: primary only\r\n");
+            FRKERNEL_vAck(eXport, bBulk, "fwdistribute: primary only\r\n");
         }
         else if (FOTA_bRequestDistribute())
         {
-            FRKERNEL_vRespond(eXport, "Firmware distribute requested\r\n");
+            FRKERNEL_vAck(eXport, bBulk, "Firmware distribute requested\r\n");
         }
         else
         {
-            FRKERNEL_vRespond(eXport, "fwdistribute: no valid image staged\r\n");
+            FRKERNEL_vAck(eXport, bBulk, "fwdistribute: no valid image staged\r\n");
         }
     }
     else if (strcmp(p, "flash clear") == 0)
     {
         /* Routed through the DbgLog consumer so it can't race log writes. */
         DBGLOG_vRequestErase();
-        FRKERNEL_vRespond(eXport, "Ext-flash log erase requested\r\n");
+        FRKERNEL_vAck(eXport, bBulk, "Ext-flash log erase requested\r\n");
     }
     else if (strcmp(p, "flash eraseall") == 0)
     {
@@ -454,7 +519,7 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
          * with the log — deliberate full field-unit reset, not routine
          * maintenance, hence the distinct command name from "flash clear". */
         DBGLOG_vRequestEraseAll();
-        FRKERNEL_vRespond(eXport, "Full ext-flash erase requested (log + staged OTA image)\r\n");
+        FRKERNEL_vAck(eXport, bBulk, "Full ext-flash erase requested (log + staged OTA image)\r\n");
     }
     else if (strcmp(p, "flash stream") == 0)
     {
@@ -482,7 +547,7 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
          * (deferred to the movement task). Both avoid racing their owners. */
         DBGLOG_vRequestErase();
         ACCLOG_vRequestErase();
-        FRKERNEL_vRespond(eXport, "MicroSD wipe requested (logs + acc data)\r\n");
+        FRKERNEL_vAck(eXport, bBulk, "MicroSD wipe requested (logs + acc data)\r\n");
     }
     else if (strcmp(p, "sd log stream") == 0)
     {
@@ -493,7 +558,7 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
     else
     {
         snprintf(resp, sizeof(resp), "Unknown: '%s'. Try 'tag -help'\r\n", p);
-        FRKERNEL_vRespond(eXport, resp);
+        FRKERNEL_vAck(eXport, bBulk, resp);
     }
 }
 #endif /* FRKERNEL_INTERFACE_UART || FRKERNEL_INTERFACE_LORA */
