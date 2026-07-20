@@ -66,7 +66,13 @@ typedef enum {
     MeshPktType_OtaPrepAck = 7,  /* secondary: joins the session           */
     MeshPktType_OtaChunk   = 8,  /* primary bcast: one image chunk         */
     MeshPktType_OtaPoll    = 9,  /* primary: request one target's report   */
-    MeshPktType_OtaReport  = 10  /* secondary: missing bitmap / verdict    */
+    MeshPktType_OtaReport  = 10, /* secondary: missing bitmap / verdict    */
+
+    MeshPktType_BasicBeacon = 11 /* secondary in basic mode: TX-only beacon
+                                   * at ~10 s (± jitter). Carries cached
+                                   * last-known GPS + age (no live fix),
+                                   * no dreq/hops/wave. See
+                                   * MeshPktBasicBeacon_t below. */
 } MeshPktType_e;
 
 /* ---- Wake-up interval enum ---- */
@@ -78,6 +84,25 @@ typedef enum {
     WAKEUP_INTERVAL_MAX_COUNT = 4
 } WakeupInterval;
 
+/* ---- Discovery mode enum ----
+ *   ADVANCED: full mesh campaign — DReq waves, per-node beacon-on-DReq,
+ *             forwarding. Original behavior.
+ *   BASIC   : each secondary independently TX-beacons at ~10 s (± jitter);
+ *             the primary passively listens for 60 s every 15 min and
+ *             accumulates a RAM store, flushed to the fr9 at each
+ *             WakeupInterval boundary. No DReq campaign, no forwarding.
+ *
+ * The mode is a system-wide setting owned by fr9 (movementAlarm.
+ * nightZoneLevels.holdSecond.value), fetched by the primary via
+ * AT+SETREQ, and distributed to secondaries in every TimeSync — a
+ * secondary applies the received mode before its next scheduled wake.
+ * Cold-boot default on every node is ADVANCED (safe fallback with full
+ * mesh info) until the first TimeSync flips it. */
+typedef enum {
+    DISCOVERY_MODE_ADVANCED = 0,
+    DISCOVERY_MODE_BASIC    = 1
+} DiscoveryMode_e;
+
 /* ---- On-wire packet structs ---- */
 typedef struct {
     uint32_t u32DreqId;
@@ -88,6 +113,10 @@ typedef struct {
     uint32_t u32BeaconMsgId;
     uint8_t  dreqWaveDisc;
     uint8_t  u8MoveState;    /* 0 = moving, 1 = still */
+    uint8_t  u8FwPatch;      /* sender's VERSION_SW_PATCH — logged per-neighbor
+                              * so "did unit X pick up the latest OTA" is
+                              * answerable from the fr9 flash log without
+                              * touching each device with `tag <ID> fwver`. */
     bool     bGpsValid;      /* true if i32Lat/Lon hold a real fix */
     int32_t  i32LatUDeg;     /* latitude  in microdegrees (10^-6 deg) */
     int32_t  i32LonUDeg;     /* longitude in microdegrees (10^-6 deg) */
@@ -102,6 +131,25 @@ typedef struct {
     uint32_t u32AckedIds[MESH_MAX_ACK_IDS_PER_PACKET];
 } MeshPktDAck_t;
 
+/* Basic-mode beacon (see MeshPktType_BasicBeacon). Populated on the
+ * secondary from cached last-known GPS + its age (no live fix); no dreq,
+ * no hops, no wave. u32BeaconMsgId is monotonic per-boot per-device and
+ * lets the primary's RAM store discard stale re-arrivals (newer-msgid
+ * wins). */
+typedef struct {
+    uint32_t u32DeviceId;
+    uint32_t u32BeaconMsgId;
+    uint16_t u16BatMv;
+    uint8_t  u8MoveState;    /* 0 = moving, 1 = still */
+    uint8_t  u8FwPatch;      /* sender's VERSION_SW_PATCH */
+    bool     bGpsValid;      /* true if i32Lat/Lon hold a cached fix */
+    int32_t  i32LatUDeg;     /* latitude  in microdegrees (10^-6 deg) */
+    int32_t  i32LonUDeg;     /* longitude in microdegrees (10^-6 deg) */
+    uint32_t u32GpsAgeS;     /* age in seconds of that cached fix (only
+                              * meaningful when bGpsValid) */
+    int16_t  i16Rssi;        /* only set on receive */
+} MeshPktBasicBeacon_t;
+
 typedef struct {
     uint32_t     u32UtcTimestamp;
     WakeupInterval tWakeupInterval;
@@ -113,6 +161,12 @@ typedef struct {
                                         * whether an update is available
                                         * without a dedicated OtaPrep round
                                         * trip. */
+    DiscoveryMode_e eMode;            /* system-wide discovery mode — see
+                                        * DiscoveryMode_e above */
+    bool         bGpsEnabled;         /* system-wide GPS-active flag. false
+                                        * turns every GPS_vRequestFix() into
+                                        * a no-op (cached last-known fix
+                                        * keeps aging). */
 } MeshPktTimeSync_t;
 
 /* ---- Forward ring ---- */
@@ -134,6 +188,7 @@ typedef struct {
     uint16_t u16BatMv;
     uint8_t  u8HopCount;
     uint8_t  u8DreqWaveDiscovered;
+    uint8_t  u8FwPatch;        /* sender's VERSION_SW_PATCH from beacon */
     uint8_t  u8MoveState : 1;  /* 0 = moving, 1 = still */
     uint8_t  bGpsValid   : 1;  /* 1 = i32Lat/LonUDeg hold a fix */
     bool     bAcked;
@@ -161,6 +216,7 @@ typedef struct {
     uint16_t u16BatMv;
     uint8_t  u8Wave;
     uint8_t  u8MoveState;    /* 0 = moving, 1 = still */
+    uint8_t  u8FwPatch;      /* neighbor's VERSION_SW_PATCH from beacon */
     bool     bGpsValid;
     int32_t  i32LatUDeg;     /* latitude  in microdegrees */
     int32_t  i32LonUDeg;     /* longitude in microdegrees */
@@ -173,7 +229,18 @@ void MESHNETWORK_vParserTask(void *pvParameters);
 bool MESHNETWORK_bStartDiscoveryRound(uint32_t u32DreqId);
 void MESHNETWORK_vSendTimeSync(uint32_t u32UtcTimestamp,
                                WakeupInterval tWakeupInterval,
-                               uint32_t u32StagedFwVersion);
+                               uint32_t u32StagedFwVersion,
+                               DiscoveryMode_e eMode,
+                               bool bGpsEnabled);
+
+/* Discovery-mode + GPS-enable state. Set by the primary from the fr9's
+ * AT+SETREQ response and by every secondary from the last received
+ * TimeSync. Getters return the currently-applied value; cold-boot default
+ * is ADVANCED + GPS enabled. */
+void            MESHNETWORK_vSetDiscoveryMode(DiscoveryMode_e eMode);
+DiscoveryMode_e MESHNETWORK_eGetDiscoveryMode(void);
+void            MESHNETWORK_vSetGpsEnabled(bool bEnabled);
+bool            MESHNETWORK_bGetGpsEnabled(void);
 
 /* Stop whatever dreq this node is currently beaconing (secondary campaign end —
  * the caller doesn't know the node's internal beacon dreq id). */
@@ -184,6 +251,43 @@ bool MESHNETWORK_bGetDiscoveredNeighbors(MeshDiscoveredNeighbor_t *pBuffer,
                                          uint16_t u16MaxEntries,
                                          uint16_t *pu16ActualEntries);
 void MESHNETWORK_vClearDiscoveredNeighbors(void);
+
+/* Basic-mode beacon TX (secondary). Reads local BAT / MOVE / VERSION_SW_PATCH
+ * / GPS_bGetLastKnownFix and TX-only broadcasts a MeshPktType_BasicBeacon.
+ * No RX, no wait — sends and returns. Called from the basic-mode 10 s
+ * wake in DeviceDiscovery. */
+void MESHNETWORK_vSendBasicBeacon(void);
+
+/* Basic-mode primary RAM store: one entry per unique DeviceId, updated
+ * on each MeshPktType_BasicBeacon received during the 15-min listen
+ * window (newer BeaconMsgId wins, older is ignored). Flushed to the fr9
+ * at each WakeupInterval boundary via FARMRANGER_bLogBasicData and then
+ * cleared. Column set differs from the advanced-mode neighbor table (no
+ * hops / wave / RSSI, has GPS-age) so it uses its own struct + row
+ * format on the Farmranger side. */
+typedef struct {
+    uint32_t u32DeviceId;
+    uint32_t u32BeaconMsgId;  /* update key: incoming replaces stored only
+                                * when incoming > stored */
+    uint16_t u16BatMv;
+    uint8_t  u8MoveState;
+    uint8_t  u8FwPatch;
+    bool     bGpsValid;
+    int32_t  i32LatUDeg;
+    int32_t  i32LonUDeg;
+    uint32_t u32GpsAgeS;
+} MeshBasicNeighbor_t;
+
+/* Cap on the basic-mode RAM store (small deliberately — basic mode is
+ * for small remote groups). Callers stack-allocate a copy at this size
+ * before calling MESHNETWORK_bGetBasicNeighbors, so it lives in the
+ * public header. */
+#define MESH_MAX_BASIC_NEIGHBORS    32U
+
+bool MESHNETWORK_bGetBasicNeighbors(MeshBasicNeighbor_t *pBuffer,
+                                    uint16_t u16MaxEntries,
+                                    uint16_t *pu16ActualEntries);
+void MESHNETWORK_vClearBasicNeighbors(void);
 
 uint32_t MESHNETWORK_u32GenerateGlobalMsgID(void);
 

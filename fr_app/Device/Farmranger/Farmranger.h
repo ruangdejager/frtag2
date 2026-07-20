@@ -34,8 +34,23 @@ void     FARMRANGER_vNotifyOnRX(void);         /* Called from UART ISR — do no
 bool     FARMRANGER_bDeviceOn(void);
 void     FARMRANGER_vDeviceOff(void);
 uint64_t FARMRANGER_u64RequestTimestamp(void);
-uint8_t  FARMRANGER_u8RequestInterval(void);
+/* Fetch the primary's per-system settings from the logger in one AT round
+ * trip: wake interval (min), discovery mode (false=advanced, true=basic),
+ * GPS enable (false=disabled/battery-save, true=normal). Returns true on
+ * a fully-parsed response; on false the caller keeps its previous
+ * defaults. Wire format is documented in FARMRANGER_bRequestSettings's
+ * definition and the fr9-side FRTAG_vSetReqHandler. */
+bool     FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
+                                     bool    *pbBasicMode,
+                                     bool    *pbGpsEnabled);
 bool     FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count);
+
+/* Basic-mode variant: uploads the primary's accumulated MeshBasicNeighbor_t
+ * RAM store to fr9 (same AT+LOG framing, different per-row column set —
+ * see FARMRANGER_iFormatBasicRow). Called at each WakeupInterval boundary
+ * in basic mode. fr9 side treats the payload as opaque bytes so no
+ * parser change is needed there. */
+bool     FARMRANGER_bLogBasicData(MeshBasicNeighbor_t *neighbors, uint16_t count);
 
 /* ---- Firmware-file pull (OTA acquire, see Worker/OtaUpdate) ----
  * Protocol (tag is master): AT+FWREQ queries what the logger holds, answered

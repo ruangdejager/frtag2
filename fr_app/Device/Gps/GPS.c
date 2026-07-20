@@ -17,6 +17,7 @@
 #include "dbg_log.h"
 #include "Debug.h"
 #include "hal_system.h"
+#include "MeshNetwork.h"      /* MESHNETWORK_bGetGpsEnabled() */
 
 #include <limits.h>
 
@@ -402,6 +403,21 @@ void GPS_vRequestFix(bool bAutoShutdownIn, uint32_t u32TtffTimeoutS)
      * ENABLE_GPS not defined). The wake-schedule task fires this
      * unconditionally on every cycle, so being defensive here is required. */
     if (xGpsLock == NULL || xGpsResultFlags == NULL) return;
+
+    /* ---- System-wide GPS enable gate ----
+     * fr9 can turn all GPS activity off via
+     * movementAlarm.nightZoneLevels.holdFirst — carried in TimeSync and
+     * mirrored into MeshNetwork's bCurrentGpsEnabled. When disabled we
+     * skip every GPS peripheral touch (no power-on, no dispatcher kick,
+     * no sleep-lock ref). Cached last-known fix keeps aging in place;
+     * callers that need position (basic-mode beacons) read it via
+     * GPS_bGetLastKnownFix and stamp its age. Deliberately outside the
+     * xGpsLock: no state to protect, and stays cheap on the hot path. */
+    if (!MESHNETWORK_bGetGpsEnabled())
+    {
+        DBG("gps: request skipped - GPS disabled by system settings\r\n");
+        return;
+    }
 
     osMutexAcquire(xGpsLock, osWaitForever);
 

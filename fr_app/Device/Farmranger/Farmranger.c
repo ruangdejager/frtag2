@@ -112,7 +112,7 @@ static bool FARMRANGER_bATSend(const char *cmd,
                                uint32_t timeout);
 static void FARMRANGER_vATHandlerTask(void *args);
 static bool FARMRANGER_bParseTimestamp(const char *line, void *ctx);
-static bool FARMRANGER_bParseInterval(const char *line, void *ctx);
+static bool FARMRANGER_bParseSettings(const char *line, void *ctx);
 static bool FARMRANGER_bParseLoggerReady(const char *line, void *ctx);
 static bool FARMRANGER_bParseLogVerdict(const char *line, void *ctx);
 static bool FARMRANGER_bParseRDY(const char *line, void *ctx);
@@ -389,24 +389,55 @@ uint64_t FARMRANGER_u64RequestTimestamp(void)
 }
 
 /* --------------------------------------------------------------------------
- * FARMRANGER_u8RequestInterval
+ * FARMRANGER_bRequestSettings
+ *
+ * Fetch the three per-system settings the primary needs at the start of
+ * every wake, in one AT round trip. Response wire format on the fr9 side
+ * (see FRTAG_vSetReqHandler in fr9_application/fr_app/src/frtag.c):
+ *
+ *     "<interval_min>,<basic_mode>,<gps_enabled>\r\n"
+ *
+ * where basic_mode and gps_enabled are 0 or 1. Any bogus/short response
+ * leaves the outputs untouched and returns false; caller keeps its
+ * previous defaults (safe cold-boot behavior).
  * -------------------------------------------------------------------------- */
-uint8_t FARMRANGER_u8RequestInterval(void)
+bool FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
+                                 bool    *pbBasicMode,
+                                 bool    *pbGpsEnabled)
 {
-    char    intStr[32] = {0};
-    uint8_t intValue   = 0;
+    char respBuf[32] = {0};
 
-    if (FARMRANGER_bATSend("AT+INTREQ\r\n",
-                           FARMRANGER_bParseInterval,
-                           intStr,
-                           sizeof(intStr),
-                           intStr,
-                           10000))
+    if (!FARMRANGER_bATSend("AT+SETREQ\r\n",
+                            FARMRANGER_bParseSettings,
+                            respBuf,
+                            sizeof(respBuf),
+                            respBuf,
+                            10000))
     {
-        intValue = (uint8_t)strtoull(intStr, NULL, 10);
+        return false;
     }
 
-    return intValue;
+    /* Parse "<int>,<mode>,<gps>" (line stripped of trailing CRLF by the
+     * parser). All three fields must be present and numeric or we reject
+     * — safer to fall back to caller defaults than partial apply. */
+    char *p = respBuf;
+    char *endptr;
+
+    unsigned long ulInterval = strtoul(p, &endptr, 10);
+    if (endptr == p || *endptr != ',') return false;
+    p = endptr + 1;
+
+    unsigned long ulMode = strtoul(p, &endptr, 10);
+    if (endptr == p || *endptr != ',') return false;
+    p = endptr + 1;
+
+    unsigned long ulGps = strtoul(p, &endptr, 10);
+    if (endptr == p) return false;
+
+    if (pu8Interval)  *pu8Interval  = (uint8_t)ulInterval;
+    if (pbBasicMode)  *pbBasicMode  = (ulMode != 0UL);
+    if (pbGpsEnabled) *pbGpsEnabled = (ulGps  != 0UL);
+    return true;
 }
 
 /* --------------------------------------------------------------------------
@@ -430,8 +461,10 @@ uint8_t FARMRANGER_u8RequestInterval(void)
  * count, or <=0 / >=FR_CSV_ROW_MAX on error. */
 static int FARMRANGER_iFormatRow(char *row, const MeshDiscoveredNeighbor_t *n)
 {
+    /* Column order (must match fr9-side DBG_LOG header in FRTAG_vLogCmdHandler):
+     * DeviceId, Hops, RSSI, BatMv, Wave, Move, Lat, Lon, FwPatch */
     return snprintf(row, FR_CSV_ROW_MAX,
-                    "%X,%u,%d,%u,%u,%u,%ld,%ld\t",
+                    "%X,%u,%d,%u,%u,%u,%ld,%ld,%u\t",
                     (unsigned int)n->u32DeviceId,
                     n->u8HopCount,
                     n->i16Rssi,
@@ -439,7 +472,8 @@ static int FARMRANGER_iFormatRow(char *row, const MeshDiscoveredNeighbor_t *n)
                     n->u8Wave,
                     n->u8MoveState,
                     (long)n->i32LatUDeg,
-                    (long)n->i32LonUDeg);
+                    (long)n->i32LonUDeg,
+                    n->u8FwPatch);
 }
 
 /* Upload retry policy. The fr9 signals a failed transfer (bytes lost on the
@@ -580,6 +614,119 @@ static bool FARMRANGER_bLogAttempt(const MeshDiscoveredNeighbor_t *neighbors,
 
     DBG_LOG("LogData: Step 3 OK (verdict='%c')\r\n", cVerdict);
     return true;
+}
+
+/* Basic-mode row format for the primary's periodic flush. Different
+ * column set from FARMRANGER_iFormatRow — no hops/wave/RSSI (there's
+ * no mesh campaign in basic mode), has GPS age. Consumed the same way
+ * on fr9 (opaque byte stream, "\t" record delimiter — see
+ * FRTAG_vLogCmdHandler in fr9's frtag.c), so no fr9-side parser change
+ * is required; the flash-log dump just shows a different column count
+ * per row in basic-mode uploads vs advanced-mode uploads. */
+static int FARMRANGER_iFormatBasicRow(char *row, const MeshBasicNeighbor_t *n)
+{
+    return snprintf(row, FR_CSV_ROW_MAX,
+                    "%X,%u,%u,%u,%ld,%ld,%lu\t",
+                    (unsigned int)n->u32DeviceId,
+                    n->u16BatMv,
+                    n->u8MoveState,
+                    n->u8FwPatch,
+                    n->bGpsValid ? (long)n->i32LatUDeg : 0L,
+                    n->bGpsValid ? (long)n->i32LonUDeg : 0L,
+                    n->bGpsValid ? (unsigned long)n->u32GpsAgeS : 0UL);
+}
+
+static bool FARMRANGER_bLogBasicAttempt(const MeshBasicNeighbor_t *neighbors,
+                                        uint16_t count, size_t pos)
+{
+    /* Structurally identical to FARMRANGER_bLogAttempt but formats via
+     * iFormatBasicRow. Kept as a parallel function rather than a
+     * callback-parameterized shared body so the fast advanced-mode path
+     * stays function-pointer-free (matters on this small MCU) and the
+     * two column sets can drift independently without cross-impact. */
+    char row[FR_CSV_ROW_MAX];
+
+    char cmd[32];
+    int n = snprintf(cmd, sizeof(cmd), "AT+LOG=%u\r\n", (unsigned)pos);
+    if (n <= 0) return false;
+
+    char respBuf[32] = {0};
+    if (!FARMRANGER_bATSend(cmd, FARMRANGER_bParseLoggerReady, respBuf, sizeof(respBuf), NULL, 3000))
+    {
+        DBG_LOG("LogData: No 'Logger ready' received (basic Step 1 fail).\r\n");
+        EVTLOG(LOG_FRLOG_ERROR, 1);
+        return false;
+    }
+
+    for (uint16_t i = 0; i < count; i++)
+    {
+        int rn = FARMRANGER_iFormatBasicRow(row, &neighbors[i]);
+        if (rn <= 0 || rn >= (int)sizeof(row))
+            return false;
+        for (int b = 0; b < rn; b++)
+            FR_DRIVER_vUartPutByte(&farmranger.UartHandle, (uint8_t)row[b]);
+        while (!HAL_UART_bTxIdle(&farmranger.UartHandle)) osDelay(1);
+        osDelay(FR_LOG_ROW_GAP_MS);
+    }
+
+    char cVerdict     = '?';
+    uint32_t u32Start = osKernelGetTickCount();
+    bool bGotVerdict  = false;
+    FrRxLine_t line;
+    while ((osKernelGetTickCount() - u32Start) < FR_LOG_VERDICT_MS)
+    {
+        if (osMessageQueueGet(xLineQueue, &line, NULL, 50U) == osOK)
+        {
+            if (FARMRANGER_bParseLogVerdict(line.data, &cVerdict))
+            {
+                bGotVerdict = true;
+                break;
+            }
+        }
+    }
+
+    if (!bGotVerdict)
+    {
+        DBG_LOG("LogData: no verdict received (basic Step 3 timeout).\r\n");
+        return false;
+    }
+    if (cVerdict != 'O')
+    {
+        DBG_LOG("LogData: fr9 reported ERR on basic-mode flush.\r\n");
+        return false;
+    }
+    return true;
+}
+
+bool FARMRANGER_bLogBasicData(MeshBasicNeighbor_t *neighbors, uint16_t count)
+{
+    char   row[FR_CSV_ROW_MAX];
+    size_t pos = 0;
+
+    for (uint16_t i = 0; i < count; i++)
+    {
+        int n = FARMRANGER_iFormatBasicRow(row, &neighbors[i]);
+        if (n <= 0 || n >= (int)sizeof(row))
+            return false;
+        pos += (size_t)n;
+    }
+
+    for (uint8_t u8Attempt = 1U; u8Attempt <= FR_LOG_ATTEMPTS; u8Attempt++)
+    {
+        if (FARMRANGER_bLogBasicAttempt(neighbors, count, pos))
+        {
+            if (u8Attempt > 1U)
+                DBG_LOG("LogData: basic upload OK on attempt %u\r\n", u8Attempt);
+            return true;
+        }
+        if (u8Attempt < FR_LOG_ATTEMPTS)
+        {
+            DBG_LOG("LogData: basic attempt %u failed, retrying...\r\n", u8Attempt);
+            osDelay(FR_LOG_RETRY_DELAY_MS);
+        }
+    }
+    DBG_LOG("LogData: basic all %u attempts failed\r\n", FR_LOG_ATTEMPTS);
+    return false;
 }
 
 bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
@@ -828,22 +975,25 @@ static bool FARMRANGER_bParseTimestamp(const char *line, void *ctx)
     return false;
 }
 
-static bool FARMRANGER_bParseInterval(const char *line, void *ctx)
+/* Parse the AT+SETREQ response: "<int>,<mode>,<gps>\r\n" (up to ~12 B).
+ * Only lightly validated here — the tighter numeric parse happens in
+ * FARMRANGER_bRequestSettings after CRLF strip. We just accept any line
+ * that ends in "\r\n" and copy the pre-CRLF part into ctx. */
+static bool FARMRANGER_bParseSettings(const char *line, void *ctx)
 {
     char  *out = (char *)ctx;
     size_t len = strlen(line);
 
-    /* Expect: 1-3 digits + "\r\n" */
-    if (len >= 3 && len < 6 && line[len - 2] == '\r' && line[len - 1] == '\n')
-    {
-        for (size_t i = 0; i < len - 2; i++)
-            if (line[i] < '0' || line[i] > '9') return false;
+    /* Need at least "0,0,0\r\n" = 7 bytes, cap at whatever the ATSend
+     * caller sized its buffer to (sizeof(respBuf) in FARMRANGER_bRequestSettings). */
+    if (len < 7 || line[len - 2] != '\r' || line[len - 1] != '\n')
+        return false;
 
-        memcpy(out, line, len - 2);
-        out[len - 2] = '\0';
-        return true;
-    }
-    return false;
+    if (len - 2 >= 32) return false;   /* would overflow the 32-B respBuf */
+
+    memcpy(out, line, len - 2);
+    out[len - 2] = '\0';
+    return true;
 }
 
 static bool FARMRANGER_bParseLoggerReady(const char *line, void *ctx)

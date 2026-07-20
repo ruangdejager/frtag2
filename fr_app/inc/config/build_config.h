@@ -30,8 +30,8 @@
  * See fr_app/Worker/FrKernel/FrKernel_Config.h.
  * -------------------------------------------------------------------------- */
 // #define FRKERNEL_INTERFACE_UART        /* debug UART (bench use) */
-// #define FRKERNEL_INTERFACE_LORA        /* LoRa radio (deployed secondary) */
-#define FRKERNEL_INTERFACE_LORA_BRIDGE    /* UART<->LoRa relay (bench test rig) */
+ #define FRKERNEL_INTERFACE_LORA        /* LoRa radio (deployed secondary) */
+//#define FRKERNEL_INTERFACE_LORA_BRIDGE    /* UART<->LoRa relay (bench test rig) */
 
 /* --------------------------------------------------------------------------
  * Persistent-storage backend — select exactly one. Mutually exclusive

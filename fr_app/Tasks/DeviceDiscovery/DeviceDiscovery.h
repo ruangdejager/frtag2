@@ -44,6 +44,16 @@
  * asynchronously; the AppTask never blocks waiting for it. */
 #define DEVICE_DISCOVERY_GPS_PRETRIGGER_S   180U          /* 3 minutes              */
 
+/* Basic-mode primary passive-listen cadence + duration. Independent of
+ * WakeupInterval: the primary opens a 60 s RX window every 15 min and
+ * accumulates heard BasicBeacons into a RAM store; the accumulated
+ * store is then flushed to fr9 at each WakeupInterval boundary and
+ * cleared. If WakeupInterval == 15 min the two coincide on every wake;
+ * for larger intervals (30/60/120) the primary listens 2/4/8 times
+ * per flush. See the basic-mode branch of DEVICE_DISCOVERY_vAppTask. */
+#define DEVICE_DISCOVERY_BASIC_LISTEN_PERIOD_S    (15U * 60U)
+#define DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_MS   (60U * 1000U)
+
 /* Kernel wakeup (shake-sequence): how long to wait for the user to start a
  * FrKernel session (send any "tag ..." command) before giving up and letting
  * the device return to deep sleep. */
@@ -97,6 +107,14 @@
 /* osEventFlags bit — set by Movement to bypass deep sleep into FrKernel */
 #define DISCOVERY_KERNEL_BIT                (1UL << 1)
 
+/* osEventFlags bit — set by wakeup-schedule task in basic mode when the
+ * ~10s jittered beacon-TX cadence fires. The AppTask handles this with a
+ * short TX-only path (send one MeshPktType_BasicBeacon, radio back to
+ * sleep, release lock) — no discovery campaign, no RX. See the basic-
+ * mode branch in DEVICE_DISCOVERY_vAppTask and its scheduling in
+ * DEVICE_DISCOVERY_vCheckWakeupScheduleTask. */
+#define DISCOVERY_BASIC_BEACON_BIT          (1UL << 2)
+
 /* Thread flag bit — set by MeshNetwork when a TimeSync packet is received */
 #define DEVICE_DISCOVERY_NOTIFY_TIMESYNC    (1UL << 0)
 
@@ -108,7 +126,7 @@
 #define DEVICE_DISCOVERY_DRIVER_bConnectLogger()             FARMRANGER_bDeviceOn()
 #define DEVICE_DISCOVERY_DRIVER_vDisconnectLogger()          FARMRANGER_vDeviceOff()
 #define DEVICE_DISCOVERY_DRIVER_u64RequestTS()               FARMRANGER_u64RequestTimestamp()
-#define DEVICE_DISCOVERY_DRIVER_u8RequestInterval()          FARMRANGER_u8RequestInterval()
+#define DEVICE_DISCOVERY_DRIVER_bRequestSettings(pi, pm, pg) FARMRANGER_bRequestSettings((pi), (pm), (pg))
 #define DEVICE_DISCOVERY_bSendDiscoveryData(items, size)     FARMRANGER_bLogData(items, size)
 
 /* ---- Production sleep state ---- */
