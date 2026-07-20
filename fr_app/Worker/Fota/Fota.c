@@ -697,7 +697,7 @@ void FOTA_vOnLoraPacket(const uint8_t *pu8Buf, uint16_t u16Len)
                     uint8_t u8ChunkXor = 0U;
                     for (uint8_t i = 0U; i < u8Len; i++)
                         u8ChunkXor ^= au8ChunkMail[i];
-                    DBG_LOG("RXC %u xor=0x%02X\r\n", (unsigned)u16Idx, (unsigned)u8ChunkXor);
+                    DBG("RXC %u xor=0x%02X\r\n", (unsigned)u16Idx, (unsigned)u8ChunkXor);
                 }
 
                 u16ChunkMailIdx = u16Idx;
