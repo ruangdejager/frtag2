@@ -201,13 +201,8 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             DBG_LOG("DeviceDiscovery: Primary basic-mode listen (%u ms)\r\n",
                 (unsigned)DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_MS);
             osDelay(DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_MS);
-            uint16_t u16BasicCount = 0U;
-            {
-                MeshBasicNeighbor_t tTmp[MESH_MAX_BASIC_NEIGHBORS];
-                (void)MESHNETWORK_bGetBasicNeighbors(tTmp, MESH_MAX_BASIC_NEIGHBORS, &u16BasicCount);
-            }
             DBG_LOG("DeviceDiscovery: basic listen end - %u unique nodes in RAM store\r\n",
-                (unsigned)u16BasicCount);
+                (unsigned)MESHNETWORK_u16GetBasicNeighborCount());
         }
         else if (eDeviceRole == DEVICE_ROLE_PRIMARY)
         {
@@ -259,6 +254,18 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         }
         else
         {
+            /* Basic mode: this big-interval wake coincides with a primary
+             * listen boundary. If WakeupInterval == the 15 min listen
+             * period, EVERY primary listen lands on a secondary big wake —
+             * so TX one beacon here too, otherwise the primary would never
+             * hear this secondary (the surrounding TX-window beacons are
+             * suppressed while this wake holds the sleep lock). Harmless in
+             * the larger-interval case (just one extra beacon the primary
+             * also hears). The RX wait below then catches the primary's
+             * TimeSync for RTC + any mode/interval/gps change. */
+            if (MESHNETWORK_eGetDiscoveryMode() == DISCOVERY_MODE_BASIC)
+                MESHNETWORK_vSendBasicBeacon();
+
             DBG_LOG("DeviceDiscovery %X: Secondary waiting for timesync.\r\n",
                 LORARADIO_u32GetUniqueId());
 
@@ -905,44 +912,71 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             }
         }
 
-        /* --- Basic-mode 10 s jittered beacon (SECONDARY only) ---
-         * Fires between big-interval discovery wakes when the system is
-         * in DISCOVERY_MODE_BASIC. Each firing is a short TX-only wake
-         * (see the AppTask branch that handles DISCOVERY_BASIC_BEACON_BIT).
-         * The next fire time is randomized inside a nominal 10 s window
-         * (5..15 s) so multiple secondaries don't collide on air. The
-         * schedule is suppressed on the same heartbeat as a big-interval
-         * discovery wake (bFireDiscovery), because that path already
-         * covers TX of a beacon plus a full RX for TimeSync. */
+        /* --- Basic-mode jittered beacon TX window (SECONDARY only) ---
+         * When in DISCOVERY_MODE_BASIC, TX beacons ONLY during the window
+         * straddling the primary's 15 min listen: from TX_GUARD_S before
+         * the boundary through the 60 s listen + TX_GUARD_S after. Outside
+         * that window the radio stays asleep (the ~10x efficiency win over
+         * the old always-on 10 s cadence). Within it, beacons are jittered
+         * ~5..10 s apart so multiple secondaries don't collide and the
+         * primary gets several chances to hear each one.
+         *
+         * Phase is against BASIC_LISTEN_PERIOD_S (the primary's fixed
+         * listen cadence), NOT this secondary's WakeupInterval.
+         *
+         * Two guards, both required:
+         *  - !bFireDiscovery: don't also fire on the exact boundary
+         *    heartbeat, which is a big-interval RX wake (that path TXes
+         *    its own beacon at the start — see the AppTask secondary
+         *    branch — so the primary still hears us even when
+         *    WakeupInterval == the 15 min listen period).
+         *  - SYSTEM_bCheckSleepModeStatus(): only fire when otherwise
+         *    idle (no sleep lock held). Without this, a beacon fired while
+         *    a big wake / GPS / kernel session already holds the lock would
+         *    acquire a second lock that the one-shot AppTask handler never
+         *    balances -> gSleepLockCount leaks and the device never sleeps. */
         static uint64_t u64NextBasicBeaconUtc = 0ULL;
         if (eDeviceRole == DEVICE_ROLE_SECONDARY &&
             MESHNETWORK_eGetDiscoveryMode() == DISCOVERY_MODE_BASIC &&
-            !bFireDiscovery)
+            !bFireDiscovery &&
+            SYSTEM_bCheckSleepModeStatus())
         {
-            if (u64NextBasicBeaconUtc == 0ULL || u64Utc >= u64NextBasicBeaconUtc)
-            {
-                /* 5..15 s uniform — pass-through of the platform's
-                 * rand() which is seeded once at init from the device
-                 * unique id. Any two secondaries deviate on their very
-                 * first roll and the mean spacing stays at 10 s. */
-                uint32_t u32NextDelayS = 5U + (uint32_t)(rand() % 11);
-                u64NextBasicBeaconUtc = u64Utc + (uint64_t)u32NextDelayS;
+            uint32_t u32Phase = (uint32_t)(u64Utc % (uint64_t)DEVICE_DISCOVERY_BASIC_LISTEN_PERIOD_S);
+            bool bInTxWindow =
+                (u32Phase >= (DEVICE_DISCOVERY_BASIC_LISTEN_PERIOD_S - DEVICE_DISCOVERY_BASIC_TX_GUARD_S)) ||
+                (u32Phase <= (DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_S + DEVICE_DISCOVERY_BASIC_TX_GUARD_S));
 
-                if (POWER_tGetState() & (POWER_CLASS_NORMAL | POWER_CLASS_LOW))
+            if (bInTxWindow)
+            {
+                if (u64NextBasicBeaconUtc == 0ULL || u64Utc >= u64NextBasicBeaconUtc)
                 {
-                    SYSTEM_vSleepLockAcquire();
-                    LORARADIO_vWakeUp();
-                    osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_BASIC_BEACON_BIT);
+                    /* 5..10 s uniform. rand() is seeded per device from its
+                     * unique id (DEVICE_DISCOVERY_vInit), so two secondaries
+                     * pick different offsets. */
+                    uint32_t u32NextDelayS = 5U + (uint32_t)(rand() % 6);
+                    u64NextBasicBeaconUtc = u64Utc + (uint64_t)u32NextDelayS;
+
+                    if (POWER_tGetState() & (POWER_CLASS_NORMAL | POWER_CLASS_LOW))
+                    {
+                        SYSTEM_vSleepLockAcquire();
+                        LORARADIO_vWakeUp();
+                        osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_BASIC_BEACON_BIT);
+                    }
                 }
+            }
+            else
+            {
+                /* Outside the TX window — arm so the first beacon of the
+                 * next window fires immediately on entry rather than
+                 * waiting out a stale (pre-window) target time. */
+                u64NextBasicBeaconUtc = 0ULL;
             }
         }
         else if (eDeviceRole == DEVICE_ROLE_SECONDARY &&
                  MESHNETWORK_eGetDiscoveryMode() != DISCOVERY_MODE_BASIC)
         {
-            /* Reset the schedule on mode flip-back to advanced so a
-             * subsequent flip back to basic starts a fresh window
-             * from now rather than firing immediately on some
-             * hours-in-the-past target. */
+            /* Reset on flip-back to advanced so a later flip to basic
+             * starts fresh rather than firing on a stale target. */
             u64NextBasicBeaconUtc = 0ULL;
         }
 

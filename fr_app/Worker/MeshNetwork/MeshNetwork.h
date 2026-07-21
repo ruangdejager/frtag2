@@ -289,6 +289,10 @@ bool MESHNETWORK_bGetBasicNeighbors(MeshBasicNeighbor_t *pBuffer,
                                     uint16_t *pu16ActualEntries);
 void MESHNETWORK_vClearBasicNeighbors(void);
 
+/* Cheap count of unique nodes currently in the basic-mode RAM store —
+ * avoids stack-copying the whole table just to log a count. */
+uint16_t MESHNETWORK_u16GetBasicNeighborCount(void);
+
 uint32_t MESHNETWORK_u32GenerateGlobalMsgID(void);
 
 void          MESHNETWORK_vSetWakeupInterval(WakeupInterval tNewInterval);

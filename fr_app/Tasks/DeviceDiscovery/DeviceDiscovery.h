@@ -52,7 +52,21 @@
  * for larger intervals (30/60/120) the primary listens 2/4/8 times
  * per flush. See the basic-mode branch of DEVICE_DISCOVERY_vAppTask. */
 #define DEVICE_DISCOVERY_BASIC_LISTEN_PERIOD_S    (15U * 60U)
-#define DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_MS   (60U * 1000U)
+#define DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_S    60U
+#define DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_MS   (DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_S * 1000U)
+
+/* Secondary basic-mode TX efficiency: instead of transmitting a beacon
+ * every ~10 s around the clock (of which the primary hears only the 60 s
+ * it listens per 15 min), the secondary confines its jittered beacon TX
+ * to a window straddling the primary's listen — starting
+ * DEVICE_DISCOVERY_BASIC_TX_GUARD_S before the 15 min boundary and ending
+ * the same guard after the 60 s listen. The guard absorbs the primary's
+ * ~5 s wake buffer plus RTC drift between nodes. Phase is measured against
+ * BASIC_LISTEN_PERIOD_S (the primary's fixed listen cadence), NOT the
+ * secondary's own WakeupInterval. Outside this window the radio stays
+ * asleep — roughly a 10x cut in secondary TX airtime/battery vs the old
+ * always-on cadence. */
+#define DEVICE_DISCOVERY_BASIC_TX_GUARD_S         10U
 
 /* Kernel wakeup (shake-sequence): how long to wait for the user to start a
  * FrKernel session (send any "tag ..." command) before giving up and letting

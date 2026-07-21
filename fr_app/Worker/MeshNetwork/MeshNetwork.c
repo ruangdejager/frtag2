@@ -1046,6 +1046,13 @@ void MESHNETWORK_vClearBasicNeighbors(void)
     osMutexRelease(xNeighborTableMutex);
 }
 
+uint16_t MESHNETWORK_u16GetBasicNeighborCount(void)
+{
+    /* Plain read of a uint16_t — atomic on Cortex-M4; no mutex needed just
+     * to log a count. */
+    return u16BasicNeighborCount;
+}
+
 static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
                                      size_t u32Len,
                                      int16_t s16Rssi)

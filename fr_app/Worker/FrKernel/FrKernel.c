@@ -301,6 +301,22 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
     {
         snprintf(resp, sizeof(resp), "Device ID: %04" PRIX32 "\r\n",
                  LORARADIO_u32GetUniqueId());
+#ifdef FRKERNEL_INTERFACE_LORA
+        /* Collision avoidance: on a broadcast scan EVERY listening device
+         * hears this at the same instant and would otherwise TX its reply
+         * simultaneously — on a shared channel they collide and the kernel
+         * decodes at most one. Spread the replies uniformly across a 5 s
+         * window so they land at different times. rand() is seeded per
+         * device from its unique id (DEVICE_DISCOVERY_vInit), so two
+         * devices pick different offsets. Runs on the FrKernel task, so
+         * blocking here is fine; a scan has nothing else time-critical.
+         * UART is a single device on the wire — no spread needed there. */
+        if (eXport == FRKERNEL_XPORT_LORA)
+        {
+            uint32_t u32JitterMs = (uint32_t)(rand() % 5000);
+            osDelay(u32JitterMs);
+        }
+#endif
         FRKERNEL_vRespond(eXport, resp);
 #ifdef FRKERNEL_INTERFACE_UART
         if (eXport == FRKERNEL_XPORT_UART)
