@@ -23,7 +23,7 @@
 
 #define VERSION_SW_MAJOR    1
 #define VERSION_SW_MINOR    0
-#define VERSION_SW_PATCH    19
+#define VERSION_SW_PATCH    20
 
 #define VERSION_u32Get()   ((uint32_t)VERSION_SW_MAJOR * 10000UL + \
                             (uint32_t)VERSION_SW_MINOR * 100UL   + \
