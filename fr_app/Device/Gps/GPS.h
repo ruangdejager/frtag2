@@ -155,8 +155,16 @@ void GPS_vInit(void);
  * and updates bAutoShutdown (and the TTFF timeout, if applicable) to the
  * last-caller values. If the board is not in POWER_CLASS_NORMAL the call
  * refuses to power the GPS and sets the NO_POWER result so any concurrent
- * waiter is released. */
-void GPS_vRequestFix(bool bAutoShutdown, uint32_t u32TtffTimeoutS);
+ * waiter is released.
+ *
+ * bForce: when true, bypass the system-wide GPS-enable gate (fr9's
+ * movementAlarm.nightZoneLevels.holdFirst flag distributed via TimeSync).
+ * Reserved for scenarios that MUST have a fix regardless of user
+ * preference — currently only ProductionSleep-exit paths, which need
+ * RTC correction after an unbounded stretch of sleep. Routine callers
+ * (the pre-trigger before every scheduled wake) should pass false so
+ * the user's disable is respected. */
+void GPS_vRequestFix(bool bAutoShutdown, uint32_t u32TtffTimeoutS, bool bForce);
 
 /* Block until the current (or next) session signals a terminal result.
  * Returns the result enum, or GPS_RESULT_FIX_TIMEOUT if u32TimeoutMs

@@ -21,6 +21,8 @@
 
 #include "init.h"
 #include "build_config.h"
+#include "dbg_log.h"
+#include "platform_rtc.h"
 #include "hal_rtc.h"
 #include "hal_timer.h"
 #include "hal_uart.h"
@@ -155,6 +157,21 @@ void INIT_vInitialization(void *parameters)
     SETTINGS_vInit();
 
     HAL_RTC_vInit();
+
+    /* Restore UTC from TAMP backup registers if it survived the reset.
+     * OTA-triggered NVIC_SystemReset() keeps VBAT alive, so the value
+     * persisted by the heartbeat task before the reset is still in
+     * BKP4R/BKP5R — apply it now so log timestamps don't jump back to
+     * 1970 while we wait for the next TimeSync. */
+    {
+        uint64_t u64SavedUtc = 0;
+        if (HAL_RTC_bLoadPersistedUtc(&u64SavedUtc))
+        {
+            RTC_vSetUTC(u64SavedUtc);
+            DBG_LOG("RTC: restored UTC=%lu from backup registers\r\n",
+                    (unsigned long)u64SavedUtc);
+        }
+    }
 
     osDelay(100);
 

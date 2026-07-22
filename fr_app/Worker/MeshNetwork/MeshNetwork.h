@@ -265,17 +265,22 @@ void MESHNETWORK_vSendBasicBeacon(void);
  * cleared. Column set differs from the advanced-mode neighbor table (no
  * hops / wave / RSSI, has GPS-age) so it uses its own struct + row
  * format on the Farmranger side. */
+/* Field order + the u8MoveState/bGpsValid bitfields keep this at 24 bytes
+ * (vs. 28 with naive ordering) — same tight-packing this file already
+ * applies to NeighborEntry_t, needed because this part's RAM is byte-exact
+ * full (see FORWARD_RING_SIZE's comment above). tBasicNeighborTable
+ * [MESH_MAX_BASIC_NEIGHBORS] makes every byte here cost 32x. */
 typedef struct {
     uint32_t u32DeviceId;
     uint32_t u32BeaconMsgId;  /* update key: incoming replaces stored only
                                 * when incoming > stored */
-    uint16_t u16BatMv;
-    uint8_t  u8MoveState;
-    uint8_t  u8FwPatch;
-    bool     bGpsValid;
     int32_t  i32LatUDeg;
     int32_t  i32LonUDeg;
     uint32_t u32GpsAgeS;
+    uint16_t u16BatMv;
+    uint8_t  u8FwPatch;
+    uint8_t  u8MoveState : 1;
+    uint8_t  bGpsValid   : 1;
 } MeshBasicNeighbor_t;
 
 /* Cap on the basic-mode RAM store (small deliberately — basic mode is

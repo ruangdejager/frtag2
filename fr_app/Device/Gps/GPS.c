@@ -397,7 +397,7 @@ static void GPS_vMaybeSyncRtc(uint32_t u32GpsUnixTime)
  * last-caller values.
  * Refuses if board is not in POWER_CLASS_NORMAL — sets NO_POWER result.
  * -------------------------------------------------------------------------- */
-void GPS_vRequestFix(bool bAutoShutdownIn, uint32_t u32TtffTimeoutS)
+void GPS_vRequestFix(bool bAutoShutdownIn, uint32_t u32TtffTimeoutS, bool bForce)
 {
     /* Safe no-op if GPS_vInit() was never called (e.g. PRIMARY device or
      * ENABLE_GPS not defined). The wake-schedule task fires this
@@ -408,14 +408,31 @@ void GPS_vRequestFix(bool bAutoShutdownIn, uint32_t u32TtffTimeoutS)
      * fr9 can turn all GPS activity off via
      * movementAlarm.nightZoneLevels.holdFirst — carried in TimeSync and
      * mirrored into MeshNetwork's bCurrentGpsEnabled. When disabled we
-     * skip every GPS peripheral touch (no power-on, no dispatcher kick,
-     * no sleep-lock ref). Cached last-known fix keeps aging in place;
-     * callers that need position (basic-mode beacons) read it via
-     * GPS_bGetLastKnownFix and stamp its age. Deliberately outside the
-     * xGpsLock: no state to protect, and stays cheap on the hot path. */
-    if (!MESHNETWORK_bGetGpsEnabled())
+     * skip every GPS peripheral touch (no power-on, no dispatcher kick).
+     * Cached last-known fix keeps aging in place; callers that need
+     * position (basic-mode beacons) read it via GPS_bGetLastKnownFix and
+     * stamp its age.
+     *
+     * bForce overrides the gate for callers that MUST have a fix even
+     * when the user has disabled GPS — currently only ProductionSleep
+     * exit paths, which need RTC correction after an unbounded stretch
+     * of sleep. See the bForce docs in GPS.h.
+     *
+     * IMPORTANT: every caller of this function acquires a sleep-lock ref
+     * *before* the call, expecting GPS_vPowerOff() to release it at the
+     * end of the session (fix or timeout). If we early-return without
+     * running a session, that ref never balances — gSleepLockCount
+     * climbs by one per call and the device stops entering STOP2. So
+     * release the caller's ref here too, mirroring what a normal
+     * successful session would have done at its tail. Callers that do
+     * NOT hold a lock (there currently are none) would need to check
+     * the enable flag themselves before acquiring — but a stray extra
+     * release is caught by SYSTEM_vSleepLockRelease's saturating
+     * decrement (see hal_system.c). */
+    if (!bForce && !MESHNETWORK_bGetGpsEnabled())
     {
         DBG("gps: request skipped - GPS disabled by system settings\r\n");
+        SYSTEM_vSleepLockRelease();
         return;
     }
 

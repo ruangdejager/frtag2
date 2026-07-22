@@ -793,7 +793,10 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                 {
                     SYSTEM_vSleepLockAcquire();
                     DBG_LOG("DeviceDiscovery: GPS acquire on ProductionSleep wake (5 min timeout)\r\n");
-                    GPS_vRequestFix(true, 300);
+                    /* bForce=true: RTC correction after unbounded
+                     * ProductionSleep must run even if the user disabled
+                     * routine GPS via fr9. */
+                    GPS_vRequestFix(true, 300, true);
                 }
 
                 /* Open a FrKernel window instead of an autonomous discovery
@@ -827,7 +830,10 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                 {
                     SYSTEM_vSleepLockAcquire();
                     DBG_LOG("DeviceDiscovery: GPS acquire on ProductionSleep wake (5 min timeout)\r\n");
-                    GPS_vRequestFix(true, 300);
+                    /* bForce=true: RTC correction after unbounded
+                     * ProductionSleep must run even if the user disabled
+                     * routine GPS via fr9. */
+                    GPS_vRequestFix(true, 300, true);
                 }
 
                 osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
@@ -1040,8 +1046,10 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
 
             DBG("DeviceDiscovery: GPS pre-trigger\r\n");
             /* auto-shutdown on completion, bounded to GPS_PRETRIGGER_S so it
-             * can never run forever */
-            GPS_vRequestFix(true, 120);
+             * can never run forever. bForce=false: respects the user's
+             * fr9-side GPS-disable setting (unlike the ProductionSleep-exit
+             * paths, which need RTC correction regardless). */
+            GPS_vRequestFix(true, 120, false);
         }
     }
 }
@@ -1116,7 +1124,9 @@ void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
         {
             SYSTEM_vSleepLockAcquire();
             DBG_LOG("DeviceDiscovery: GPS acquire on ProductionSleep wake (5 min timeout)\r\n");
-            GPS_vRequestFix(true, 300);
+            /* bForce=true: same rationale as the solar wake path -
+             * RTC correction after unbounded ProductionSleep. */
+            GPS_vRequestFix(true, 300, true);
         }
     }
 

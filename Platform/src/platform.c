@@ -22,6 +22,7 @@
 #include "hal_rtc.h"
 #include "hal_wdt.h"
 #include "hal_system.h"
+#include "platform_rtc.h"
 
 #include "LoraRadio.h"
 #include "MeshNetwork.h"
@@ -80,6 +81,16 @@ void PLATFORM_vHeartbeatDispatchTask(void *parameters)
 
         /* Housekeeping ---------------------------------------------------- */
         TIME_vTick();
+
+        /* Persist UTC to TAMP backup registers so any reset that keeps
+         * VBAT alive (OTA-triggered, watchdog, brown-out) restores the
+         * clock at boot instead of dropping back to 1970. Gated on
+         * RTC_bIsRtcValid() so we only save real times sourced from
+         * TimeSync (or a previous restore) — not the boot-time counter
+         * value that would fail the range check on write anyway. Two
+         * 32-bit register writes; the cost is trivial. */
+        if (RTC_bIsRtcValid())
+            HAL_RTC_vPersistUtc(RTC_u64GetUTC());
         /* ------------------------------------------------------------------ */
 
         /* Notify all enabled subscribers ----------------------------------- */

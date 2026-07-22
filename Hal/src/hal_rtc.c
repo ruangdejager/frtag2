@@ -20,6 +20,55 @@
 RTC_HandleTypeDef hrtc;
 
 static uint64_t hal_rtc_counter = 7200-5;
+
+/* ---- UTC persistence across resets ----
+ *
+ * TAMP->BKP*R are in the VBAT-backed domain and survive any reset that
+ * doesn't remove backup-domain power (OTA-triggered NVIC_SystemReset,
+ * watchdog, brown-out, etc). We persist the last known UTC into two
+ * slots so a reset doesn't send our clock back to boot-time
+ * hal_rtc_counter (~7200s → 1970-01-01 02:00) and force us to wait for
+ * the next TimeSync just to know what date it is.
+ *
+ * Layout (STM32WLE5 TAMP has BKP0..BKP31):
+ *   BKP0R/BKP1R : owned by Fota (OTA arm magic + staged version)
+ *   BKP2R       : bootloader version (written by bootloader on every boot)
+ *   BKP3R       : deliberately unused, see Fota_Config.h
+ *   BKP4R       : UTC low 32 bits
+ *   BKP5R       : UTC high 32 bits
+ *
+ * A magic marker isn't stored separately — the sanity check on read
+ * (2020..2100 range) is enough to reject a cold-boot 0.
+ *
+ * TAMP writes require the backup domain to be unlocked; the RTC's
+ * MspInit already enables the backup-domain clock (LSE) but the
+ * DBP-enable is done here on demand, since it's cheap and self-
+ * contained. */
+static bool HAL_RTC_bUtcInRange(uint64_t v)
+{
+    return (v >= 1577836800ULL) &&    /* 2020-01-01 */
+           (v <= 4102444800ULL);      /* 2100-01-01 */
+}
+
+bool HAL_RTC_bLoadPersistedUtc(uint64_t *pu64Utc)
+{
+    HAL_PWR_EnableBkUpAccess();
+    uint32_t u32Lo = TAMP->BKP4R;
+    uint32_t u32Hi = TAMP->BKP5R;
+    uint64_t v = ((uint64_t)u32Hi << 32) | (uint64_t)u32Lo;
+    if (!HAL_RTC_bUtcInRange(v)) return false;
+    if (pu64Utc) *pu64Utc = v;
+    return true;
+}
+
+void HAL_RTC_vPersistUtc(uint64_t u64Utc)
+{
+    /* Skip garbage — never persist a value we would refuse to restore. */
+    if (!HAL_RTC_bUtcInRange(u64Utc)) return;
+    HAL_PWR_EnableBkUpAccess();
+    TAMP->BKP4R = (uint32_t)(u64Utc & 0xFFFFFFFFULL);
+    TAMP->BKP5R = (uint32_t)(u64Utc >> 32);
+}
 static rtc_tick_callback_t       one_second_callback = NULL;
 static rtc_hourAlarm_callback_t  one_minute_callback = NULL;
 static rtc_hourAlarm_callback_t  one_hour_callback   = NULL;
