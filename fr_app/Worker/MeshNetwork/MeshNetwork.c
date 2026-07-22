@@ -173,7 +173,8 @@ static const uint8_t u8CurrentWakeupIntervalMin[] = {
     [WAKEUP_INTERVAL_15_MIN]  = 15,
     [WAKEUP_INTERVAL_30_MIN]  = 30,
     [WAKEUP_INTERVAL_60_MIN]  = 60,
-    [WAKEUP_INTERVAL_120_MIN] = 120
+    [WAKEUP_INTERVAL_120_MIN] = 120,
+    [WAKEUP_INTERVAL_240_MIN] = 240
 };
 
 /* ---- Discovery mode + GPS-enable state ----

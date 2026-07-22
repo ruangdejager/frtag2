@@ -452,6 +452,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                     else if (u8WI == 30)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_30_MIN);
                     else if (u8WI == 60)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_60_MIN);
                     else if (u8WI == 120) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_120_MIN);
+                    else if (u8WI == 240) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_240_MIN);
                     MESHNETWORK_vSetDiscoveryMode(bBM ? DISCOVERY_MODE_BASIC
                                                      : DISCOVERY_MODE_ADVANCED);
                     MESHNETWORK_vSetGpsEnabled(bGE);
@@ -539,6 +540,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 else if (u8WakeInterval == 30)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_30_MIN);
                 else if (u8WakeInterval == 60)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_60_MIN);
                 else if (u8WakeInterval == 120) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_120_MIN);
+                else if (u8WakeInterval == 240) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_240_MIN);
 
                 MESHNETWORK_vSetDiscoveryMode(bBasicMode ? DISCOVERY_MODE_BASIC
                                                         : DISCOVERY_MODE_ADVANCED);

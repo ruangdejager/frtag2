@@ -74,6 +74,6 @@
  * Differences smaller than this threshold are treated as within acceptable
  * oscillator drift and the RTC is left unchanged.
  */
-#define GPS_RTC_SYNC_MIN_ERROR_S            30U
+#define GPS_RTC_SYNC_MIN_ERROR_S            5U
 
 #endif /* DEVICE_GPS_GPS_CONFIG_H_ */

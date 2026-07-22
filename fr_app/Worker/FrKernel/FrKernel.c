@@ -383,6 +383,7 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                 "  tag fwver                   app + bootloader version\r\n"
                 "  tag juice                   battery + solar panel voltage (mV)\r\n"
                 "  tag discovery schedule      wakeup interval (min)\r\n"
+                "  tag discovery schedule <N>  set wakeup interval (15/30/60/120/240 min)\r\n"
                 "  tag prodsleep               enter production sleep (secondary only)\r\n"
                 "  tag release                 release device for sleep\r\n"
             );
@@ -397,6 +398,7 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                 "  tag <ID> fwver              app + bootloader version\r\n"
                 "  tag <ID> juice              battery + solar panel voltage (mV)\r\n"
                 "  tag <ID> discovery schedule wakeup interval (min)\r\n"
+                "  tag <ID> discovery schedule <N>  set wakeup interval (15/30/60/120/240)\r\n"
                 "  tag <ID> prodsleep          enter production sleep (secondary only)\r\n"
                 "  tag <ID> release            release device for sleep\r\n"
                 "  tag * <cmd>                 bulk: every device runs <cmd> silently\r\n"
@@ -459,6 +461,41 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                  (unsigned)VERSION_SW_PATCH,
                  (unsigned long)TAMP->BKP2R);
         FRKERNEL_vRespond(eXport, resp);
+    }
+    else if (strncmp(p, "discovery schedule ", 19) == 0)
+    {
+        /* Action variant: "discovery schedule <N>" where N is minutes.
+         * Bulk-capable ("tag * discovery schedule 60") — every listening
+         * device applies the interval locally and DBG_LOGs the result
+         * silently (no over-air reply, see FRKERNEL_vAck). Single-target
+         * ("tag <ID> discovery schedule 60") also works but note the
+         * value will be overwritten by the primary's next TimeSync,
+         * which broadcasts whatever interval the PRIMARY holds — for a
+         * persistent change, bulk the whole fleet (or set fr9's own
+         * minWindow so the primary re-broadcasts it).
+         *
+         * Values must be from the fixed set of WakeupInterval enum
+         * mappings (15/30/60/120/240 min); anything else is rejected. */
+        uint32_t u32Mins = (uint32_t)strtoul(p + 19, NULL, 10);
+        WakeupInterval eNew = WAKEUP_INTERVAL_MAX_COUNT;   /* sentinel */
+        if      (u32Mins == 15U)  eNew = WAKEUP_INTERVAL_15_MIN;
+        else if (u32Mins == 30U)  eNew = WAKEUP_INTERVAL_30_MIN;
+        else if (u32Mins == 60U)  eNew = WAKEUP_INTERVAL_60_MIN;
+        else if (u32Mins == 120U) eNew = WAKEUP_INTERVAL_120_MIN;
+        else if (u32Mins == 240U) eNew = WAKEUP_INTERVAL_240_MIN;
+
+        if (eNew != WAKEUP_INTERVAL_MAX_COUNT)
+        {
+            MESHNETWORK_vSetWakeupInterval(eNew);
+            snprintf(resp, sizeof(resp), "Discovery interval set to %u min\r\n",
+                     (unsigned)u32Mins);
+        }
+        else
+        {
+            snprintf(resp, sizeof(resp), "Invalid interval '%lu' - allowed: 15,30,60,120,240\r\n",
+                     (unsigned long)u32Mins);
+        }
+        FRKERNEL_vAck(eXport, bBulk, resp);
     }
     else if (strcmp(p, "discovery schedule") == 0)
     {

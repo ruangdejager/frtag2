@@ -81,7 +81,8 @@ typedef enum {
     WAKEUP_INTERVAL_30_MIN  = 2,
     WAKEUP_INTERVAL_60_MIN  = 3,
     WAKEUP_INTERVAL_120_MIN = 4,
-    WAKEUP_INTERVAL_MAX_COUNT = 4
+    WAKEUP_INTERVAL_240_MIN = 5,
+    WAKEUP_INTERVAL_MAX_COUNT = 5
 } WakeupInterval;
 
 /* ---- Discovery mode enum ----
