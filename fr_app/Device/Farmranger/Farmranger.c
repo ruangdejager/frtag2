@@ -461,15 +461,15 @@ bool FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
  * count, or <=0 / >=FR_CSV_ROW_MAX on error. */
 static int FARMRANGER_iFormatRow(char *row, const MeshDiscoveredNeighbor_t *n)
 {
-    /* Column order (must match fr9-side DBG_LOG header in FRTAG_vLogCmdHandler):
-     * DeviceId, Hops, RSSI, BatMv, Wave, Move, Lat, Lon, FwPatch */
+    /* Column order (must match fr9-side advanced-mode DBG_LOG header in
+     * FRTAG_vLogCmdHandler): DeviceId, Hops, Wave, RSSI, BatMv, Move, Lat, Lon, FwPatch */
     return snprintf(row, FR_CSV_ROW_MAX,
-                    "%X,%u,%d,%u,%u,%u,%ld,%ld,%u\t",
+                    "%X,%u,%u,%d,%u,%u,%ld,%ld,%u\t",
                     (unsigned int)n->u32DeviceId,
                     n->u8HopCount,
+                    n->u8Wave,
                     n->i16Rssi,
                     n->u16BatMv,
-                    n->u8Wave,
                     n->u8MoveState,
                     (long)n->i32LatUDeg,
                     (long)n->i32LonUDeg,
@@ -625,10 +625,13 @@ static bool FARMRANGER_bLogAttempt(const MeshDiscoveredNeighbor_t *neighbors,
  * per row in basic-mode uploads vs advanced-mode uploads. */
 static int FARMRANGER_iFormatBasicRow(char *row, const MeshBasicNeighbor_t *n)
 {
+    /* Basic-mode columns (must match the fr9 basic-mode header string in
+     * FRTAG_vLogCmdHandler): DeviceId,BatMv,RSSI,Move,FwPatch,Lat,Lon,AgeS */
     return snprintf(row, FR_CSV_ROW_MAX,
-                    "%X,%u,%u,%u,%ld,%ld,%lu\t",
+                    "%X,%u,%d,%u,%u,%ld,%ld,%lu\t",
                     (unsigned int)n->u32DeviceId,
                     n->u16BatMv,
+                    n->i16Rssi,
                     n->u8MoveState,
                     n->u8FwPatch,
                     n->bGpsValid ? (long)n->i32LatUDeg : 0L,

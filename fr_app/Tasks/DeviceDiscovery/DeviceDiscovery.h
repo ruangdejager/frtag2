@@ -52,21 +52,31 @@
  * for larger intervals (30/60/120) the primary listens 2/4/8 times
  * per flush. See the basic-mode branch of DEVICE_DISCOVERY_vAppTask. */
 #define DEVICE_DISCOVERY_BASIC_LISTEN_PERIOD_S    (15U * 60U)
-#define DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_S    60U
+/* Primary listen window on the 15-min cadence. Halved (60 s -> 30 s)
+ * alongside the secondary's 10 s -> 5 s TX cadence: with beacons coming
+ * twice as fast, the primary still gets several per device inside a
+ * shorter window, at half the radio-on time. */
+#define DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_S    30U
 #define DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_MS   (DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_S * 1000U)
 
-/* Secondary basic-mode TX efficiency: instead of transmitting a beacon
- * every ~10 s around the clock (of which the primary hears only the 60 s
- * it listens per 15 min), the secondary confines its jittered beacon TX
- * to a window straddling the primary's listen — starting
+/* Basic-mode primary high-water mark: when the RAM store hits this many
+ * unique devices, flush to fr9 mid-cycle (log-only — no timestamp sync,
+ * no settings fetch, no TimeSync) so the table can keep accepting
+ * beacons from further devices in the same 60 s listen. Set below
+ * MESH_MAX_BASIC_NEIGHBORS (32) so a handful of extra beacons arriving
+ * DURING the ~1 s flush still fit without being silently dropped. */
+#define DEVICE_DISCOVERY_BASIC_HWM                28U
+
+/* Secondary basic-mode TX efficiency: the secondary confines its jittered
+ * beacon TX to a window straddling the primary's listen — starting
  * DEVICE_DISCOVERY_BASIC_TX_GUARD_S before the 15 min boundary and ending
- * the same guard after the 60 s listen. The guard absorbs the primary's
+ * the same guard after the (30 s) listen. The guard absorbs the primary's
  * ~5 s wake buffer plus RTC drift between nodes. Phase is measured against
  * BASIC_LISTEN_PERIOD_S (the primary's fixed listen cadence), NOT the
  * secondary's own WakeupInterval. Outside this window the radio stays
- * asleep — roughly a 10x cut in secondary TX airtime/battery vs the old
- * always-on cadence. */
-#define DEVICE_DISCOVERY_BASIC_TX_GUARD_S         10U
+ * asleep. Guard halved (10 s -> 5 s) alongside the listen window and
+ * the 5 s TX cadence to keep the ratio of on-to-off time consistent. */
+#define DEVICE_DISCOVERY_BASIC_TX_GUARD_S         5U
 
 /* Kernel wakeup (shake-sequence): how long to wait for the user to start a
  * FrKernel session (send any "tag ..." command) before giving up and letting

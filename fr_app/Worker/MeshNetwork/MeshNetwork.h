@@ -270,7 +270,8 @@ void MESHNETWORK_vSendBasicBeacon(void);
  * (vs. 28 with naive ordering) — same tight-packing this file already
  * applies to NeighborEntry_t, needed because this part's RAM is byte-exact
  * full (see FORWARD_RING_SIZE's comment above). tBasicNeighborTable
- * [MESH_MAX_BASIC_NEIGHBORS] makes every byte here cost 32x. */
+ * [MESH_MAX_BASIC_NEIGHBORS] makes every byte here cost 32x. Adding
+ * i16Rssi bumped this from 24 to 28 bytes (worst-case pad). */
 typedef struct {
     uint32_t u32DeviceId;
     uint32_t u32BeaconMsgId;  /* update key: incoming replaces stored only
@@ -279,6 +280,8 @@ typedef struct {
     int32_t  i32LonUDeg;
     uint32_t u32GpsAgeS;
     uint16_t u16BatMv;
+    int16_t  i16Rssi;         /* best (least-negative) RSSI heard across
+                                * all beacons from this device this cycle */
     uint8_t  u8FwPatch;
     uint8_t  u8MoveState : 1;
     uint8_t  bGpsValid   : 1;

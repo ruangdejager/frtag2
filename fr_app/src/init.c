@@ -21,6 +21,7 @@
 
 #include "init.h"
 #include "build_config.h"
+#include "version_config.h"
 #include "hal_rtc.h"
 #include "hal_timer.h"
 #include "hal_uart.h"
@@ -96,6 +97,11 @@ void INIT_vInitialization(void *parameters)
      * options this TU actually saw defined -- the string is assembled by the
      * preprocessor, not read back at runtime. */
     DBG_LOG("\r\n\r\nBuild config:\r\n"
+        " FW v%u.%u.%u\r\n",
+        (unsigned)VERSION_SW_MAJOR,
+        (unsigned)VERSION_SW_MINOR,
+        (unsigned)VERSION_SW_PATCH);
+    DBG_LOG(""
 #ifdef FRKERNEL_INTERFACE_UART
         " FRKERNEL_INTERFACE_UART\r\n"
 #endif

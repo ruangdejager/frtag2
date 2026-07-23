@@ -907,6 +907,13 @@ static void BASIC_vAddOrUpdate(const MeshPktBasicBeacon_t *ptBB)
             tBasicNeighborTable[i].u16BatMv       = ptBB->u16BatMv;
             tBasicNeighborTable[i].u8MoveState    = ptBB->u8MoveState;
             tBasicNeighborTable[i].u8FwPatch      = ptBB->u8FwPatch;
+            /* Best-RSSI-wins: keep the strongest (least-negative) reading
+             * heard across all beacons from this device — a single weak
+             * reception due to obstruction or a distant antenna angle
+             * shouldn't overwrite a known-good one. Multi-beacon RX in
+             * one cycle only helps when we retain the best sample. */
+            if (ptBB->i16Rssi > tBasicNeighborTable[i].i16Rssi)
+                tBasicNeighborTable[i].i16Rssi = ptBB->i16Rssi;
             if (ptBB->bGpsValid)
             {
                 tBasicNeighborTable[i].bGpsValid  = true;
@@ -925,6 +932,7 @@ static void BASIC_vAddOrUpdate(const MeshPktBasicBeacon_t *ptBB)
         e->u32DeviceId    = ptBB->u32DeviceId;
         e->u32BeaconMsgId = ptBB->u32BeaconMsgId;
         e->u16BatMv       = ptBB->u16BatMv;
+        e->i16Rssi        = ptBB->i16Rssi;
         e->u8MoveState    = ptBB->u8MoveState;
         e->u8FwPatch      = ptBB->u8FwPatch;
         e->bGpsValid      = ptBB->bGpsValid;

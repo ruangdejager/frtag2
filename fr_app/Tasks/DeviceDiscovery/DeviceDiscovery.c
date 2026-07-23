@@ -61,6 +61,7 @@ static volatile ProductionState_e eProductionState = PRODUCTION_READY;
 static void DEVICE_DISCOVERY_vRecoveryMode(void);
 #endif
 static void DEVICE_DISCOVERY_vSendTS(void);
+static bool DEVICE_DISCOVERY_bBasicLogAndClear(const char *pacReason);
 static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters);
 
 /* --------------------------------------------------------------------------
@@ -200,7 +201,24 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
              * WakeupInterval boundaries. */
             DBG_LOG("DeviceDiscovery: Primary basic-mode listen (%u ms)\r\n",
                 (unsigned)DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_MS);
-            osDelay(DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_MS);
+            /* Poll for HWM every 250 ms during the listen window instead
+             * of a plain osDelay(WINDOW_MS). Beacons still arrive via
+             * the parser task in the background; if the store hits
+             * BASIC_HWM (28) before the window ends we flush mid-cycle
+             * so the remaining ~4 slots can accept further devices
+             * arriving during the ~1 s flush. Without this, the 33rd+
+             * unique device is silently dropped until the WakeupInterval
+             * boundary flush. */
+            {
+                uint32_t u32WaitedMs = 0U;
+                while (u32WaitedMs < DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_MS)
+                {
+                    if (MESHNETWORK_u16GetBasicNeighborCount() >= DEVICE_DISCOVERY_BASIC_HWM)
+                        (void)DEVICE_DISCOVERY_bBasicLogAndClear("HWM");
+                    osDelay(250);
+                    u32WaitedMs += 250U;
+                }
+            }
             DBG_LOG("DeviceDiscovery: basic listen end - %u unique nodes in RAM store\r\n",
                 (unsigned)MESHNETWORK_u16GetBasicNeighborCount());
         }
@@ -405,41 +423,16 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             }
             else
             {
-                MeshBasicNeighbor_t tBasic[MESH_MAX_BASIC_NEIGHBORS];
-                uint16_t u16Count = 0U;
-                MESHNETWORK_bGetBasicNeighbors(tBasic, MESH_MAX_BASIC_NEIGHBORS, &u16Count);
-                DBG_LOG("DeviceDiscovery: basic-mode flush - uploading %u neighbors\r\n",
-                    (unsigned)u16Count);
-                for (uint16_t i = 0U; i < u16Count; i++)
-                {
-                    DBG_LOG("  ID:%08X  MsgId:%08X  Bat:%u  Move:%u  FwPatch:%u  Lat:%ld  Lon:%ld  AgeS:%lu\r\n",
-                        tBasic[i].u32DeviceId,
-                        tBasic[i].u32BeaconMsgId,
-                        tBasic[i].u16BatMv,
-                        tBasic[i].u8MoveState,
-                        tBasic[i].u8FwPatch,
-                        tBasic[i].bGpsValid ? (long)tBasic[i].i32LatUDeg : 0L,
-                        tBasic[i].bGpsValid ? (long)tBasic[i].i32LonUDeg : 0L,
-                        tBasic[i].bGpsValid ? (unsigned long)tBasic[i].u32GpsAgeS : 0UL);
-                }
+                /* WakeupInterval boundary flush: shared log-and-release
+                 * (may be a no-op if the store's already been flushed
+                 * mid-cycle by the HWM check inside the listen window
+                 * above), then the boundary-only round-trip: connect
+                 * logger, timestamp sync, settings fetch, disconnect,
+                 * TimeSync TX. */
+                (void)DEVICE_DISCOVERY_bBasicLogAndClear("boundary");
 
                 DEVICE_DISCOVERY_DRIVER_bConnectLogger();
-                DBG_LOG("DeviceDiscovery %X: Logger connected (basic-mode flush).\r\n",
-                    LORARADIO_u32GetUniqueId());
 
-                if (FARMRANGER_bLogBasicData(tBasic, u16Count))
-                    DBG_LOG("DeviceDiscovery %X: Basic-mode log SUCCESS.\r\n",
-                        LORARADIO_u32GetUniqueId());
-                else
-                    DBG_LOG("DeviceDiscovery %X: Basic-mode log FAILED.\r\n",
-                        LORARADIO_u32GetUniqueId());
-
-                /* Clear store now so the next 15-min window starts fresh -
-                 * a partial upload followed by a re-heard node would
-                 * otherwise be double-reported. */
-                MESHNETWORK_vClearBasicNeighbors();
-
-                /* Timestamp sync + settings fetch (same as advanced path). */
                 uint64_t now = DEVICE_DISCOVERY_DRIVER_u64RequestTS();
                 if (now > 0)
                     RTC_vSetUTC(now);
@@ -484,12 +477,12 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 EVTLOG(LOG_DISCOVERY_COUNT, u16NeighborCount);
                 for (uint16_t i = 0; i < u16NeighborCount; i++)
                 {
-                    DBG_LOG("  ID:%X  Hops:%X  RSSI:%d  Bat:%d  Wave:%d  Move:%u  Lat:%ld  Lon:%ld  FwPatch:%u\r\n",
+                    DBG_LOG("  ID:%X  Hops:%X  Wave:%d  RSSI:%d  Bat:%d  Move:%u  Lat:%ld  Lon:%ld  FwPatch:%u\r\n",
                         tNeighbors[i].u32DeviceId,
                         tNeighbors[i].u8HopCount,
+                        tNeighbors[i].u8Wave,
                         tNeighbors[i].i16Rssi,
                         tNeighbors[i].u16BatMv,
-                        tNeighbors[i].u8Wave,
                         tNeighbors[i].u8MoveState,
                         tNeighbors[i].bGpsValid ? (long)tNeighbors[i].i32LatUDeg : 0L,
                         tNeighbors[i].bGpsValid ? (long)tNeighbors[i].i32LonUDeg : 0L,
@@ -958,10 +951,11 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             {
                 if (u64NextBasicBeaconUtc == 0ULL || u64Utc >= u64NextBasicBeaconUtc)
                 {
-                    /* 5..10 s uniform. rand() is seeded per device from its
-                     * unique id (DEVICE_DISCOVERY_vInit), so two secondaries
-                     * pick different offsets. */
-                    uint32_t u32NextDelayS = 5U + (uint32_t)(rand() % 6);
+                    /* 2..8 s uniform (mean ~5 s, matching the halved
+                     * primary listen window). rand() is seeded per device
+                     * from its unique id (DEVICE_DISCOVERY_vInit), so two
+                     * secondaries pick different offsets. */
+                    uint32_t u32NextDelayS = 2U + (uint32_t)(rand() % 7);
                     u64NextBasicBeaconUtc = u64Utc + (uint64_t)u32NextDelayS;
 
                     if (POWER_tGetState() & (POWER_CLASS_NORMAL | POWER_CLASS_LOW))
@@ -1081,6 +1075,62 @@ static void DEVICE_DISCOVERY_vSendTS(void)
                                u32StagedVer,
                                MESHNETWORK_eGetDiscoveryMode(),
                                MESHNETWORK_bGetGpsEnabled());
+}
+
+/* --------------------------------------------------------------------------
+ * DEVICE_DISCOVERY_bBasicLogAndClear
+ *
+ * Snapshot the basic-mode RAM store, connect to Farmranger, upload via
+ * FARMRANGER_bLogBasicData, clear the store, disconnect. Nothing else —
+ * no timestamp sync, no AT+SETREQ, no TimeSync TX. Shared by both:
+ *   - the mid-cycle HWM auto-flush (fires whenever the store hits
+ *     DEVICE_DISCOVERY_BASIC_HWM inside a listen window), and
+ *   - the WakeupInterval-boundary flush (which additionally does the
+ *     timestamp+settings+TimeSync round trip around this call).
+ * Returns true on log success; false on any failure (empty store,
+ * getter failure, upload failure). pacReason feeds a header DBG_LOG
+ * so an operator can tell the two callers apart in the log stream.
+ * -------------------------------------------------------------------------- */
+static bool DEVICE_DISCOVERY_bBasicLogAndClear(const char *pacReason)
+{
+    MeshBasicNeighbor_t tBasic[MESH_MAX_BASIC_NEIGHBORS];
+    uint16_t u16Count = 0U;
+    if (!MESHNETWORK_bGetBasicNeighbors(tBasic, MESH_MAX_BASIC_NEIGHBORS, &u16Count) ||
+        u16Count == 0U)
+    {
+        DBG_LOG("DeviceDiscovery: basic-mode %s flush skipped - store empty\r\n",
+                pacReason);
+        return false;
+    }
+
+    DBG_LOG("DeviceDiscovery: basic-mode %s flush - uploading %u neighbors\r\n",
+            pacReason, (unsigned)u16Count);
+    for (uint16_t i = 0U; i < u16Count; i++)
+    {
+        DBG_LOG("  ID:%08X  MsgId:%08X  Bat:%u  Rssi:%d  Move:%u  FwPatch:%u  Lat:%ld  Lon:%ld  AgeS:%lu\r\n",
+            tBasic[i].u32DeviceId,
+            tBasic[i].u32BeaconMsgId,
+            tBasic[i].u16BatMv,
+            tBasic[i].i16Rssi,
+            tBasic[i].u8MoveState,
+            tBasic[i].u8FwPatch,
+            tBasic[i].bGpsValid ? (long)tBasic[i].i32LatUDeg : 0L,
+            tBasic[i].bGpsValid ? (long)tBasic[i].i32LonUDeg : 0L,
+            tBasic[i].bGpsValid ? (unsigned long)tBasic[i].u32GpsAgeS : 0UL);
+    }
+
+    DEVICE_DISCOVERY_DRIVER_bConnectLogger();
+    bool bOk = FARMRANGER_bLogBasicData(tBasic, u16Count);
+    DBG_LOG("DeviceDiscovery %X: basic-mode %s log %s.\r\n",
+            LORARADIO_u32GetUniqueId(), pacReason, bOk ? "SUCCESS" : "FAILED");
+
+    /* Clear even on FAILED — leaving stale entries around would just
+     * pile them up under the HWM again on the next listen and hit the
+     * same failure. Whichever devices were dropped this cycle will
+     * re-appear on the very next beacon they send. */
+    MESHNETWORK_vClearBasicNeighbors();
+    DEVICE_DISCOVERY_DRIVER_vDisconnectLogger();
+    return bOk;
 }
 
 /* --------------------------------------------------------------------------
