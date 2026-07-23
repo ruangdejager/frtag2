@@ -70,8 +70,12 @@
 
 /* Kernel wakeup (shake-sequence): how long to wait for the user to start a
  * FrKernel session (send any "tag ..." command) before giving up and letting
- * the device return to deep sleep. */
-#define DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS  (60 * 1000)  /* 60 seconds */
+ * the device return to deep sleep. 3 min so an operator has time to type
+ * after the ~6 s shake sequence, accounting for the ~5 s -devicereq reply
+ * jitter (see the LoRa spread in FrKernel.c). Once a session is actually
+ * open FrKernel's own FRKERNEL_INACTIVITY_TIMEOUT_MS (5 min) is the real
+ * "close this session" gate. */
+#define DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS  (180 * 1000)  /* 3 min */
 
 #define LOST_PRIMARY_TIMEOUT_MIN            480           /* ~8 hours before recovery    */
 

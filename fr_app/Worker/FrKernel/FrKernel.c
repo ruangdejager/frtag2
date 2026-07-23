@@ -318,13 +318,18 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
         }
 #endif
         FRKERNEL_vRespond(eXport, resp);
-#ifdef FRKERNEL_INTERFACE_UART
-        if (eXport == FRKERNEL_XPORT_UART)
-        {
-            s_bConnected      = true;
-            s_u32LastCmdTick  = osKernelGetTickCount();
-        }
-#endif
+        /* Open a session for the responder — same for LoRa as for UART.
+         * The comment above ("does not start a session over LoRa") was
+         * wrong in practice: without holding the device awake past this
+         * reply, the AppTask's kernel-wake window (see
+         * DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS) can expire and the
+         * radio drops to deep sleep before an operator's follow-up
+         * "tag <ID> <cmd>" arrives. The user then sees "-devicereq
+         * silently stopped working". FrKernel's own 5 min inactivity
+         * timeout (FRKERNEL_INACTIVITY_TIMEOUT_MS) is the real "close
+         * this session" gate on both transports. */
+        s_bConnected      = true;
+        s_u32LastCmdTick  = osKernelGetTickCount();
         return;
     }
 
