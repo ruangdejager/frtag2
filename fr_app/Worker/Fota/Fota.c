@@ -625,11 +625,54 @@ void FOTA_vOnLoraPacket(const uint8_t *pu8Buf, uint16_t u16Len)
 
             if (!bFwAcceptArmed) return;
 
-            uint32_t u32Ver = FOTA_u32GetU32(&pu8Buf[5]);
+            uint32_t u32Ver    = FOTA_u32GetU32(&pu8Buf[5]);
+            uint32_t u32NewSid = FOTA_u32GetU32(&pu8Buf[1]);
+
             if (u32Ver <= VERSION_u32Get())
                 return;
 
-            tPrep.u32SessionId   = FOTA_u32GetU32(&pu8Buf[1]);
+            /* First-primary-wins latch (multi-primary coexistence).
+             *
+             * With more than one primary in range, A and B each generate
+             * their own random session id and broadcast their own OtaPrep.
+             * Without latching, the last-arriving Prep would overwrite
+             * tPrep (both in the pre-AppTask pending window AND mid-
+             * receive) - the secondary would ack whichever primary
+             * happened to Prep last, and any chunks from the "loser"
+             * primary would be filtered out by the session-id check as
+             * unrelated. Worse still, an OtaPrep from B arriving during
+             * an active receive from A would clobber tPrep.u32SessionId
+             * and cause every subsequent A-chunk to be rejected, killing
+             * the transfer at whatever fraction of the image had been
+             * received so far.
+             *
+             * Rule: once we've latched onto a session (either bPrepPending
+             * queued for the AppTask, or bRxSessionActive live), only
+             * accept OtaPreps whose sid matches the latched one - those
+             * are just normal re-arrivals from PREP_REPEATS. Different-
+             * sid Preps are silently rejected (log at DBG). The existing
+             * OTA_LORA_RX_IDLE_MS silence timeout (20 s) is the natural
+             * recovery point if the latched primary dies before its
+             * transfer completes - after that window closes,
+             * bRxSessionActive drops to false and the secondary is once
+             * again free to lock onto the next-arriving primary. */
+            if (bPrepPending || bRxSessionActive)
+            {
+                if (u32NewSid != tPrep.u32SessionId)
+                {
+                    DBG("Fota: OtaPrep sid=%08X ignored (locked to %08X)\r\n",
+                        u32NewSid, tPrep.u32SessionId);
+                    return;
+                }
+                /* Same-sid re-arrival — normal PREP_REPEATS retransmit
+                 * from the already-latched primary. Just refresh the
+                 * activity timer so any concurrent silence timeout
+                 * doesn't fire while the primary is still announcing. */
+                u32LastSessionPktTick = osKernelGetTickCount();
+                return;
+            }
+
+            tPrep.u32SessionId   = u32NewSid;
             tPrep.u32Version     = u32Ver;
             tPrep.u32ImageSize   = FOTA_u32GetU32(&pu8Buf[9]);
             tPrep.u16TotalChunks = FOTA_u16GetU16(&pu8Buf[13]);
@@ -639,6 +682,10 @@ void FOTA_vOnLoraPacket(const uint8_t *pu8Buf, uint16_t u16Len)
             if (tPrep.u8ChunkLen == 0U || tPrep.u16TotalChunks == 0U ||
                 tPrep.u32ImageSize == 0U || tPrep.u32ImageSize > OTA_APP_MAX_SIZE)
                 return;
+
+            DBG_LOG("Fota: OtaPrep latched sid=%08X v%lu (%lu B, %u chunks)\r\n",
+                    (unsigned)u32NewSid, (unsigned long)u32Ver,
+                    (unsigned long)tPrep.u32ImageSize, (unsigned)tPrep.u16TotalChunks);
 
             u32LastSessionPktTick = osKernelGetTickCount();
             bPrepPending = true;
