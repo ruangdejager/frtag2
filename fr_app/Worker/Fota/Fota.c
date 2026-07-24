@@ -386,9 +386,16 @@ bool FOTA_bUartAcquire(void)
     uint32_t u32FileBytes  = 0U;
     uint8_t  u8ExpectedXor = 0U;
 
-    DBG_LOG("Fota: requesting fw check (running v%lu)\r\n",
-            (unsigned long)VERSION_u32Get());
-    if (!FARMRANGER_bFwCheckRequest(VERSION_u32Get()))
+    /* hasStaged: valid meta AND staged image is at least our running version.
+     * When false, fr9 will offer the CURRENT version's binary too so we can
+     * refill an empty/erased scratchpad — needed for LoRa distribution to
+     * secondaries even when nothing newer is available upstream. */
+    FotaMeta_t tMeta;
+    bool bHasStaged = FOTA_bGetMeta(&tMeta) && tMeta.u32Version >= VERSION_u32Get();
+
+    DBG_LOG("Fota: requesting fw check (running v%lu staged=%s)\r\n",
+            (unsigned long)VERSION_u32Get(), bHasStaged ? "yes" : "no");
+    if (!FARMRANGER_bFwCheckRequest(VERSION_u32Get(), bHasStaged))
     {
         DBG_LOG("Fota: fw check request not acked - polling FWREQ anyway\r\n");
     }
@@ -399,10 +406,14 @@ bool FOTA_bUartAcquire(void)
         return false;
     }
 
-    if (u32Version <= VERSION_u32Get())
+    /* Accept-gate: strictly-newer is always OK. Equal-version is OK only when
+     * we don't already have it staged (recovery: refill scratch after erase). */
+    if (u32Version < VERSION_u32Get() ||
+        (u32Version == VERSION_u32Get() && bHasStaged))
     {
-        DBG_LOG("Fota: logger offers v%lu, running v%lu - skip\r\n",
-                (unsigned long)u32Version, (unsigned long)VERSION_u32Get());
+        DBG_LOG("Fota: logger offers v%lu, running v%lu staged=%s - skip\r\n",
+                (unsigned long)u32Version, (unsigned long)VERSION_u32Get(),
+                bHasStaged ? "yes" : "no");
         return false;
     }
 
@@ -481,8 +492,19 @@ bool FOTA_bUartAcquire(void)
             (unsigned long)OTA_APP_BASE_ADDR, (unsigned long)u32StopAddr);
 
     (void)FARMRANGER_bFwReportDone(true);
-    FOTA_vArmBootloaderAndReset(u32Version);
-    return true;   /* not reached */
+
+    /* Only arm the bootloader when the acquired image is strictly newer than
+     * what we're running. Equal-version acquires happen when we're refilling
+     * an empty scratchpad with a copy of our own running version — nothing
+     * to install, just have a valid staged image to distribute over LoRa. */
+    if (u32Version > VERSION_u32Get())
+    {
+        FOTA_vArmBootloaderAndReset(u32Version);
+        return true;   /* not reached */
+    }
+    DBG_LOG("Fota: scratch refilled with running v%lu - no reset\r\n",
+            (unsigned long)u32Version);
+    return true;
 }
 
 /* ==========================================================================

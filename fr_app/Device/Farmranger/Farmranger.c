@@ -862,13 +862,14 @@ static bool FARMRANGER_bParseFwCheckAck(const char *line, void *ctx)
     return false;
 }
 
-bool FARMRANGER_bFwCheckRequest(uint32_t u32CurrentVer)
+bool FARMRANGER_bFwCheckRequest(uint32_t u32CurrentVer, bool bHasStaged)
 {
-    char cmd[24];
+    char cmd[32];
     char respBuf[32] = {0};
     bool bAcked = false;
 
-    snprintf(cmd, sizeof(cmd), "AT+FWCHECK=%lu\r\n", (unsigned long)u32CurrentVer);
+    snprintf(cmd, sizeof(cmd), "AT+FWCHECK=%lu,%u\r\n",
+             (unsigned long)u32CurrentVer, bHasStaged ? 1U : 0U);
 
     if (!FARMRANGER_bATSend(cmd,
                             FARMRANGER_bParseFwCheckAck,

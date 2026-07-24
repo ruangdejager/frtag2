@@ -975,7 +975,7 @@ static void MESHNETWORK_vHandleBasicBeacon(const uint8_t *pBuf,
         tBB.u32GpsAgeS = read_u32_be(&pBuf[21]);
     }
 
-    DBG("MeshNetwork: BasicBeacon: dev=%08X msgid=%08X bat=%u rssi=%d move=%u gps=%u ageS=%lu fwp=%u\r\n",
+    DBG_LOG("MeshNetwork: BasicBeacon: dev=%08X msgid=%08X bat=%u rssi=%d move=%u gps=%u ageS=%lu fwp=%u\r\n",
         tBB.u32DeviceId, tBB.u32BeaconMsgId, tBB.u16BatMv, tBB.i16Rssi,
         tBB.u8MoveState, tBB.bGpsValid, (unsigned long)tBB.u32GpsAgeS, tBB.u8FwPatch);
     u16StatBeaconsHeard++;
@@ -1023,8 +1023,9 @@ void MESHNETWORK_vSendBasicBeacon(void)
     if (!MESHNETWORK_bEncodeBasicBeacon(&tBB, u8Buf, sizeof(u8Buf), &u32Len))
         return;
 
-    DBG_LOG("MeshNetwork: Sending BasicBeacon msgid=%08X gps=%u ageS=%lu\r\n",
-        tBB.u32BeaconMsgId, tBB.bGpsValid, (unsigned long)tBB.u32GpsAgeS);
+    DBG_LOG("MeshNetwork: Sending BasicBeacon msgid=%08X bat=%u move=%u fwp=%u gps=%u ageS=%lu\r\n",
+        tBB.u32BeaconMsgId, tBB.u16BatMv, tBB.u8MoveState, tBB.u8FwPatch,
+        tBB.bGpsValid, (unsigned long)tBB.u32GpsAgeS);
     EVTLOG(LOG_TX_BEACON, 3);
     MESHNETWORK_bSendPacket(u8Buf, u32Len);
 }

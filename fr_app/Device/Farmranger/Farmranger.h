@@ -74,13 +74,21 @@ typedef enum {
 } FarmrangerFw_e;
 
 /* Ask the logger to check its GitHub Pages OTA host for a newer image
- * (AT+FWCHECK=<currentVerMMmmpp>). Returns true once fr9 acks the request
- * (+FWCHECK: OK) — the actual manifest+download work then runs on fr9's own
- * side, asynchronously; poll FARMRANGER_eFwQuery() afterward the same as
- * always (it answers FW,WAIT while fr9's check is in flight). Returns false
- * on no response, or if fr9 reports +FWCHECK: BUSY (a check from a previous
- * wake is still running) — the caller can still poll FWREQ regardless. */
-bool FARMRANGER_bFwCheckRequest(uint32_t u32CurrentVer);
+ * (AT+FWCHECK=<currentVerMMmmpp>,<hasStaged>). Returns true once fr9 acks
+ * the request (+FWCHECK: OK) — the actual manifest+download work then runs
+ * on fr9's own side, asynchronously; poll FARMRANGER_eFwQuery() afterward
+ * the same as always (it answers FW,WAIT while fr9's check is in flight).
+ * Returns false on no response, or if fr9 reports +FWCHECK: BUSY (a check
+ * from a previous wake is still running) — the caller can still poll FWREQ
+ * regardless.
+ *
+ * bHasStaged tells fr9 whether we already hold a valid staged copy of our
+ * own running version or newer in ext-flash scratch. When false, fr9 will
+ * also offer the CURRENT version's binary (not just strictly newer), so we
+ * can refill an empty/erased scratchpad after a PRE-SEND xor mismatch —
+ * without this the primary would be running vN with no staged copy of vN
+ * and no way to distribute it to secondaries. */
+bool FARMRANGER_bFwCheckRequest(uint32_t u32CurrentVer, bool bHasStaged);
 
 FarmrangerFw_e FARMRANGER_eFwQuery(uint32_t *pu32Version, uint32_t *pu32FileBytes,
                                    uint8_t *pu8ExpectedXor);
