@@ -26,6 +26,7 @@
 #include "dbg_log.h"
 #include "flashLog.h"
 #include "str.h"
+#include "version_config.h"   /* VERSION_u32Get() — primary's own running version */
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -495,10 +496,15 @@ static bool FARMRANGER_bLogAttempt(const MeshDiscoveredNeighbor_t *neighbors,
     /* Step 1: send AT+LOG=<len> and wait for "Logger ready". Without it the
      * fr9 is not in its payload state and the stream would go into the void —
      * fail the attempt rather than transmit blind. */
-    char cmd[32];
-    snprintf(cmd, sizeof(cmd), "AT+LOG=%u\r\n", (unsigned)pos);
+    /* AT+LOG=<len>,<primaryVerMMmmpp> — the primary's own running version
+     * travels with the campaign so fr9 can log which firmware captured this
+     * batch. Once per upload, not per row (it doesn't vary within a campaign). */
+    char cmd[40];
+    snprintf(cmd, sizeof(cmd), "AT+LOG=%u,%lu\r\n",
+             (unsigned)pos, (unsigned long)VERSION_u32Get());
 
-    DBG_LOG("LogData: attempt sending AT+LOG=%u\r\n", (unsigned)pos);
+    DBG_LOG("LogData: attempt sending AT+LOG=%u (primary v%lu)\r\n",
+            (unsigned)pos, (unsigned long)VERSION_u32Get());
 
     /* For an empty upload (count==0) the fr9 sends "Logger ready\r\n" and
      * "OK\r\n" back-to-back on adjacent state-machine ticks. Splitting that
@@ -649,8 +655,9 @@ static bool FARMRANGER_bLogBasicAttempt(const MeshBasicNeighbor_t *neighbors,
      * two column sets can drift independently without cross-impact. */
     char row[FR_CSV_ROW_MAX];
 
-    char cmd[32];
-    int n = snprintf(cmd, sizeof(cmd), "AT+LOG=%u\r\n", (unsigned)pos);
+    char cmd[40];
+    int n = snprintf(cmd, sizeof(cmd), "AT+LOG=%u,%lu\r\n",
+                     (unsigned)pos, (unsigned long)VERSION_u32Get());
     if (n <= 0) return false;
 
     char respBuf[32] = {0};
