@@ -418,21 +418,20 @@ void GPS_vRequestFix(bool bAutoShutdownIn, uint32_t u32TtffTimeoutS, bool bForce
      * exit paths, which need RTC correction after an unbounded stretch
      * of sleep. See the bForce docs in GPS.h.
      *
-     * IMPORTANT: every caller of this function acquires a sleep-lock ref
-     * *before* the call, expecting GPS_vPowerOff() to release it at the
-     * end of the session (fix or timeout). If we early-return without
-     * running a session, that ref never balances — gSleepLockCount
-     * climbs by one per call and the device stops entering STOP2. So
-     * release the caller's ref here too, mirroring what a normal
-     * successful session would have done at its tail. Callers that do
-     * NOT hold a lock (there currently are none) would need to check
-     * the enable flag themselves before acquiring — but a stray extra
-     * release is caught by SYSTEM_vSleepLockRelease's saturating
-     * decrement (see hal_system.c). */
+     * Sleep-lock ownership: the GPS module takes the deep-sleep lock
+     * itself, exactly once, at the IDLE->ACQUIRING cold-start transition
+     * below, and releases it in GPS_vPowerOff() when the receiver powers
+     * down. Callers no longer bracket this call with their own
+     * acquire/release, so a request that merely ATTACHES to an already-
+     * running session takes no second, never-balanced lock — that double
+     * acquire (one per overlapping request, only one released per session)
+     * was what left gSleepLockCount stuck > 0 and stopped the device
+     * re-entering STOP2 (red LED never went out). Early-return paths that
+     * never reach the cold-start branch (this enable gate and the
+     * power-class gate) took no lock, so they must not release one. */
     if (!bForce && !MESHNETWORK_bGetGpsEnabled())
     {
         DBG("gps: request skipped - GPS disabled by system settings\r\n");
-        SYSTEM_vSleepLockRelease();
         return;
     }
 
@@ -470,7 +469,17 @@ void GPS_vRequestFix(bool bAutoShutdownIn, uint32_t u32TtffTimeoutS, bool bForce
     switch (eState)
     {
     case GPS_STATE_IDLE:
-        /* Cold start — clear stale result flags and kick the dispatcher */
+        /* Cold start — the one path that actually begins a powered GPS
+         * session, so this is where the single deep-sleep lock for the
+         * session is taken (released in GPS_vPowerOff() at power-down).
+         * Flip eState to ACQUIRING synchronously, under xGpsLock, BEFORE
+         * kicking the dispatcher: a second request that lands in the
+         * window before the dispatcher runs GPS_vSessionArm() then sees
+         * ACQUIRING and attaches to this session instead of starting a
+         * second one (which would take a second lock only one
+         * GPS_vPowerOff() ever balances). */
+        SYSTEM_vSleepLockAcquire();
+        eState = GPS_STATE_ACQUIRING;
         osEventFlagsClear(xGpsResultFlags, GPS_RESULT_ALL_BITS);
         osThreadFlagsSet(GPS_vDispatcherTask_handle, GPS_DISP_TRIGGER_BIT);
         DBG("gps: request — dispatcher kicked (auto=%u)\r\n", (unsigned)bAutoShutdownIn);

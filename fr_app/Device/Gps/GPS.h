@@ -157,6 +157,14 @@ void GPS_vInit(void);
  * refuses to power the GPS and sets the NO_POWER result so any concurrent
  * waiter is released.
  *
+ * Deep-sleep lock: this function owns it. A single SYSTEM_vSleepLock is
+ * taken on the cold-start transition (when a new powered session actually
+ * begins) and released in GPS_vPowerOff() when the receiver powers down.
+ * Callers must NOT bracket the call with their own acquire/release —
+ * doing so would double-count on overlapping requests (each request
+ * acquires, but only one power-down releases) and wedge the device out of
+ * STOP2. Just call it; the lock is handled internally.
+ *
  * bForce: when true, bypass the system-wide GPS-enable gate (fr9's
  * movementAlarm.nightZoneLevels.holdFirst flag distributed via TimeSync).
  * Reserved for scenarios that MUST have a fix regardless of user

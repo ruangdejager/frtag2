@@ -778,15 +778,13 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                  * unbounded stretch in ProductionSleep (no RTC-correcting
                  * TimeSync while asleep) is exactly the case most likely to
                  * have a drifted RTC, so get it corrected as early as
-                 * possible instead of waiting. Own dedicated sleep-lock
-                 * reference (released inside GPS_vPowerOff()), independent
-                 * of the kernel-window lock acquired above (released
-                 * separately at the AppTask loop end) — see the GPS
-                 * pre-trigger below for the same acquire/POWER_CLASS_NORMAL
-                 * pattern. */
+                 * possible instead of waiting. GPS_vRequestFix() now owns
+                 * its own deep-sleep lock (taken on cold start, released in
+                 * GPS_vPowerOff()), independent of the kernel-window lock
+                 * acquired above (released separately at the AppTask loop
+                 * end). */
                 if (POWER_tGetState() & POWER_CLASS_NORMAL)
                 {
-                    SYSTEM_vSleepLockAcquire();
                     DBG_LOG("DeviceDiscovery: GPS acquire on ProductionSleep wake (5 min timeout)\r\n");
                     /* bForce=true: RTC correction after unbounded
                      * ProductionSleep must run even if the user disabled
@@ -819,11 +817,10 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                     SOLAR_u16GetVSolarMV());
 
                 /* See the ENABLE_SOLAR_POWER_SENSE branch above for why this
-                 * fires a GPS fix immediately (RTC correction on takeoff)
-                 * with its own dedicated sleep-lock reference. */
+                 * fires a GPS fix immediately (RTC correction on takeoff);
+                 * GPS_vRequestFix() owns its own sleep lock. */
                 if (POWER_tGetState() & POWER_CLASS_NORMAL)
                 {
-                    SYSTEM_vSleepLockAcquire();
                     DBG_LOG("DeviceDiscovery: GPS acquire on ProductionSleep wake (5 min timeout)\r\n");
                     /* bForce=true: RTC correction after unbounded
                      * ProductionSleep must run even if the user disabled
@@ -1024,19 +1021,14 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
 
         if (bFireGps && (POWER_tGetState() & POWER_CLASS_NORMAL))
         {
-            /* Hold off deep sleep until GPS auto-shuts-down, times out, or is
-             * otherwise turned off — released inside GPS_vPowerOff().
-             *
-             * The power-class check above is required, not just an
-             * optimisation: GPS_vRequestFix() refuses outright with
-             * GPS_RESULT_NO_POWER when the board isn't in POWER_CLASS_NORMAL,
-             * and on that path it returns without ever calling
-             * GPS_vPowerOff(). If we acquired the lock unconditionally, that
-             * refusal would leak it forever — gSleepLockCount would never
-             * return to 0, deep sleep would be permanently disabled, and
-             * every subsequent pre-trigger would silently refuse the same
-             * way (no "session armed" line ever again). */
-            SYSTEM_vSleepLockAcquire();
+            /* GPS_vRequestFix() owns its deep-sleep lock now (taken on the
+             * cold-start transition, released in GPS_vPowerOff()), so no
+             * lock is taken here and an overlap with an in-flight GPS
+             * session — a still-running ProductionSleep-exit fix, say —
+             * simply attaches instead of leaking a second lock. The
+             * POWER_CLASS_NORMAL guard is kept as an optimisation: it
+             * skips the UART/DEBUG re-arm when GPS_vRequestFix() would
+             * refuse for want of power anyway. */
             HAL_UART_vInit();
             DEBUG_vInit();
 
@@ -1170,11 +1162,10 @@ void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
 
         /* Same rationale as the solar wake path: get the RTC corrected as
          * early as possible after an unbounded ProductionSleep stretch,
-         * not just at the next scheduled pre-trigger. Own dedicated
-         * sleep-lock reference, released inside GPS_vPowerOff(). */
+         * not just at the next scheduled pre-trigger. GPS_vRequestFix()
+         * owns its own sleep lock (released inside GPS_vPowerOff()). */
         if (POWER_tGetState() & POWER_CLASS_NORMAL)
         {
-            SYSTEM_vSleepLockAcquire();
             DBG_LOG("DeviceDiscovery: GPS acquire on ProductionSleep wake (5 min timeout)\r\n");
             /* bForce=true: same rationale as the solar wake path -
              * RTC correction after unbounded ProductionSleep. */
