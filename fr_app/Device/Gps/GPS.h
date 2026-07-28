@@ -202,4 +202,12 @@ uint32_t GPS_u32GetLastFixAgeSeconds(void);
 /* Called from USART1 ISR via uart_callbacks.c — do not call directly. */
 void GPS_vNotifyOnRX(void);
 
+/* Boot-time smoke test: powers the module up, polls the UART for NMEA
+ * bytes for up to u32TimeoutMs, then powers down and returns true iff
+ * enough bytes were seen to prove the module is alive on the wire.
+ * Does NOT go through the normal session state machine (no dispatcher
+ * kick, no bSessionActive) — safe to call from INIT_vInitialization
+ * before the rest of the system is up. Blocking. */
+bool GPS_bSelfTest(uint32_t u32TimeoutMs);
+
 #endif /* DEVICE_GPS_GPS_H_ */

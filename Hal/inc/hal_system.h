@@ -28,4 +28,15 @@ void Error_Handler(void);
  * already masked and deep-sleep eligibility already decided. */
 void HAL_SYSTEM_vEnterStop2(void);
 
+/* Which LED indicates STOP2 residency (off in STOP2, on otherwise). Red
+ * is the default; DeviceDiscovery swaps it to yellow while the secondary
+ * is in ProductionSleep so the bench can distinguish "asleep waiting for
+ * solar / kernel wakeup" from "asleep between normal scheduled wakes".
+ *
+ * The setter turns the previously-selected LED off before switching so
+ * two indicator LEDs are never lit at once. Safe to call from any task
+ * context; the switch takes effect on the next STOP2 entry/exit. */
+typedef enum { HAL_SYSTEM_SLEEP_LED_RED = 0, HAL_SYSTEM_SLEEP_LED_YELLOW = 1 } HalSystemSleepLed_e;
+void HAL_SYSTEM_vSetSleepIndicatorLed(HalSystemSleepLed_e eLed);
+
 #endif /* INC_HAL_SYSTEM_H_ */

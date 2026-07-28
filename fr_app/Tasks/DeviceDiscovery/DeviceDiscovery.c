@@ -759,6 +759,9 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             if (SOLAR_u32GetPowerMW() >= SOLAR_ACTIVATION_POWER_MW)
             {
                 eProductionState = PRODUCTION_ACTIVE;
+                /* Swap the STOP2-indicator LED back to red now that we're
+                 * no longer in ProductionSleep — see the setter's docs. */
+                HAL_SYSTEM_vSetSleepIndicatorLed(HAL_SYSTEM_SLEEP_LED_RED);
 
                 /* Hold off deep sleep until the resulting kernel window
                  * completes (released at the end of
@@ -805,6 +808,9 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             if (SOLAR_u16GetVSolarMV() >= SOLAR_ACTIVATION_VSOLAR_MV)
             {
                 eProductionState = PRODUCTION_ACTIVE;
+                /* Swap the STOP2-indicator LED back to red now that we're
+                 * no longer in ProductionSleep — see the setter's docs. */
+                HAL_SYSTEM_vSetSleepIndicatorLed(HAL_SYSTEM_SLEEP_LED_RED);
 
                 /* See the ENABLE_SOLAR_POWER_SENSE branch above for why the
                  * UART is re-armed here and why this opens a kernel window
@@ -1158,6 +1164,9 @@ void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
     if (eProductionState == PRODUCTION_SLEEP)
     {
         eProductionState = PRODUCTION_ACTIVE;
+        /* Swap the STOP2-indicator LED back to red now that we're no
+         * longer in ProductionSleep — see HAL_SYSTEM_vSetSleepIndicatorLed. */
+        HAL_SYSTEM_vSetSleepIndicatorLed(HAL_SYSTEM_SLEEP_LED_RED);
         DBG_LOG("DeviceDiscovery: Kernel wakeup — exiting ProductionSleep\r\n");
 
         /* Same rationale as the solar wake path: get the RTC corrected as
@@ -1219,6 +1228,12 @@ void DEVICE_DISCOVERY_vEnterProductionSleep(void)
         return;
     }
     eProductionState = PRODUCTION_SLEEP;
+    /* Swap the STOP2-indicator LED to yellow so the bench can tell
+     * "asleep in ProductionSleep, waiting for solar/shake" apart from
+     * the normal red "asleep between scheduled wakes" at a glance. Any
+     * ProductionSleep exit path (solar activation or Kernel wakeup)
+     * swaps it back to red. */
+    HAL_SYSTEM_vSetSleepIndicatorLed(HAL_SYSTEM_SLEEP_LED_YELLOW);
     DBG_LOG("DeviceDiscovery: Entering ProductionSleep\r\n");
 }
 

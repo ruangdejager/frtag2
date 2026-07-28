@@ -56,6 +56,7 @@
 #include "Log.h"
 #include "Fota.h"
 #include "DbgLog.h"
+#include "SelfTest.h"
 
 #ifdef STORAGE_BACKEND_MICROSD
 #  include "MicroSD.h"
@@ -230,6 +231,13 @@ void INIT_vInitialization(void *parameters)
     TIME_vInit();
     BAT_vInit();
     POWER_vInit();
+
+    /* Peripheral smoke test — checks GPS UART, ACC WHO_AM_I and ext-flash
+     * JEDEC ID. Records each result for later FrKernel queries and flashes
+     * a yellow-LED error code for anything that failed. Blocking; returns
+     * once the LED sequence is done (no delay on a clean boot). Never
+     * fatal — normal boot always proceeds after this. */
+    SELFTEST_vRunAndReport();
 
     BSP_LED_Off(LED_YELLOW);
 

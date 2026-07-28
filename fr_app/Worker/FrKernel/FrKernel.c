@@ -77,6 +77,7 @@
 #include "build_config.h"
 #include "version_config.h"
 #include "DbgLog.h"
+#include "SelfTest.h"
 #include "stm32wlxx_hal.h"     /* TAMP->BKP2R for the bootloader version    */
 #ifdef STORAGE_BACKEND_MICROSD
 #  include "AccLog.h"
@@ -226,6 +227,7 @@ static bool FRKERNEL_bQueryOnlyCmd(const char *p)
     static const char *const apacQueries[] = {
         "-help", "juice", "fwver", "discovery schedule",
         "flash stream", "sd log stream",
+        "selftest", "selftest gps", "selftest acc", "selftest flash",
     };
     for (size_t i = 0U; i < (sizeof(apacQueries) / sizeof(apacQueries[0])); i++)
         if (strcmp(p, apacQueries[i]) == 0)
@@ -387,6 +389,8 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                 "  tag -help                   list commands\r\n"
                 "  tag fwver                   app + bootloader version\r\n"
                 "  tag juice                   battery + solar panel voltage (mV)\r\n"
+                "  tag selftest                boot-time gps/acc/flash results\r\n"
+                "  tag selftest gps|acc|flash  single boot-time result\r\n"
                 "  tag discovery schedule      wakeup interval (min)\r\n"
                 "  tag discovery schedule <N>  set wakeup interval (15/30/60/120/240 min)\r\n"
                 "  tag prodsleep               enter production sleep (secondary only)\r\n"
@@ -402,6 +406,8 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                 "  tag <ID> -help              list commands\r\n"
                 "  tag <ID> fwver              app + bootloader version\r\n"
                 "  tag <ID> juice              battery + solar panel voltage (mV)\r\n"
+                "  tag <ID> selftest           boot-time gps/acc/flash results\r\n"
+                "  tag <ID> selftest gps|acc|flash  single boot-time result\r\n"
                 "  tag <ID> discovery schedule wakeup interval (min)\r\n"
                 "  tag <ID> discovery schedule <N>  set wakeup interval (15/30/60/120/240)\r\n"
                 "  tag <ID> prodsleep          enter production sleep (secondary only)\r\n"
@@ -465,6 +471,36 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                  (unsigned)VERSION_SW_MINOR,
                  (unsigned)VERSION_SW_PATCH,
                  (unsigned long)TAMP->BKP2R);
+        FRKERNEL_vRespond(eXport, resp);
+    }
+    else if (strcmp(p, "selftest") == 0)
+    {
+        /* Answers from the memoized boot-time run (see SELFTEST_vRunAndReport
+         * called from INIT_vInitialization). "n/a" is reported for tests
+         * that don't apply on this build/role (GPS on primary, flash under
+         * MicroSD backend) — no re-run happens here. */
+        snprintf(resp, sizeof(resp), "selftest: gps=%s acc=%s flash=%s\r\n",
+                 SELFTEST_bGpsApplicable()   ? (SELFTEST_bGpsOk()   ? "OK" : "FAIL") : "n/a",
+                 SELFTEST_bAccOk()           ? "OK" : "FAIL",
+                 SELFTEST_bFlashApplicable() ? (SELFTEST_bFlashOk() ? "OK" : "FAIL") : "n/a");
+        FRKERNEL_vRespond(eXport, resp);
+    }
+    else if (strcmp(p, "selftest gps") == 0)
+    {
+        snprintf(resp, sizeof(resp), "selftest gps: %s\r\n",
+                 SELFTEST_bGpsApplicable() ? (SELFTEST_bGpsOk() ? "OK" : "FAIL") : "n/a");
+        FRKERNEL_vRespond(eXport, resp);
+    }
+    else if (strcmp(p, "selftest acc") == 0)
+    {
+        snprintf(resp, sizeof(resp), "selftest acc: %s\r\n",
+                 SELFTEST_bAccOk() ? "OK" : "FAIL");
+        FRKERNEL_vRespond(eXport, resp);
+    }
+    else if (strcmp(p, "selftest flash") == 0)
+    {
+        snprintf(resp, sizeof(resp), "selftest flash: %s\r\n",
+                 SELFTEST_bFlashApplicable() ? (SELFTEST_bFlashOk() ? "OK" : "FAIL") : "n/a");
         FRKERNEL_vRespond(eXport, resp);
     }
     else if (strncmp(p, "discovery schedule ", 19) == 0)

@@ -565,6 +565,63 @@ void GPS_vShutdown(void)
 }
 
 /* --------------------------------------------------------------------------
+ * GPS_bSelfTest — boot-time smoke test, side-steps the session state machine.
+ *
+ * Powers the receiver up, polls the UART for NMEA bytes, powers it down and
+ * returns true iff enough bytes were seen to prove the module is present and
+ * transmitting. Ignores the dispatcher and bSessionActive entirely (only the
+ * init task is running against GPS at this point, so contention is
+ * impossible), which is why this doesn't need xGpsLock either. Sole purpose
+ * is a boot-time yellow-LED error indicator — the normal fix path is
+ * unaffected regardless of the outcome.
+ * -------------------------------------------------------------------------- */
+#define GPS_SELFTEST_MIN_BYTES      20U   /* one NMEA epoch is ~200+ B; 20 is a floor */
+#define GPS_SELFTEST_WARMUP_MS      200U  /* MAX-M10S emits $GNTXT boot lines quickly */
+
+bool GPS_bSelfTest(uint32_t u32TimeoutMs)
+{
+    /* Not built for GPS (no xGpsLock created yet): treat as pass so the LED
+     * doesn't flag a hardware fault for a software-disabled build. */
+    if (xGpsLock == NULL) return true;
+
+    /* Cold power-on, mirroring GPS_vSessionArm's cold-start branch minus the
+     * VALSET config (self-test only cares about default-baud NMEA presence). */
+    GPS_DRIVER_vInitGPS(&gps.UartHandle);
+    GPS_DRIVER_vEnableUart(&gps.UartHandle);
+    HAL_UART_vClearBuffer(&gps.UartHandle);
+    GPS_DRIVER_vPowerEnHigh();
+    bGpsPowered = true;
+
+    osDelay(GPS_SELFTEST_WARMUP_MS);
+
+    uint32_t u32Start   = osKernelGetTickCount();
+    uint32_t u32ByteCnt = 0U;
+    uint8_t  u8Byte;
+    while ((osKernelGetTickCount() - u32Start) < u32TimeoutMs
+           && u32ByteCnt < GPS_SELFTEST_MIN_BYTES)
+    {
+        while (UART_bReadByte(&gps.UartHandle, &u8Byte))
+        {
+            u32ByteCnt++;
+        }
+        osDelay(10);
+    }
+
+    /* Power-down: same order as GPS_vPowerOff minus the sleep-lock release
+     * (self-test never took one). */
+    GPS_DRIVER_vPowerEnLow();
+    GPS_DRIVER_vDisableUart(&gps.UartHandle);
+    bGpsPowered = false;
+
+    bool bOk = (u32ByteCnt >= GPS_SELFTEST_MIN_BYTES);
+    DBG_LOG("gps: selftest %s (rx=%lu bytes in ~%lums)\r\n",
+            bOk ? "OK" : "FAIL",
+            (unsigned long)u32ByteCnt,
+            (unsigned long)(osKernelGetTickCount() - u32Start));
+    return bOk;
+}
+
+/* --------------------------------------------------------------------------
  * GPS_vRxTask — CMSIS-RTOS v2 task; blocks on thread flag from ISR.
  * Internal — only the dispatcher gates sessions on/off via bSessionActive.
  * -------------------------------------------------------------------------- */

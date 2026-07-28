@@ -21,6 +21,33 @@
 
 static volatile uint32_t gSleepLockCount = 0;
 
+/* Which LED indicates STOP2 residency (see HAL_SYSTEM_vSetSleepIndicatorLed
+ * in hal_system.h). Red by default; DeviceDiscovery flips to yellow while
+ * in ProductionSleep so the bench can tell "asleep in prodsleep" from
+ * "asleep between normal wakes" at a glance. */
+static volatile HalSystemSleepLed_e eSleepLed = HAL_SYSTEM_SLEEP_LED_RED;
+
+void HAL_SYSTEM_vSetSleepIndicatorLed(HalSystemSleepLed_e eLed)
+{
+    if (eLed == eSleepLed) return;
+
+    /* Switch cleanly: the old LED gets forced off (regardless of whether
+     * we're currently sleeping) and the new LED comes on because we're
+     * demonstrably out of STOP2 right now — anything else would have to
+     * poll from an ISR, and a task calling this is by definition awake. */
+    if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED)
+    {
+        BSP_LED_Off(LED_RED);
+        BSP_LED_On(LED_YELLOW);
+    }
+    else
+    {
+        BSP_LED_Off(LED_YELLOW);
+        BSP_LED_On(LED_RED);
+    }
+    eSleepLed = eLed;
+}
+
 void SystemClock_Config(void)
 {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -76,19 +103,21 @@ void SystemClock_Config(void)
  * -------------------------------------------------------------------------- */
 void HAL_SYSTEM_vEnterStop2(void)
 {
-    /* Red LED off while in STOP2; back on the moment we wake. The LED is
-     * therefore a direct visual indicator of the power mode: off == STOP2,
-     * on == running in any other mode.
+    /* The "sleep indicator" LED goes off while in STOP2 and comes back on
+     * the moment we wake — a direct visual indicator of the power mode:
+     * off == STOP2, on == running in any other mode. The choice of which
+     * LED plays that role is state (see HAL_SYSTEM_vSetSleepIndicatorLed):
+     * red normally, swapped to yellow during ProductionSleep so the bench
+     * can tell the two "asleep" modes apart at a glance.
      *
-     * Yellow is NOT touched here (unlike red, it is never restored on wake).
-     * Its only owner is the Movement shake-sequence confirmation flash
-     * (MOVE_DRIVER_vLedOn/Off, bounded by a short osDelay with no sleep lock
-     * held) — STOP2 has no minimum-idle-time floor, so it can fire mid-flash,
-     * and force-clearing yellow here used to extinguish that flash almost
-     * immediately after it was set, well before the intended on-time. GPIO
-     * output level is retained across STOP2, so leaving yellow alone simply
-     * lets it stay lit through the sleep window when Movement is flashing it. */
-    BSP_LED_Off(LED_RED);
+     * The other LED is NOT touched here (its retention across STOP2 is
+     * relied on for other purposes — e.g. the Movement shake-sequence
+     * confirmation flash, bounded by a short osDelay with no sleep lock
+     * held; STOP2 has no minimum-idle-time floor, so it can fire mid-flash,
+     * and force-clearing here would extinguish that flash almost
+     * immediately after it was set). */
+    if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED) BSP_LED_Off(LED_RED);
+    else                                       BSP_LED_Off(LED_YELLOW);
 
     HAL_GPIO_vOnSleep();
 
@@ -128,7 +157,8 @@ void HAL_SYSTEM_vEnterStop2(void)
     HAL_SPI_vMarkParked();   /* SPI1 (ACC) + SPI2 (flash): restore on first select */
     HAL_ADC_vMarkParked();   /* ADC: restore + recalibrate on first HAL_ADC_vLock  */
 
-    BSP_LED_On(LED_RED);
+    if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED) BSP_LED_On(LED_RED);
+    else                                       BSP_LED_On(LED_YELLOW);
 }
 
 /* --------------------------------------------------------------------------
