@@ -573,7 +573,7 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
         }
         else
         {
-            FOTA_vArmAcceptance();
+            FOTA_vArmAcceptanceKernel();
             FRKERNEL_vAck(eXport, bBulk, "Firmware acceptance ARMED - awaiting OtaPrep\r\n");
         }
     }

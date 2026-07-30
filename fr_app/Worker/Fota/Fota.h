@@ -122,11 +122,21 @@ bool FOTA_bPrepPending(void);
 void FOTA_vSecondaryReceive(void);
 
 /* Secondary firmware-acceptance gate: unarmed devices ignore every OtaPrep.
- * Armed over a live FrKernel session ("tag <ID> fwaccept"); cleared by
- * "tag <ID> fwaccept off", by a completed/attempted receive, or by reset. */
+ * Two arm sources:
+ *   - FOTA_vArmAcceptance(): the discovery TimeSync auto-arm. Persists across
+ *     wakes so a secondary catches up on a later campaign. NOT honoured inside
+ *     a kernel wakeup (would let a stray OtaPrep during a log-download session
+ *     start a pointless receive).
+ *   - FOTA_vArmAcceptanceKernel(): explicit "tag <ID> fwaccept" — the only
+ *     source that enables the OTA-receive rendezvous inside a live FrKernel
+ *     session.
+ * Both cleared by "tag <ID> fwaccept off", by a completed/attempted receive,
+ * or by reset. FOTA_bAcceptanceArmedViaKernel() is true only for the latter. */
 void FOTA_vArmAcceptance(void);
+void FOTA_vArmAcceptanceKernel(void);
 void FOTA_vDisarmAcceptance(void);
 bool FOTA_bAcceptanceArmed(void);
+bool FOTA_bAcceptanceArmedViaKernel(void);
 
 /* --------------------------------------------------------------------------
  * Session priority

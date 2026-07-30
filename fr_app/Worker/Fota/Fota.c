@@ -47,6 +47,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>       /* rand() — multi-primary distribute backoff */
 
 /* ==========================================================================
  * Storage layer — external NOR scratchpad + metadata
@@ -537,11 +538,21 @@ bool FOTA_bUartAcquire(void)
 /* ---- Shared session state ---- */
 static uint32_t u32SessionId;
 
-/* Secondary firmware-acceptance gate. */
+/* Secondary firmware-acceptance gate. bFwAcceptViaKernel distinguishes an
+ * explicit "tag <ID> fwaccept" (which enables the OTA-receive rendezvous
+ * inside a kernel session) from the discovery TimeSync auto-arm (which must
+ * NOT be consumed by an unrelated kernel/log-download wakeup). */
 static volatile bool bFwAcceptArmed;
+static volatile bool bFwAcceptViaKernel;
 
 /* Primary on-demand distribution request. */
 static volatile bool bDistributeReq;
+
+/* Multi-primary listen-before-distribute: RTC tick of the last Ota* packet
+ * heard whose session id was not our own (i.e. another primary's live
+ * session). 0 = none heard yet. Set in FOTA_vOnLoraPacket regardless of
+ * role; consumed by FOTA_vDistribute's pre-Prep backoff. */
+static volatile uint32_t u32LastForeignOtaTick;
 
 /* ---- Primary: distribution target table (filled by the parser) ---- */
 typedef struct {
@@ -638,6 +649,27 @@ static void FOTA_vNotifyAppTask(void)
  * -------------------------------------------------------------------------- */
 void FOTA_vOnLoraPacket(const uint8_t *pu8Buf, uint16_t u16Len)
 {
+    /* Multi-primary carrier sense: every OTA packet type carries the session
+     * id at [1]. Any Ota* whose id isn't ours is another primary's live
+     * session (or its secondaries acking/reporting to it) — record the tick
+     * so FOTA_vDistribute can defer instead of colliding. Our own session id
+     * is regenerated at the top of FOTA_vDistribute, so same-session
+     * re-arrivals are never mistaken for foreign. Cheap, role-agnostic, and
+     * harmless on packets we otherwise ignore. */
+    switch (pu8Buf[0])
+    {
+        case MeshPktType_OtaPrep:
+        case MeshPktType_OtaPrepAck:
+        case MeshPktType_OtaChunk:
+        case MeshPktType_OtaPoll:
+        case MeshPktType_OtaReport:
+            if (u16Len >= 5U && FOTA_u32GetU32(&pu8Buf[1]) != u32SessionId)
+                u32LastForeignOtaTick = osKernelGetTickCount();
+            break;
+        default:
+            break;
+    }
+
     switch (pu8Buf[0])
     {
         case MeshPktType_OtaPrep:
@@ -1039,6 +1071,39 @@ void FOTA_vDistribute(void)
             (unsigned long)tMeta.u32Version, (unsigned long)tMeta.u32SizeBytes,
             u16Total, (unsigned long)u32SessionId);
 
+    /* ---- Listen-before-distribute (multi-primary coexistence) ----
+     * Two primaries on the same fr9 schedule enter this function in the same
+     * second; without this they broadcast OtaPrep/chunks simultaneously and
+     * secondaries between them join neither (both log "no targets joined").
+     * Wait a random backoff and watch u32LastForeignOtaTick: whoever draws
+     * the shorter backoff Preps first, and the other hears that foreign
+     * session mid-backoff and defers to the next campaign (the winner covers
+     * the shared secondaries; a secondary already updated simply won't join,
+     * so the winner finishes fast and the next random draw lets us run).
+     * The fr9 FW check after this call (DeviceDiscovery.c) still runs — only
+     * the broadcast is skipped. */
+    {
+        uint32_t u32Backoff = (uint32_t)(rand() % (int)OTA_DISTRIBUTE_BACKOFF_SPREAD_MS);
+        uint32_t u32Start   = osKernelGetTickCount();
+        while ((osKernelGetTickCount() - u32Start) < u32Backoff)
+        {
+            if (u32LastForeignOtaTick != 0U &&
+                (int32_t)(u32LastForeignOtaTick - u32Start) >= 0)
+                break;   /* another primary started first — stop waiting, defer below */
+            osDelay(100);
+        }
+
+        if (u32LastForeignOtaTick != 0U &&
+            (uint32_t)(osKernelGetTickCount() - u32LastForeignOtaTick) < OTA_FOREIGN_ACTIVE_MS)
+        {
+            DBG_LOG("Fota: another primary distributing - deferring to next wake\r\n");
+            bDistributeActive = false;
+            LOG_vSuspend(false);
+            FLASH_vInhibitDeepPowerDown(false);
+            return;
+        }
+    }
+
     /* Re-verify our OWN stored copy immediately before every send, not just
      * once at acquire time: a single scan can occasionally return a wrong
      * value while the stored bytes are fine (a transient SPI/flash read
@@ -1288,20 +1353,41 @@ bool FOTA_bPrepPending(void)
 
 void FOTA_vArmAcceptance(void)
 {
-    bFwAcceptArmed = true;
+    /* Discovery TimeSync auto-arm. Persists across wakes so a secondary that
+     * kept missing the distribution catches up on a later campaign — but this
+     * source must NOT be honoured inside a kernel/log-download wakeup, so
+     * clear the kernel flag. */
+    bFwAcceptArmed     = true;
+    bFwAcceptViaKernel = false;
     DBG_LOG("Fota: firmware acceptance ARMED\r\n");
+}
+
+void FOTA_vArmAcceptanceKernel(void)
+{
+    /* Explicit "tag <ID> fwaccept" — the only arm source allowed to run an
+     * OTA receive inside a live FrKernel session (see the kernel rendezvous
+     * in DeviceDiscovery.c). */
+    bFwAcceptArmed     = true;
+    bFwAcceptViaKernel = true;
+    DBG_LOG("Fota: firmware acceptance ARMED (kernel)\r\n");
 }
 
 void FOTA_vDisarmAcceptance(void)
 {
-    bFwAcceptArmed = false;
-    bPrepPending   = false;
+    bFwAcceptArmed     = false;
+    bFwAcceptViaKernel = false;
+    bPrepPending       = false;
     DBG_LOG("Fota: firmware acceptance disarmed\r\n");
 }
 
 bool FOTA_bAcceptanceArmed(void)
 {
     return bFwAcceptArmed;
+}
+
+bool FOTA_bAcceptanceArmedViaKernel(void)
+{
+    return bFwAcceptArmed && bFwAcceptViaKernel;
 }
 
 bool FOTA_bSessionActive(void)
@@ -1311,8 +1397,9 @@ bool FOTA_bSessionActive(void)
 
 void FOTA_vSecondaryReceive(void)
 {
-    bPrepPending = false;
-    bFwAcceptArmed = false;   /* one-shot: retry needs a fresh fwaccept */
+    bPrepPending       = false;
+    bFwAcceptArmed     = false;   /* one-shot: retry needs a fresh fwaccept */
+    bFwAcceptViaKernel = false;
 
     DBG_LOG("Fota: receiving v%lu (%lu B, %u chunks)\r\n",
             (unsigned long)tPrep.u32Version, (unsigned long)tPrep.u32ImageSize,

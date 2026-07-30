@@ -634,6 +634,20 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             DBG_LOG("DeviceDiscovery: Kernel wakeup - waiting up to %u s for FrKernel session...\r\n",
                 DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS / 1000U);
 
+#ifdef STORAGE_BACKEND_FLASH
+            /* Drop any leftover discovery TimeSync auto-arm before the kernel
+             * session opens: this wake is for kernel commands, not OTA. Left
+             * armed, a stray OtaPrep here would latch (bPrepPending) and — since
+             * the kernel rendezvous only serves an explicit "tag fwaccept" — sit
+             * un-consumed, then reject the next campaign's real OtaPrep as a
+             * different-sid session ("locked to"), wedging that secondary out of
+             * OTA. The next discovery TimeSync re-arms it anyway, so nothing is
+             * lost. An explicit "tag <ID> fwaccept" during the session re-arms
+             * via the kernel path. */
+            if (!FOTA_bAcceptanceArmedViaKernel())
+                FOTA_vDisarmAcceptance();
+#endif
+
             uint32_t u32WaitedMs = 0U;
             while (!FRKERNEL_bIsConnected() && u32WaitedMs < DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS)
             {
@@ -669,10 +683,17 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             {
 #ifdef STORAGE_BACKEND_FLASH
                 if (eDeviceRole == DEVICE_ROLE_SECONDARY &&
-                    FOTA_bAcceptanceArmed() && FOTA_bPrepPending())
+                    FOTA_bAcceptanceArmedViaKernel() && FOTA_bPrepPending())
                 {
-                    /* Verified image -> resets into the bootloader (no return);
-                     * failure returns here and the session keeps holding. */
+                    /* Only an EXPLICIT "tag <ID> fwaccept" (kernel arm) runs an
+                     * OTA receive inside a kernel session. A leftover discovery
+                     * TimeSync auto-arm must not be consumed here: it would let
+                     * a stray OtaPrep during a log-download wakeup start a
+                     * pointless receive that no primary is actually feeding
+                     * (the "receiving v... 0/N chunks - abort" seen in field
+                     * logs). Verified image -> resets into the bootloader (no
+                     * return); failure returns here and the session keeps
+                     * holding. */
                     FOTA_vSecondaryReceive();
                 }
                 else if (eDeviceRole == DEVICE_ROLE_PRIMARY &&

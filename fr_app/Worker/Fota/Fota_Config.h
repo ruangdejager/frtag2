@@ -173,4 +173,23 @@ typedef struct
 #define OTA_LORA_RX_IDLE_MS       20000U  /* secondary: session silence abort  */
 #define OTA_LORA_SESSION_MAX_MS   (12UL * 60UL * 1000UL)
 
+/* ---- Multi-primary coexistence (listen-before-distribute) ----
+ * Two primaries driven by the same fr9 schedule wake, TimeSync and start
+ * distributing in the same second, so their OtaPrep/chunk/ack exchanges
+ * collide and secondaries between them join neither. Before broadcasting
+ * its first OtaPrep a primary waits a random backoff and listens; if it
+ * hears another primary's live OTA session (any Ota* packet whose session
+ * id isn't ours) it defers this campaign and lets the other finish. The
+ * random backoff breaks the phase symmetry so one primary always Preps
+ * first; per-campaign randomness keeps it fair and self-healing. */
+#define OTA_DISTRIBUTE_BACKOFF_SPREAD_MS  5000U   /* random pre-Prep backoff; kept
+                                                     well under APP_OTA_PREP_WAIT_MS
+                                                     (15 s) so the winner's Prep
+                                                     still lands in the secondary's
+                                                     arm window                    */
+#define OTA_FOREIGN_ACTIVE_MS             6000U   /* foreign OTA counts as "another
+                                                     primary active" if heard this
+                                                     recently (~one PREP burst:
+                                                     REPEATS 5 * GAP 1000 ms)       */
+
 #endif /* WORKER_FOTA_FOTA_CONFIG_H_ */

@@ -168,7 +168,7 @@ static uint32_t   u32LastTimeSyncUtc  = 0;
 static bool       bTimeSyncUtcValid   = false;
 
 /* ---- Wakeup interval ---- */
-static WakeupInterval tCurrentWakeupInterval = WAKEUP_INTERVAL_60_MIN;
+static WakeupInterval tCurrentWakeupInterval = WAKEUP_INTERVAL_15_MIN;
 static const uint8_t u8CurrentWakeupIntervalMin[] = {
     [WAKEUP_INTERVAL_15_MIN]  = 15,
     [WAKEUP_INTERVAL_30_MIN]  = 30,
