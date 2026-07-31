@@ -26,6 +26,14 @@
 static hal_uart_t *uart1_buffer = NULL;
 static hal_uart_t *uart2_buffer = NULL;
 
+/* Upper bound on how long HAL_UART_vTxPutBuffer() waits for TX-ring space
+ * before giving up. Normal drain is sub-millisecond (ISR-paced at the baud
+ * rate); only a wedged/clock-gated USART sits full this long, and spinning
+ * forever there hangs the calling task — fatal when it holds a lock (the GPS
+ * dispatcher spins under xGpsLock). 2 s is orders of magnitude past any real
+ * transfer, so it never trips in normal operation. */
+#define HAL_UART_TX_STALL_TIMEOUT_MS   2000U
+
 /* Device role, latched once at boot from the strap (HAL_UART_vSetRole) so the
  * USART1 baud/swap can be chosen without re-reading PB12 on every HAL_UART_vInit
  * — the strap pin is tristated right after that single read. */
@@ -57,7 +65,22 @@ void HAL_UART_vInit(void)
 {
     LL_USART_InitTypeDef USART_InitStruct = {0};
 
-    __HAL_RCC_USART1_CLK_ENABLE();
+    /* Snapshot whether USART1 (GPS on a secondary, Farmranger on a primary) is
+     * already clocked — i.e. its owning driver has it powered and may be
+     * actively transmitting right now. This function is called from the
+     * wake-path tasks (schedule / AppTask) mainly to re-arm the debug UART
+     * after STOP2, but it also re-inits USART1 and clock-gates it at the end.
+     * Doing that to a USART1 another task is mid-transmit on kills the TX
+     * clock, so its ISR never drains the ring and HAL_UART_vTxPutBuffer()
+     * spins forever — hanging the GPS dispatcher while it holds xGpsLock:
+     * the deep-sleep lock never releases (no STOP2, red LED stays on) and the
+     * next GPS_vRequestFix() blocks on that mutex, so scheduled discovery
+     * wakes stop. So only (re)configure USART1 when it is IDLE; when it's in
+     * use, leave it entirely to its owner. USART1's baud/mode registers are
+     * retained across STOP2 and clock-gating, so the boot-time init (the one
+     * call where USART1 is guaranteed idle) is all it ever needs. */
+    bool bUsart1Idle = (__HAL_RCC_USART1_IS_CLK_ENABLED() != 1);
+
     __HAL_RCC_USART2_CLK_ENABLE();
 
     /* Debug / Farmranger UART (USART2) */
@@ -87,21 +110,31 @@ void HAL_UART_vInit(void)
      *
      * On a PRIMARY the pins are also TX/RX-swapped: the daughterboard wiring
      * to the fr9 Farmranger UART crosses PB6/PB7 the opposite way to the
-     * GNSS module wiring, so the MCU-side SWAP bit corrects for it. */
-    bool bPrimary = s_bPrimaryRole;
+     * GNSS module wiring, so the MCU-side SWAP bit corrects for it.
+     *
+     * Skipped entirely when USART1 is already in use (see bUsart1Idle above):
+     * its owner has it configured, and touching it here would race a live
+     * transfer. */
+    if (bUsart1Idle)
+    {
+        __HAL_RCC_USART1_CLK_ENABLE();
 
-    USART_InitStruct.BaudRate = bPrimary ? BSP_FARMRANGER_UART_BAUD : BSP_GPS_UART_BAUD;
-    LL_USART_Init(BSP_GPS_USART_INSTANCE, &USART_InitStruct);
-    LL_USART_SetHWFlowCtrl(BSP_GPS_USART_INSTANCE, LL_USART_HWCONTROL_NONE);
-    LL_USART_ConfigAsyncMode(BSP_GPS_USART_INSTANCE);
-    LL_USART_SetTXRXSwap(BSP_GPS_USART_INSTANCE,
-                          bPrimary ? LL_USART_TXRX_SWAPPED : LL_USART_TXRX_STANDARD);
-    LL_USART_Enable(BSP_GPS_USART_INSTANCE);
-    NVIC_SetPriority(BSP_GPS_USART_IRQn,
-                     NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 6, 0));
+        bool bPrimary = s_bPrimaryRole;
 
-    /* Leave clocks disabled until needed — re-enabled by HAL_UART_vSetup */
-    __HAL_RCC_USART1_CLK_DISABLE();
+        USART_InitStruct.BaudRate = bPrimary ? BSP_FARMRANGER_UART_BAUD : BSP_GPS_UART_BAUD;
+        LL_USART_Init(BSP_GPS_USART_INSTANCE, &USART_InitStruct);
+        LL_USART_SetHWFlowCtrl(BSP_GPS_USART_INSTANCE, LL_USART_HWCONTROL_NONE);
+        LL_USART_ConfigAsyncMode(BSP_GPS_USART_INSTANCE);
+        LL_USART_SetTXRXSwap(BSP_GPS_USART_INSTANCE,
+                              bPrimary ? LL_USART_TXRX_SWAPPED : LL_USART_TXRX_STANDARD);
+        LL_USART_Enable(BSP_GPS_USART_INSTANCE);
+        NVIC_SetPriority(BSP_GPS_USART_IRQn,
+                         NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 6, 0));
+
+        /* Leave the clock disabled until needed — re-enabled by HAL_UART_vSetup */
+        __HAL_RCC_USART1_CLK_DISABLE();
+    }
+
     __HAL_RCC_USART2_CLK_DISABLE();
 }
 
@@ -261,9 +294,22 @@ void HAL_UART_vTxPutBuffer(hal_uart_t *drv, const uint8_t *data, uint16_t length
         /* Push into the interrupt-driven TX ring; only yield when the ring is
          * full (waiting for the ISR to drain), not after every byte. Otherwise
          * output is throttled to ~1 KB/s, which makes a flash-log dump take
-         * minutes. With this, throughput is limited by the UART baud rate. */
+         * minutes. With this, throughput is limited by the UART baud rate.
+         *
+         * Bounded: a ring that stays full for HAL_UART_TX_STALL_TIMEOUT_MS
+         * means the TX ISR isn't draining it (clock gated / peripheral wedged).
+         * Spinning forever there would hang this task; if it holds a lock the
+         * whole subsystem wedges (this is exactly how a USART1 re-init racing a
+         * live GPS transfer used to hang the GPS dispatcher under xGpsLock).
+         * Drop the rest of the buffer instead — recoverable, unlike a deadlock. */
+        uint32_t u32WaitedMs = 0U;
         while (!HAL_UART_vTxPutByte(drv, data[idx]))
+        {
+            if (u32WaitedMs >= HAL_UART_TX_STALL_TIMEOUT_MS)
+                return;
             osDelay(1);
+            u32WaitedMs++;
+        }
     }
 }
 
