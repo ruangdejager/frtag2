@@ -27,6 +27,36 @@ static volatile uint32_t gSleepLockCount = 0;
  * "asleep between normal wakes" at a glance. */
 static volatile HalSystemSleepLed_e eSleepLed = HAL_SYSTEM_SLEEP_LED_RED;
 
+/* Sleep-indicator LED duty control (power saving).
+ *
+ * The LED still means the same thing — off in STOP2, a pulse when awake — but
+ * at a much lower duty than the old on-every-wake (~1 Hz) blink:
+ *   - STOP2 sleeping (no lock): pulse only once per SLEEP_PULSE_WAKE_DIVIDER
+ *     STOP2 wakes, i.e. roughly every 3 s at the 1 Hz heartbeat, ~3x less
+ *     LED-on time.
+ *   - Lock held (never enters STOP2): a short 2 Hz flash (below) instead of
+ *     solid on — far less duty than solid-on and visually distinct from the
+ *     slow 3 s sleep pulse, so a stuck/awake device is obvious.
+ * Both patterns drive whichever LED eSleepLed currently selects, so the
+ * ProductionSleep red<->yellow swap keeps working. */
+#define SLEEP_PULSE_WAKE_DIVIDER   3U      /* STOP2 wakes per LED pulse (~3 s @1 Hz) */
+#define LIGHT_PULSE_PERIOD_MS      500U    /* 2 Hz repeat rate                       */
+#define LIGHT_PULSE_ON_MS          20U     /* ... short on-flash each period         */
+
+static uint8_t u8SleepPulseWakeCount = 0U;
+
+static void HAL_SYSTEM_vSleepLedOn(void)
+{
+    if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED) BSP_LED_On(LED_RED);
+    else                                       BSP_LED_On(LED_YELLOW);
+}
+
+static void HAL_SYSTEM_vSleepLedOff(void)
+{
+    if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED) BSP_LED_Off(LED_RED);
+    else                                       BSP_LED_Off(LED_YELLOW);
+}
+
 void HAL_SYSTEM_vSetSleepIndicatorLed(HalSystemSleepLed_e eLed)
 {
     if (eLed == eSleepLed) return;
@@ -116,8 +146,7 @@ void HAL_SYSTEM_vEnterStop2(void)
      * held; STOP2 has no minimum-idle-time floor, so it can fire mid-flash,
      * and force-clearing here would extinguish that flash almost
      * immediately after it was set). */
-    if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED) BSP_LED_Off(LED_RED);
-    else                                       BSP_LED_Off(LED_YELLOW);
+    HAL_SYSTEM_vSleepLedOff();
 
     HAL_GPIO_vOnSleep();
 
@@ -157,8 +186,15 @@ void HAL_SYSTEM_vEnterStop2(void)
     HAL_SPI_vMarkParked();   /* SPI1 (ACC) + SPI2 (flash): restore on first select */
     HAL_ADC_vMarkParked();   /* ADC: restore + recalibrate on first HAL_ADC_vLock  */
 
-    if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED) BSP_LED_On(LED_RED);
-    else                                       BSP_LED_On(LED_YELLOW);
+    /* Pulse the indicator only every Nth wake, not every wake: a brief on this
+     * wake (the next STOP2 entry above turns it off again), so the LED blips
+     * ~once every 3 s at the 1 Hz heartbeat instead of every second — same
+     * "alive & sleeping" signal, ~3x less LED-on time. */
+    if (++u8SleepPulseWakeCount >= SLEEP_PULSE_WAKE_DIVIDER)
+    {
+        u8SleepPulseWakeCount = 0U;
+        HAL_SYSTEM_vSleepLedOn();
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -227,6 +263,20 @@ void vPortSuppressTicksAndSleep(TickType_t xExpectedIdleTime)
     else
     {
         /* ---- LIGHT path: core-gated WFI, SysTick keeps running ---- */
+
+        /* A sleep lock is held (or init isn't ready): we are NOT sleeping, so
+         * pulse the indicator at 2 Hz instead of leaving it solid on — halves
+         * the LED duty and makes "awake/locked" visually distinct from the slow
+         * 3 s STOP2 sleep pulse. Phase is taken from the RTC clock (not a
+         * per-call counter) so it stays a clean 2 Hz regardless of how often
+         * this idle hook runs; with SysTick live it re-runs ~every ms while
+         * idle-but-locked, which renders it smoothly. Register-only work, safe
+         * inside the cpsid-i critical section. */
+        if ((HAL_RTC_u32GetMsOfDay() % LIGHT_PULSE_PERIOD_MS) < LIGHT_PULSE_ON_MS)
+            HAL_SYSTEM_vSleepLedOn();
+        else
+            HAL_SYSTEM_vSleepLedOff();
+
         __asm volatile("dsb" ::: "memory");
         __asm volatile("wfi");
         __asm volatile("isb");
