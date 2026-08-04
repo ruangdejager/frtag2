@@ -56,10 +56,23 @@ DeviceRole_e              eDeviceRole;
 uint32_t                  u32DreqId;
 static volatile ProductionState_e eProductionState = PRODUCTION_READY;
 
+/* SolarSleep variant of PRODUCTION_SLEEP: identical super-deep-sleep state
+ * (same yellow STOP2 indicator, same suppressed discovery/acc logging), but
+ * a rising panel voltage must NOT wake it — only the shake sequence may.
+ * That lets a flat unit sit with the whole system disabled and take a full
+ * charge off the panel instead of waking the moment the sun hits it.
+ *
+ * Only meaningful while eProductionState == PRODUCTION_SLEEP. The schedule
+ * task skips its solar-activation check entirely while this is set, so the
+ * two solar exit paths cannot run; the kernel (shake) wake path is the only
+ * reachable exit and clears it. */
+static volatile bool bSolarWakeDisabled = false;
+
 /* ---- Forward declarations ---- */
 #ifdef ENABLE_LOW_POWER_RECOVERY
 static void DEVICE_DISCOVERY_vRecoveryMode(void);
 #endif
+static void DEVICE_DISCOVERY_vEnterSleepMode(bool bAllowSolarWake);
 static void DEVICE_DISCOVERY_vSendTS(void);
 static bool DEVICE_DISCOVERY_bBasicLogAndClear(const char *pacReason);
 static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters);
@@ -776,6 +789,15 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
         /* ---- ProductionSleep: secondary only — primary has no solar panel ---- */
         if (eDeviceRole == DEVICE_ROLE_SECONDARY && eProductionState == PRODUCTION_SLEEP)
         {
+            /* SolarSleep ("tag solarsleep"): shake-to-wake only. Skip the
+             * solar-activation check below entirely — the whole point is to
+             * stay disabled while the panel charges the battery, so a rising
+             * Vsolar/Psolar must not pull us out. The continue still applies,
+             * so no scheduled discovery wake fires either. Exit is via the
+             * shake sequence -> DEVICE_DISCOVERY_vTriggerKernelWakeup(). */
+            if (bSolarWakeDisabled)
+                continue;
+
 #ifdef ENABLE_SOLAR_POWER_SENSE
             if (SOLAR_u32GetPowerMW() >= SOLAR_ACTIVATION_POWER_MW)
             {
@@ -1184,11 +1206,17 @@ void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
      * resuming normal scheduled discovery. Mirrors the solar wake path. */
     if (eProductionState == PRODUCTION_SLEEP)
     {
-        eProductionState = PRODUCTION_ACTIVE;
+        bool bWasSolarSleep = bSolarWakeDisabled;
+
+        eProductionState   = PRODUCTION_ACTIVE;
+        /* Shake is the ONLY exit from SolarSleep — clear the flag here or the
+         * next ordinary "tag prodsleep" would inherit it and ignore solar. */
+        bSolarWakeDisabled = false;
         /* Swap the STOP2-indicator LED back to red now that we're no
          * longer in ProductionSleep — see HAL_SYSTEM_vSetSleepIndicatorLed. */
         HAL_SYSTEM_vSetSleepIndicatorLed(HAL_SYSTEM_SLEEP_LED_RED);
-        DBG_LOG("DeviceDiscovery: Kernel wakeup — exiting ProductionSleep\r\n");
+        DBG_LOG("DeviceDiscovery: Kernel wakeup — exiting %s\r\n",
+                bWasSolarSleep ? "SolarSleep" : "ProductionSleep");
 
         /* Same rationale as the solar wake path: get the RTC corrected as
          * early as possible after an unbounded ProductionSleep stretch,
@@ -1239,23 +1267,47 @@ osThreadId_t DEVICE_DISCOVERY_xGetTaskHandle(void)
 }
 
 /* --------------------------------------------------------------------------
+ * DEVICE_DISCOVERY_vEnterSleepMode — shared body for the two super-deep-sleep
+ * commands. Identical in every respect (state, indicator LED, suppressed
+ * discovery/acc logging) except whether a solar-level rise may wake us:
+ *   bAllowSolarWake == true  -> "tag prodsleep"  (solar OR shake)
+ *   bAllowSolarWake == false -> "tag solarsleep" (shake only; the panel gets
+ *                               to charge the battery undisturbed)
+ * -------------------------------------------------------------------------- */
+static void DEVICE_DISCOVERY_vEnterSleepMode(bool bAllowSolarWake)
+{
+    const char *pacName = bAllowSolarWake ? "ProductionSleep" : "SolarSleep";
+
+    if (eDeviceRole != DEVICE_ROLE_SECONDARY)
+    {
+        DBG_LOG("DeviceDiscovery: %s not applicable on primary device\r\n", pacName);
+        return;
+    }
+
+    bSolarWakeDisabled = !bAllowSolarWake;
+    eProductionState   = PRODUCTION_SLEEP;
+    /* Swap the STOP2-indicator LED to yellow so the bench can tell
+     * "asleep in ProductionSleep/SolarSleep, waiting for solar/shake" apart
+     * from the normal red "asleep between scheduled wakes" at a glance. Any
+     * exit path (solar activation or Kernel wakeup) swaps it back to red. */
+    HAL_SYSTEM_vSetSleepIndicatorLed(HAL_SYSTEM_SLEEP_LED_YELLOW);
+    DBG_LOG("DeviceDiscovery: Entering %s\r\n", pacName);
+}
+
+/* --------------------------------------------------------------------------
  * DEVICE_DISCOVERY_vEnterProductionSleep
  * -------------------------------------------------------------------------- */
 void DEVICE_DISCOVERY_vEnterProductionSleep(void)
 {
-    if (eDeviceRole != DEVICE_ROLE_SECONDARY)
-    {
-        DBG_LOG("DeviceDiscovery: ProductionSleep not applicable on primary device\r\n");
-        return;
-    }
-    eProductionState = PRODUCTION_SLEEP;
-    /* Swap the STOP2-indicator LED to yellow so the bench can tell
-     * "asleep in ProductionSleep, waiting for solar/shake" apart from
-     * the normal red "asleep between scheduled wakes" at a glance. Any
-     * ProductionSleep exit path (solar activation or Kernel wakeup)
-     * swaps it back to red. */
-    HAL_SYSTEM_vSetSleepIndicatorLed(HAL_SYSTEM_SLEEP_LED_YELLOW);
-    DBG_LOG("DeviceDiscovery: Entering ProductionSleep\r\n");
+    DEVICE_DISCOVERY_vEnterSleepMode(true);
+}
+
+/* --------------------------------------------------------------------------
+ * DEVICE_DISCOVERY_vEnterSolarSleep
+ * -------------------------------------------------------------------------- */
+void DEVICE_DISCOVERY_vEnterSolarSleep(void)
+{
+    DEVICE_DISCOVERY_vEnterSleepMode(false);
 }
 
 /* --------------------------------------------------------------------------

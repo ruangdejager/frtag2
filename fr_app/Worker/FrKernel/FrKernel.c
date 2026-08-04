@@ -394,6 +394,7 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                 "  tag discovery schedule      wakeup interval (min)\r\n"
                 "  tag discovery schedule <N>  set wakeup interval (15/30/60/120/240 min)\r\n"
                 "  tag prodsleep               enter production sleep (secondary only)\r\n"
+                "  tag solarsleep              as prodsleep, shake-to-wake only\r\n"
                 "  tag release                 release device for sleep\r\n"
             );
         }
@@ -411,6 +412,7 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                 "  tag <ID> discovery schedule wakeup interval (min)\r\n"
                 "  tag <ID> discovery schedule <N>  set wakeup interval (15/30/60/120/240)\r\n"
                 "  tag <ID> prodsleep          enter production sleep (secondary only)\r\n"
+                "  tag <ID> solarsleep         as prodsleep, shake-to-wake only\r\n"
                 "  tag <ID> release            release device for sleep\r\n"
                 "  tag * <cmd>                 bulk: every device runs <cmd> silently\r\n"
                 "                              (DBG_LOG only, no reply; action cmds only)\r\n"
@@ -558,6 +560,22 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
          * transmission (same "let the log line drain" pattern used before
          * FOTA_vArmBootloaderAndReset's reset). Then auto-release so
          * sleep proceeds immediately instead of opening a kernel window. */
+        osDelay(100);
+        s_bConnected = false;
+    }
+    else if (strcmp(p, "solarsleep") == 0)
+    {
+        /* Same super-deep sleep as prodsleep, minus the solar wake: only the
+         * shake sequence brings it back. For leaving a flat unit to charge
+         * with everything disabled — a rising panel voltage would otherwise
+         * wake it the moment the sun came up, which is exactly what we don't
+         * want while trying to put charge INTO the battery. */
+        DEVICE_DISCOVERY_vEnterSolarSleep();
+        FRKERNEL_vAck(eXport, bBulk, "SolarSleep entered — shake-to-wake only\r\n");
+
+        /* Terminal command, same as prodsleep above: let the response drain
+         * off the wire, then auto-release so sleep proceeds immediately
+         * instead of holding an open kernel window. */
         osDelay(100);
         s_bConnected = false;
     }

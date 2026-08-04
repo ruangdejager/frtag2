@@ -172,7 +172,17 @@ DeviceRole_e       DEVICE_DISCOVERY_eGetDeviceRole(void);
 osThreadId_t       DEVICE_DISCOVERY_xGetTaskHandle(void);
 void               DEVICE_DISCOVERY_vTriggerKernelWakeup(void);
 
+/* Super-deep sleep (secondary only): discovery, acc logging and scheduled
+ * wakes all stop; the STOP2 indicator goes yellow. The two variants differ
+ * only in what may wake the device again:
+ *   vEnterProductionSleep — a rising panel level OR the shake sequence.
+ *   vEnterSolarSleep      — the shake sequence ONLY, so a flat unit can take
+ *                           a full charge off the panel with the whole system
+ *                           disabled instead of waking as soon as the sun
+ *                           hits it.
+ * Both report PRODUCTION_SLEEP via eGetProductionState(). */
 void               DEVICE_DISCOVERY_vEnterProductionSleep(void);
+void               DEVICE_DISCOVERY_vEnterSolarSleep(void);
 ProductionState_e  DEVICE_DISCOVERY_eGetProductionState(void);
 
 #endif /* TASKS_DEVICEDISCOVERY_DEVICEDISCOVERY_H_ */
