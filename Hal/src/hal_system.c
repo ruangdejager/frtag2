@@ -78,6 +78,11 @@ void HAL_SYSTEM_vSetSleepIndicatorLed(HalSystemSleepLed_e eLed)
     eSleepLed = eLed;
 }
 
+HalSystemSleepLed_e HAL_SYSTEM_eGetSleepIndicatorLed(void)
+{
+    return eSleepLed;
+}
+
 void SystemClock_Config(void)
 {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};

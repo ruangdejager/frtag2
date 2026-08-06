@@ -219,6 +219,10 @@ static bool MOVE_bCheckPosition(uint8_t step)
     int8_t y = MoveAlg.Y.i8DcLevel;
     int8_t z = MoveAlg.Z.i8DcLevel;
 
+    /* 5-position sequence: flat-down -> up -> tilt X -> tilt Y -> up.
+     * (Previously 6 positions with a redundant "return to up" required
+     * between the X and Y tilts; removed so tilt X can transition straight
+     * into tilt Y.) */
     switch (step)
     {
         case 0: return (z < -MOVE_SEQ_GRAV_TH) &&
@@ -227,10 +231,9 @@ static bool MOVE_bCheckPosition(uint8_t step)
         case 1: return (z > +MOVE_SEQ_GRAV_TH);
         case 2: return ((x > MOVE_SEQ_GRAV_TH || x < -MOVE_SEQ_GRAV_TH)) &&
                        (z > -MOVE_SEQ_GRAV_NULL && z < MOVE_SEQ_GRAV_NULL);
-        case 3: return (z > +MOVE_SEQ_GRAV_TH);
-        case 4: return ((y > MOVE_SEQ_GRAV_TH || y < -MOVE_SEQ_GRAV_TH)) &&
+        case 3: return ((y > MOVE_SEQ_GRAV_TH || y < -MOVE_SEQ_GRAV_TH)) &&
                        (z > -MOVE_SEQ_GRAV_NULL && z < MOVE_SEQ_GRAV_NULL);
-        case 5: return (z > +MOVE_SEQ_GRAV_TH);
+        case 4: return (z > +MOVE_SEQ_GRAV_TH);
         default: return false;
     }
 }
@@ -255,9 +258,9 @@ static void MOVE_vSequenceTick(void)
             u8HoldCounter     = 0U;
             u8TransitionTicks = 0U;
 
-            DBG_LOG("Movement: shake-sequence step %u/6 accepted\r\n", u8SeqStep);
+            DBG_LOG("Movement: shake-sequence step %u/5 accepted\r\n", u8SeqStep);
 
-            if (u8SeqStep >= 6U)
+            if (u8SeqStep >= 5U)
             {
                 /* Sequence complete — flash 5 times then trigger kernel wakeup */
                 DBG_LOG("Movement: shake-sequence COMPLETE -> kernel wakeup\r\n");
@@ -282,7 +285,7 @@ static void MOVE_vSequenceTick(void)
 
         if (u8TransitionTicks >= MOVE_SEQ_TRANSITION_TICKS)
         {
-            DBG_LOG("Movement: shake-sequence reset (was step %u/6)\r\n", u8SeqStep);
+            DBG_LOG("Movement: shake-sequence reset (was step %u/5)\r\n", u8SeqStep);
             u8SeqStep         = 0U;
             u8TransitionTicks = 0U;
         }

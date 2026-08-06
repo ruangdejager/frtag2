@@ -39,4 +39,12 @@ void HAL_SYSTEM_vEnterStop2(void);
 typedef enum { HAL_SYSTEM_SLEEP_LED_RED = 0, HAL_SYSTEM_SLEEP_LED_YELLOW = 1 } HalSystemSleepLed_e;
 void HAL_SYSTEM_vSetSleepIndicatorLed(HalSystemSleepLed_e eLed);
 
+/* Current sleep-indicator LED. Movement's shake-sequence confirmation flash
+ * (Movement_Driver.h) reads this to always blink the OTHER LED, so it's never
+ * fighting the sleep indicator for the same physical LED — e.g. during
+ * ProductionSleep/SolarSleep the indicator owns yellow, so the shake flash
+ * moves to red instead of being stomped by the STOP2 entry/exit and 2 Hz
+ * lock-held pulsing that also drive yellow in that mode. */
+HalSystemSleepLed_e HAL_SYSTEM_eGetSleepIndicatorLed(void);
+
 #endif /* INC_HAL_SYSTEM_H_ */
