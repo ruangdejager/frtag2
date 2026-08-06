@@ -45,16 +45,55 @@ static volatile HalSystemSleepLed_e eSleepLed = HAL_SYSTEM_SLEEP_LED_RED;
 
 static uint8_t u8SleepPulseWakeCount = 0U;
 
+/* GPS-powered indication: while the GNSS module is on, the companion LED
+ * (the one that isn't the sleep indicator) flashes in step with the
+ * indicator, so "GPS is up" reads as both LEDs blinking together instead of
+ * just the usual single one. Pushed in by the GPS module on power-on/off
+ * rather than polled, which keeps this HAL file free of any device-layer
+ * dependency. See HAL_SYSTEM_vSetGpsActive(). */
+static volatile bool bGpsActive = false;
+
 static void HAL_SYSTEM_vSleepLedOn(void)
 {
-    if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED) BSP_LED_On(LED_RED);
-    else                                       BSP_LED_On(LED_YELLOW);
+    if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED)
+    {
+        BSP_LED_On(LED_RED);
+        if (bGpsActive) BSP_LED_On(LED_YELLOW);
+    }
+    else
+    {
+        BSP_LED_On(LED_YELLOW);
+        if (bGpsActive) BSP_LED_On(LED_RED);
+    }
 }
 
 static void HAL_SYSTEM_vSleepLedOff(void)
 {
-    if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED) BSP_LED_Off(LED_RED);
-    else                                       BSP_LED_Off(LED_YELLOW);
+    if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED)
+    {
+        BSP_LED_Off(LED_RED);
+        if (bGpsActive) BSP_LED_Off(LED_YELLOW);
+    }
+    else
+    {
+        BSP_LED_Off(LED_YELLOW);
+        if (bGpsActive) BSP_LED_Off(LED_RED);
+    }
+}
+
+void HAL_SYSTEM_vSetGpsActive(bool bActive)
+{
+    if (bActive == bGpsActive) return;
+
+    bGpsActive = bActive;
+
+    /* On the falling edge the companion LED may be mid-flash — force it off
+     * so it can't be stranded lit once it stops being driven. */
+    if (!bActive)
+    {
+        if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED) BSP_LED_Off(LED_YELLOW);
+        else                                       BSP_LED_Off(LED_RED);
+    }
 }
 
 void HAL_SYSTEM_vSetSleepIndicatorLed(HalSystemSleepLed_e eLed)

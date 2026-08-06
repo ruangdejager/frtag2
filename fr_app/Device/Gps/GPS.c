@@ -88,6 +88,18 @@ static volatile gps_state_e eState         = GPS_STATE_IDLE;
 static volatile bool        bAutoShutdown  = true;
 static volatile uint16_t    u16PendingTtffTimeout = GNSS_TTFF_TIMEOUT_1_AID_ASSIST;
 static bool                 bSessionActive = false;   /* drives RX-task gating      */
+
+/* Set by GPS_vShutdown() when it tears down a live session; consumed by the
+ * dispatcher before it arms. Without it, a shutdown landing in the window
+ * between GPS_vRequestFix() queueing GPS_DISP_TRIGGER_BIT and the dispatcher
+ * running would let the dispatcher power the module straight back on — with
+ * no sleep-lock reference behind it, since the shutdown already released the
+ * one the request took. The eventual GPS_vPowerOff() would then release a
+ * lock this module never held, stealing another subsystem's reference and
+ * dropping the device into STOP2 while that subsystem still needed it.
+ * Matters now that "tag prodsleep"/"tag solarsleep" call GPS_vShutdown()
+ * from the FrKernel task at an arbitrary moment. */
+static volatile bool        bSessionCancelled = false;
 static bool                 bCallerNotified= false;   /* GNSS_vOnSolution edge       */
 static bool                 bGpsPowered    = false;   /* hardware rail + UART state  */
 static osEventFlagsId_t     xGpsResultFlags = NULL;
@@ -318,6 +330,7 @@ static void GPS_vSessionArm(void)
         HAL_UART_vClearBuffer(&gps.UartHandle);
         GPS_DRIVER_vPowerEnHigh();
         bGpsPowered = true;
+        HAL_SYSTEM_vSetGpsActive(true);   /* both LEDs blink while GNSS is on */
 
         /* Apply 1Hz/GPS-only/full-power config. The MAX-M10S emits its first
          * $GNTXT boot messages almost immediately, but its UART *receiver*
@@ -358,6 +371,7 @@ static void GPS_vPowerOff(void)
     GPS_DRIVER_vPowerEnLow();
     GPS_DRIVER_vDisableUart(&gps.UartHandle);
     eState = GPS_STATE_IDLE;
+    HAL_SYSTEM_vSetGpsActive(false);   /* stop the companion-LED blink */
     DBG_LOG("gps: powered off\r\n");
 
     /* GPS is fully off — release the sleep lock taken by whoever requested
@@ -466,6 +480,9 @@ void GPS_vRequestFix(bool bAutoShutdownIn, uint32_t u32TtffTimeoutS, bool bForce
         u16PendingTtffTimeout = GNSS_TTFF_NO_TIMEOUT;
     }
 
+    /* A fresh request supersedes any pending shutdown-cancel. */
+    bSessionCancelled = false;
+
     switch (eState)
     {
     case GPS_STATE_IDLE:
@@ -556,6 +573,8 @@ void GPS_vShutdown(void)
     if (eState != GPS_STATE_IDLE)
     {
         DBG("gps: manual shutdown\r\n");
+        /* Block a dispatcher arm that may already be queued behind us. */
+        bSessionCancelled = true;
         GPS_vPowerOff();
         /* Signal dispatcher in case it's mid-wait — it observes eState==IDLE
          * and returns to its outer trigger-wait. */
@@ -591,6 +610,7 @@ bool GPS_bSelfTest(uint32_t u32TimeoutMs)
     HAL_UART_vClearBuffer(&gps.UartHandle);
     GPS_DRIVER_vPowerEnHigh();
     bGpsPowered = true;
+    HAL_SYSTEM_vSetGpsActive(true);
 
     osDelay(GPS_SELFTEST_WARMUP_MS);
 
@@ -612,6 +632,7 @@ bool GPS_bSelfTest(uint32_t u32TimeoutMs)
     GPS_DRIVER_vPowerEnLow();
     GPS_DRIVER_vDisableUart(&gps.UartHandle);
     bGpsPowered = false;
+    HAL_SYSTEM_vSetGpsActive(false);
 
     bool bOk = (u32ByteCnt >= GPS_SELFTEST_MIN_BYTES);
     DBG_LOG("gps: selftest %s (rx=%lu bytes in ~%lums)\r\n",
@@ -996,6 +1017,15 @@ static void GPS_vDispatcherTask(void *parameters)
         osThreadFlagsWait(GPS_DISP_TRIGGER_BIT, osFlagsWaitAny, osWaitForever);
 
         osMutexAcquire(xGpsLock, osWaitForever);
+        if (bSessionCancelled)
+        {
+            /* GPS_vShutdown() killed this session between the request and
+             * now — it already powered down and released the lock, so just
+             * consume the stale trigger instead of re-arming. */
+            bSessionCancelled = false;
+            osMutexRelease(xGpsLock);
+            continue;
+        }
         GPS_vSessionArm();
         osMutexRelease(xGpsLock);
 

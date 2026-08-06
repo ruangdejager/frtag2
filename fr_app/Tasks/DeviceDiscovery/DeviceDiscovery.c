@@ -351,6 +351,11 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 if ((int32_t)(u32LastPkt - u32SilenceRef) > 0)
                     u32SilenceRef = u32LastPkt;
 
+                /* prodsleep/solarsleep commanded mid-campaign: abandon it and
+                 * head for sleep instead of running out the window. */
+                if (eProductionState == PRODUCTION_SLEEP)
+                    break;
+
                 if ((uint32_t)(u32Now - u32CampaignStart) >= APP_DISCOVERY_WINDOW_TIMEOUT_MS)
                     break;   /* hard cap */
 
@@ -664,6 +669,15 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             uint32_t u32WaitedMs = 0U;
             while (!FRKERNEL_bIsConnected() && u32WaitedMs < DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS)
             {
+                /* A prodsleep/solarsleep command taken during this window is
+                 * an order to sleep NOW — don't keep the device awake for the
+                 * rest of the 3 min holding the kernel sleep lock. (The
+                 * command's own auto-release can otherwise be missed entirely
+                 * by this 500 ms poll, since it clears the session flag ~100 ms
+                 * after setting it.) */
+                if (eProductionState == PRODUCTION_SLEEP)
+                    break;
+
                 osDelay(500);
                 u32WaitedMs += 500U;
             }
@@ -1285,7 +1299,31 @@ static void DEVICE_DISCOVERY_vEnterSleepMode(bool bAllowSolarWake)
     }
 
     bSolarWakeDisabled = !bAllowSolarWake;
+    /* Set the state FIRST: the schedule task gates on it, so from here on it
+     * starts nothing new (no scheduled wake, no GPS pre-trigger) while we
+     * tear down what is already running. */
     eProductionState   = PRODUCTION_SLEEP;
+
+    /* Kill anything still running so the device goes down clean instead of
+     * sitting awake for minutes after being told to sleep.
+     *
+     * GPS is the one that both holds a sleep lock AND leaves a device
+     * powered: the solar/kernel wake paths kick off a 5-minute
+     * GPS_vRequestFix(), so without this the module would keep running (and
+     * blocking STOP2) long after the command. GPS_vShutdown() powers the
+     * receiver down and releases that lock through the normal
+     * GPS_vPowerOff() path, so the accounting stays exact — no leak, and no
+     * double release (it no-ops when already idle).
+     *
+     * The other in-flight work needs no forced teardown, it just has to be
+     * allowed to fall through its own exit: the AppTask's campaign / kernel
+     * windows now break out on PRODUCTION_SLEEP and release their sleep lock
+     * at the loop tail as always, and the FrKernel handler closes the
+     * session right after acking. A FOTA receive is deliberately left alone
+     * — it owns flash state mid-write and unwinds safely on its own silence
+     * timeout; forcing it here would risk a worse mess than the short wait. */
+    GPS_vShutdown();
+
     /* Swap the STOP2-indicator LED to yellow so the bench can tell
      * "asleep in ProductionSleep/SolarSleep, waiting for solar/shake" apart
      * from the normal red "asleep between scheduled wakes" at a glance. Any

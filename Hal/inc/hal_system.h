@@ -47,4 +47,11 @@ void HAL_SYSTEM_vSetSleepIndicatorLed(HalSystemSleepLed_e eLed);
  * lock-held pulsing that also drive yellow in that mode. */
 HalSystemSleepLed_e HAL_SYSTEM_eGetSleepIndicatorLed(void);
 
+/* GPS-powered indication. While set, the companion LED (whichever one is NOT
+ * the sleep indicator) flashes in step with the indicator, so "GNSS module is
+ * on" reads as both LEDs blinking together. Pushed in by the GPS module on
+ * power-on/off so this HAL layer needs no device-layer dependency; the
+ * falling edge forces the companion LED off so it can't be left lit. */
+void HAL_SYSTEM_vSetGpsActive(bool bActive);
+
 #endif /* INC_HAL_SYSTEM_H_ */
