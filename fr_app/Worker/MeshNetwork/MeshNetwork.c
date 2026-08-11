@@ -150,9 +150,24 @@ static uint32_t   u32NodeBeaconDreqId = 0;
 static uint8_t    u8NodeHopCount      = 0;
 static NodeRole_e eNodeRole           = NODE_ROLE_UNKNOWN;
 
-/* R2: bound beaconing so a lost D-Ack can't keep a node beaconing all campaign. */
+/* R2: bound beaconing so a lost D-Ack can't keep a node beaconing all wave.
+ * The budget is PER WAVE, not per campaign: hitting it drops us to forwarder,
+ * but the primary's next DReq wave re-arms us (see MESHNETWORK_vHandleDReq).
+ * Without that, a node whose 6 beacons all lost out to channel congestion
+ * went mute for the rest of the campaign while the primary was still
+ * actively re-asking for it, and simply never got counted. */
 static uint8_t    u8NodeBeaconCount      = 0;
-static uint32_t   u32NodeBeaconStartTick = 0;
+
+/* Survives the stop that bStopBeaconingLocked performs (which zeroes
+ * u32NodeBeaconDreqId), so after a cap we still know which primary we were
+ * talking to — needed both to match a late D-Ack and to recognise that
+ * primary's next wave. */
+static uint32_t   u32LastBeaconDreqId    = 0;
+
+/* True once a D-Ack for this campaign has been matched. Suppresses the
+ * per-wave re-arm: being acked means the primary has us, so further beacons
+ * would be pure wasted air time. Cleared per campaign in vResetNodeRole. */
+static bool       bNodeAckedThisCampaign = false;
 
 /* Multi-primary: "first TimeSync per wake" gate (secondaries only).
  * Reset by DeviceDiscovery at the start of each wake cycle. */
@@ -570,18 +585,18 @@ static void MESHNETWORK_vBuildAndQueueBeacon(void)
     FORWARD_vAdd(tBeacon.u32BeaconMsgId);
     MESHNETWORK_bSendPacket(u8Buf, u32Len);
 
-    /* R2: bound beaconing — count this beacon; once the count or time cap is
-     * hit, stop beaconing and become a forwarder even if no D-Ack arrived (lost
-     * D-Ack safety). The campaign then ends via the secondary silence rule. */
+    /* R2: bound beaconing — count this beacon; once the count cap is hit, stop
+     * beaconing and become a forwarder even if no D-Ack arrived (lost D-Ack
+     * safety). Not the end of the road: the primary's next DReq wave re-arms
+     * us with a fresh budget (see MESHNETWORK_vHandleDReq), so this is a
+     * per-wave backoff rather than a per-campaign giveup. */
     bool bDoStop = false;
     if (osMutexAcquire(xRoleMutex, 100) == osOK)
     {
         if (bNodeBeaconing)
         {
             u8NodeBeaconCount++;
-            uint32_t u32Now = osKernelGetTickCount();
-            if (u8NodeBeaconCount >= MESH_MAX_BEACONS_PER_CAMPAIGN ||
-                (u32Now - u32NodeBeaconStartTick) >= MESH_MAX_BEACON_DURATION_MS)
+            if (u8NodeBeaconCount >= MESH_MAX_BEACONS_PER_CAMPAIGN)
             {
                 bDoStop = MESHNETWORK_bStopBeaconingLocked(u32NodeBeaconDreqId);
             }
@@ -591,7 +606,7 @@ static void MESHNETWORK_vBuildAndQueueBeacon(void)
     if (bDoStop)
     {
         osTimerStop(xBeaconTimer);
-        DBG_LOG("MeshNetwork: Beacon cap reached, become forwarder\r\n");
+        DBG_LOG("MeshNetwork: Beacon cap reached, become forwarder (awaiting next wave)\r\n");
     }
 }
 
@@ -736,7 +751,35 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
     if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_PRIMARY)
     {
         NodeRole_e eRole = MESHNETWORK_eGetRole();
-        if (eRole == NODE_ROLE_FORWARDER)
+
+        /* Re-arm after a beacon cap: the primary issues a BRAND-NEW dreq id
+         * for every wave (DeviceDiscovery.c's campaign loop) precisely to ask
+         * again, so a node that burned its beacon budget on the previous wave
+         * without ever being acked must be allowed back in. Previously the
+         * FORWARDER test below swallowed every later wave and the node stayed
+         * mute for the rest of the campaign — a device could beacon 6 times
+         * into a congested channel in ~17 s, go silent, and never be counted
+         * even though the primary kept hunting for it for another ~50 s.
+         *
+         * Guards: same primary (via the id we preserved at cap time), a
+         * genuinely different dreq (so forwarded copies of the wave we
+         * already gave up on don't retrigger), and not already acked. The
+         * primary's own APP_PRIMARY_MAX_WAVES bounds how often this can
+         * happen. Re-arming skips forwarding this DReq, matching what a
+         * node beaconing from the start does. */
+        if (eRole == NODE_ROLE_FORWARDER &&
+            !bNodeAckedThisCampaign &&
+            u32LastBeaconDreqId != 0U &&
+            u32OriginId == (u32LastBeaconDreqId >> 16) &&
+            u32DreqId   != u32LastBeaconDreqId)
+        {
+            DBG_LOG("MeshNetwork: New wave %u after beacon cap - re-arming beacon\r\n",
+                    (unsigned)u8WaveCnt);
+            u8PrimaryDreqWaveCnt = u8WaveCnt;
+            i16BestDreqRssi      = s16Rssi;
+            MESHNETWORK_vStartBeaconing(u32DreqId, (uint8_t)(u8SenderHopCount + 1));
+        }
+        else if (eRole == NODE_ROLE_FORWARDER)
         {
             if (!FORWARD_bHasSeen(u32DreqId))
             {
@@ -1502,6 +1545,10 @@ static bool MESHNETWORK_bStopBeaconingLocked(uint32_t u32DreqId)
     if (u32NodeBeaconDreqId != u32DreqId) return false;
     bNodeBeaconing      = false;
     i16BestDreqRssi     = -256;
+    /* Remember who we were beaconing to before clearing the live id: a D-Ack
+     * delayed past the cap, or that primary's next wave, both still need to
+     * be attributable to this primary. */
+    u32LastBeaconDreqId = u32NodeBeaconDreqId;
     u32NodeBeaconDreqId = 0;
     eNodeRole           = NODE_ROLE_FORWARDER;
     return true;
@@ -1514,13 +1561,27 @@ static bool MESHNETWORK_bStopBeaconingLocked(uint32_t u32DreqId)
  * 16-bit id, so this stays multi-primary safe. */
 static void MESHNETWORK_vStopBeaconingByOrigin(uint32_t u32DreqId)
 {
-    bool bDoStop = false;
+    bool bDoStop  = false;
+    bool bLateAck = false;
     if (osMutexAcquire(xRoleMutex, 100) == osOK)
     {
         if (bNodeBeaconing &&
             (u32NodeBeaconDreqId >> 16) == (u32DreqId >> 16))
         {
+            bNodeAckedThisCampaign = true;
             bDoStop = MESHNETWORK_bStopBeaconingLocked(u32NodeBeaconDreqId);
+        }
+        else if (!bNodeBeaconing && u32LastBeaconDreqId != 0U &&
+                 (u32LastBeaconDreqId >> 16) == (u32DreqId >> 16))
+        {
+            /* Ack from the primary we beaconed to, arriving after we already
+             * hit the beacon cap. Congestion is exactly what both delays acks
+             * and burns the beacon budget, so this is the likely case rather
+             * than a rare one — and it used to be dropped on the floor,
+             * leaving the node convinced it was never heard. It WAS heard:
+             * record that so the next wave doesn't re-beacon for nothing. */
+            bNodeAckedThisCampaign = true;
+            bLateAck               = true;
         }
         osMutexRelease(xRoleMutex);
     }
@@ -1528,6 +1589,10 @@ static void MESHNETWORK_vStopBeaconingByOrigin(uint32_t u32DreqId)
     {
         osTimerStop(xBeaconTimer);
         DBG_LOG("MeshNetwork: Stop beaconing (acked), become forwarder\r\n");
+    }
+    else if (bLateAck)
+    {
+        DBG_LOG("MeshNetwork: Late D-Ack after beacon cap - counted, no re-arm\r\n");
     }
 }
 
@@ -1559,8 +1624,7 @@ static void MESHNETWORK_vStartBeaconing(uint32_t u32DreqId, uint8_t u8HopCount)
             u32NodeBeaconDreqId    = u32DreqId;
             u8NodeHopCount         = u8HopCount;
             eNodeRole              = NODE_ROLE_BEACONING;
-            u8NodeBeaconCount      = 0;
-            u32NodeBeaconStartTick = osKernelGetTickCount();
+            u8NodeBeaconCount      = 0;   /* fresh per-wave budget */
             bDoStart               = true;
         }
         osMutexRelease(xRoleMutex);
@@ -1652,9 +1716,13 @@ void MESHNETWORK_vResetNodeRole(void)
 {
     if (osMutexAcquire(xRoleMutex, 100) == osOK)
     {
-        bNodeBeaconing      = false;
-        u32NodeBeaconDreqId = 0;
-        eNodeRole           = NODE_ROLE_UNKNOWN;
+        bNodeBeaconing         = false;
+        u32NodeBeaconDreqId    = 0;
+        eNodeRole              = NODE_ROLE_UNKNOWN;
+        /* Fresh campaign: forget who we beaconed to and whether we were
+         * acked, so the per-wave re-arm starts from a clean slate. */
+        u32LastBeaconDreqId    = 0;
+        bNodeAckedThisCampaign = false;
         osMutexRelease(xRoleMutex);
     }
     osTimerStop(xBeaconTimer);   /* outside the lock */

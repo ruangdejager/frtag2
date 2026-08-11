@@ -29,10 +29,14 @@
  * airtime per campaign. */
 #define MESH_MAX_NEIGHBORS            120
 
-/* A beaconing node gives up (becomes forwarder) after whichever comes first —
- * bounds airtime if its D-Ack is silently lost. */
+/* A beaconing node stops (becomes forwarder) after this many beacons — bounds
+ * airtime if its D-Ack is silently lost. This is a PER-WAVE budget: the
+ * primary's next DReq wave re-arms a node that was never acked, so hitting it
+ * is a backoff, not a giveup for the whole campaign.
+ * (A parallel 30 s duration cap used to sit alongside this; at the 3.5 s
+ * beacon interval 6 beacons take ~21 s, so the count always won and the timer
+ * never once decided anything. Removed rather than left as dead config.) */
 #define MESH_MAX_BEACONS_PER_CAMPAIGN 6U
-#define MESH_MAX_BEACON_DURATION_MS   30000U
 
 /* TX jitter window — wide enough to de-correlate many nodes answering one DReq.
  * Max stays well under MESH_BEACON_INTERVAL_MS so a jittered beacon never slips
