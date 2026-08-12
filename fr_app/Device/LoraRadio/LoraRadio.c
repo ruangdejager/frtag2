@@ -44,6 +44,29 @@
 #define CAD_MAX_BACKOFF_MS      2000
 #define CAD_MAX_EXPONENT        4
 
+/* Per-packet carrier-sense budget in the TX drain. Was 5000 ms inline; named
+ * here because it multiplies with the drain batch size to bound how long the
+ * radio can be away from RX. */
+#define LORA_TX_CARRIER_WAIT_MS 5000U
+
+/* Max packets sent per pass through the radio task's event loop.
+ *
+ * This used to drain the ENTIRE queue in one `while`, never returning to the
+ * event loop until empty. With an 8-deep queue and a 5 s carrier-sense budget
+ * each, a congested node could sit up to ~40 s inside that loop — and carrier
+ * sense runs the chip in CAD, not RX, so the device is deaf for the whole
+ * time. A heavy-forwarding unit in the field missed the primary's TimeSync in
+ * 39 of 47 campaigns that way, which meant FOTA acceptance was never armed and
+ * it silently refused every firmware update. Draining a couple of packets per
+ * pass keeps the radio cycling back through RX. */
+#define LORA_TX_DRAIN_PER_PASS  2U
+
+/* Packets older than this are dropped instead of transmitted. A mesh forward
+ * that has been stuck behind a congested queue for this long is stale — the
+ * campaign that cared about it has moved on — and sending it only adds to the
+ * congestion that delayed it. */
+#define LORA_TX_MAX_AGE_MS      10000U
+
 /* Mask covering all 31 usable CMSIS thread-flag bits */
 #define ALL_FLAGS               (0x7FFFFFFFU)
 
@@ -57,6 +80,10 @@ static osThreadId_t       LORARADIO_vRadioTask_handle;
  * single time — hundreds per campaign, drowning the flash log. Counted here
  * and reported once per campaign via the mesh stats line. */
 static volatile uint16_t u16CadTimeoutCount = 0;
+
+/* Packets discarded unsent for exceeding LORA_TX_MAX_AGE_MS, plus those
+ * dropped by LORARADIO_vFlushTxQueue(). Reported alongside the CAD tally. */
+static volatile uint16_t u16TxStaleDropCount = 0;
 
 /* Pending radio events captured during carrier-sense / back-off */
 static volatile uint32_t gRadioPendingEvents = 0;
@@ -133,6 +160,8 @@ bool LORARADIO_bTxPacket(LoraRadio_Packet_t *packet)
     if (packet->length > (LORA_MAX_PACKET_SIZE - 2))
         return false;
 
+    packet->u32QueuedTick = osKernelGetTickCount();   /* for the stale-drop check */
+
     if (osMessageQueuePut(xLoRaTxQueue, packet, 0, 0) != osOK)
     {
         DBG_LOG("Loraradio: TX PKT queue full\r\n");
@@ -155,6 +184,8 @@ bool LORARADIO_bTxPacketWait(LoraRadio_Packet_t *packet, uint32_t timeoutMs)
      * osMessageQueueGet() pulls the head item, i.e. as soon as it has
      * actually finished with the previous packet -- no polling, no guessed
      * delay. */
+    packet->u32QueuedTick = osKernelGetTickCount();   /* for the stale-drop check */
+
     if (osMessageQueuePut(xLoRaTxQueue, packet, 0, timeoutMs) != osOK)
         return false;
 
@@ -254,16 +285,38 @@ void LORARADIO_vRadioTask(void *arg)
             LORARADIO_DRIVER_vEnterRxMode(0);
         }
 
-        /* ---------- TX REQUEST ---------- */
+        /* ---------- TX REQUEST ----------
+         * Bounded drain: at most LORA_TX_DRAIN_PER_PASS packets before falling
+         * back to the event loop. Carrier sense puts the chip in CAD, not RX,
+         * so time spent here is time spent deaf; emptying the whole queue in
+         * one go could hold that for tens of seconds and make the node miss
+         * the very TimeSync/OtaPrep it needs (see LORA_TX_DRAIN_PER_PASS).
+         * Anything still queued is picked up next pass — the queue-count test
+         * above re-enters this block without needing a fresh TX_PENDING. */
         if ((events & RADIO_EVT_TX_PENDING) ||
             (osMessageQueueGetCount(xLoRaTxQueue) > 0))
         {
-            while (osMessageQueueGet(xLoRaTxQueue, &pkt, NULL, 0) == osOK)
+            uint8_t u8Sent = 0U;
+
+            while (u8Sent < LORA_TX_DRAIN_PER_PASS &&
+                   osMessageQueueGet(xLoRaTxQueue, &pkt, NULL, 0) == osOK)
             {
+                /* Drop rather than send a packet that has been stuck behind a
+                 * congested queue: it is a mesh forward whose moment has
+                 * passed, and transmitting it now only feeds the congestion
+                 * that delayed it. Doesn't count against the send budget. */
+                if ((osKernelGetTickCount() - pkt.u32QueuedTick) > LORA_TX_MAX_AGE_MS)
+                {
+                    if (u16TxStaleDropCount < UINT16_MAX) u16TxStaleDropCount++;
+                    continue;
+                }
+
+                u8Sent++;
+
                 uint8_t crc = LORARADIO_u8CRC8_Calculate(pkt.buffer, pkt.length);
                 pkt.buffer[pkt.length++] = crc;
 
-                if (!LORARADIO_bCarrierSenseAndWait(5000))
+                if (!LORARADIO_bCarrierSenseAndWait(LORA_TX_CARRIER_WAIT_MS))
                 {
                     uint32_t stashed = LORARADIO_u32ConsumePendingEvents();
                     if (stashed)
@@ -381,6 +434,32 @@ uint16_t LORARADIO_u16GetAndClearCadTimeouts(void)
     uint16_t u16Count = u16CadTimeoutCount;
     u16CadTimeoutCount = 0U;
     return u16Count;
+}
+
+uint16_t LORARADIO_u16GetAndClearTxStaleDrops(void)
+{
+    uint16_t u16Count = u16TxStaleDropCount;
+    u16TxStaleDropCount = 0U;
+    return u16Count;
+}
+
+void LORARADIO_vFlushTxQueue(void)
+{
+    LoraRadio_Packet_t tDiscard;
+    uint16_t           u16Dropped = 0U;
+
+    if (xLoRaTxQueue == NULL) return;
+
+    while (osMessageQueueGet(xLoRaTxQueue, &tDiscard, NULL, 0) == osOK)
+        u16Dropped++;
+
+    if (u16Dropped > 0U)
+    {
+        if ((uint32_t)u16TxStaleDropCount + u16Dropped > UINT16_MAX)
+            u16TxStaleDropCount = UINT16_MAX;
+        else
+            u16TxStaleDropCount = (uint16_t)(u16TxStaleDropCount + u16Dropped);
+    }
 }
 
 /* --------------------------------------------------------------------------

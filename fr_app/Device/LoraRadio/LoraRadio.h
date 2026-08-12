@@ -31,6 +31,11 @@ typedef struct {
     uint8_t  length;
     int16_t  rssi;
     int8_t   snr;
+    /* Tick at which this packet was queued for TX. Set by the radio layer on
+     * enqueue (callers leave it alone); used to discard packets that sat in
+     * the queue so long that sending them is pointless — see
+     * LORA_TX_MAX_AGE_MS. Unused on the RX path. */
+    uint32_t u32QueuedTick;
 } LoraRadio_Packet_t;
 
 void     LORARADIO_vInit(void);
@@ -67,6 +72,18 @@ bool     LORARADIO_bCarrierSenseAndWait(uint32_t maxWaitMs);
  * campaign in the mesh stats line rather than logged per occurrence, which
  * under congestion ran to hundreds of lines and buried everything else. */
 uint16_t LORARADIO_u16GetAndClearCadTimeouts(void);
+
+/* Packets discarded unsent since the last call — aged out of the TX queue or
+ * dropped by LORARADIO_vFlushTxQueue(). Reading clears the tally. Reported
+ * alongside the CAD count in the per-campaign mesh stats line. */
+uint16_t LORARADIO_u16GetAndClearTxStaleDrops(void);
+
+/* Discard everything still queued for TX. Call when the work that queued it
+ * is over (campaign end / before sleep): otherwise the radio task keeps
+ * carrier-sensing its way through a stale backlog for minutes afterwards,
+ * burning power and — because carrier sense runs the chip in CAD rather than
+ * RX — staying deaf well into the next event it should have heard. */
+void LORARADIO_vFlushTxQueue(void);
 
 void LORARADIO_vEnterDeepSleep(void);
 void LORARADIO_vWakeUp(void);

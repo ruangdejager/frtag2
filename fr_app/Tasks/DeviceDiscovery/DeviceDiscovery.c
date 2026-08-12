@@ -418,6 +418,19 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
          * ---------------------------------------------------------------- */
         DBG_LOG("DeviceDiscovery %X: Discovery complete.\r\n",
             LORARADIO_u32GetUniqueId());
+
+        /* Drop whatever mesh traffic is still queued for TX. The campaign it
+         * belonged to is over, so sending it is pointless — and on a
+         * heavy-forwarding node the radio task would otherwise spend minutes
+         * carrier-sensing through that backlog, deaf the whole time (carrier
+         * sense runs the chip in CAD, not RX). That deafness is what made one
+         * unit miss the primary's post-campaign TimeSync in 39 of 47
+         * campaigns and so never arm FOTA acceptance at all. Flushed here,
+         * before the stats line, so the drop shows up in this campaign's
+         * tally. */
+        MESHNETWORK_vFlushTxQueue();
+        LORARADIO_vFlushTxQueue();
+
         MESHNETWORK_vLogCampaignStats("campaign");
         EVTLOG(LOG_DISCOVERY_CMPLT, eDeviceRole);
 

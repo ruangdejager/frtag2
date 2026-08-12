@@ -229,6 +229,14 @@ static uint16_t u16StatBeaconsHeard;
 static uint16_t u16StatAcksHeard;
 static uint16_t u16StatMsgsForwarded;
 
+/* Mesh-layer packets that never made it onto the air: dropped because the
+ * mesh TX queue was full, or discarded by MESHNETWORK_vFlushTxQueue(). Summed
+ * with the radio layer's own tally into the campaign stats "txDrop" figure.
+ * Back-pressure skips are deliberately NOT counted here — refusing to queue a
+ * relay is the mechanism that PREVENTS these drops, so folding it in would
+ * make the number climb precisely when things are working. */
+static uint16_t u16StatTxDropped;
+
 /* Tick of the most recent received discovery packet (any type).
  * Updated in every handler so DeviceDiscovery can detect mesh activity
  * without needing to track individual packet-type ticks. */
@@ -689,6 +697,27 @@ static void MESHNETWORK_vPrimaryAckTimerCallback(void *arg)
 }
 
 /* --------------------------------------------------------------------------
+ * MESHNETWORK_bTxBacklogHigh — is the TX queue too deep to take more relay
+ * traffic?
+ *
+ * Back-pressure for FORWARDED packets only. A node that hears a lot (a
+ * well-placed relay can hear 300+ beacons a campaign) will otherwise queue
+ * relays faster than a congested channel drains them, fill the queue, and
+ * then drop at the tail anyway — having already committed the airtime and
+ * latency of everything ahead. Refusing early keeps the queue shallow, which
+ * is what keeps the radio cycling back to RX promptly.
+ *
+ * Applied to beacon/DReq/ack relays. NOT applied to TimeSync (rare, and the
+ * one packet the whole mesh depends on for time + firmware notification) or
+ * to this node's own transmissions.
+ * -------------------------------------------------------------------------- */
+static bool MESHNETWORK_bTxBacklogHigh(void)
+{
+    if (xMeshTxQueue == NULL) return false;
+    return (osMessageQueueGetCount(xMeshTxQueue) >= (MESH_TX_QUEUE_LEN / 2));
+}
+
+/* --------------------------------------------------------------------------
  * MESHNETWORK_bSendPacket — enqueue with TX jitter
  * -------------------------------------------------------------------------- */
 static bool MESHNETWORK_bSendPacket(const uint8_t *pBuf, size_t u32Len)
@@ -705,6 +734,7 @@ static bool MESHNETWORK_bSendPacket(const uint8_t *pBuf, size_t u32Len)
 
     if (osMessageQueuePut(xMeshTxQueue, &tItem, 0, 50) != osOK)
     {
+        if (u16StatTxDropped < UINT16_MAX) u16StatTxDropped++;
         DBG_LOG("MeshNetwork: TX queue full, dropping packet\r\n");
         return false;
     }
@@ -781,7 +811,7 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
         }
         else if (eRole == NODE_ROLE_FORWARDER)
         {
-            if (!FORWARD_bHasSeen(u32DreqId))
+            if (!FORWARD_bHasSeen(u32DreqId) && !MESHNETWORK_bTxBacklogHigh())
             {
                 uint8_t u8Out[32];
                 size_t  u32OutLen = 0;
@@ -912,8 +942,12 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
         return;
     }
 
-    /* 4. Secondary forwarder: relay beacon */
-    if (MESHNETWORK_eGetRole() == NODE_ROLE_FORWARDER)
+    /* 4. Secondary forwarder: relay beacon.
+     * Skipped while the TX queue is already backed up — beacon relays are by
+     * far the highest-volume traffic here, and queueing more of them is what
+     * drives the backlog that keeps the radio in CAD instead of RX. */
+    if (MESHNETWORK_eGetRole() == NODE_ROLE_FORWARDER &&
+        !MESHNETWORK_bTxBacklogHigh())
     {
         tBeacon.u8HopCount++;
         uint8_t u8Buf[64];
@@ -1153,7 +1187,8 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
     }
     FORWARD_vAdd(u32AckMsgId);
 
-    if (MESHNETWORK_eGetRole() == NODE_ROLE_FORWARDER)
+    if (MESHNETWORK_eGetRole() == NODE_ROLE_FORWARDER &&
+        !MESHNETWORK_bTxBacklogHigh())
     {
         MESHNETWORK_bSendPacket(pBuf, u32Len);
         DBG("MeshNetwork: Ack forwarded\r\n");
@@ -1735,7 +1770,12 @@ void MESHNETWORK_vFlushTxQueue(void)
     if (xMeshTxQueue == NULL) return;
     MeshTxItem_t tItem;
     while (osMessageQueueGet(xMeshTxQueue, &tItem, NULL, 0) == osOK)
-        ; /* discard */
+    {
+        /* Counted, not silent: a flush that routinely discards a lot is the
+         * signature of a node queueing relays faster than the channel drains
+         * them — the condition that used to leave it deaf for minutes. */
+        if (u16StatTxDropped < UINT16_MAX) u16StatTxDropped++;
+    }
 }
 
 void MESHNETWORK_vIncrDreqWaveCnt(void) { u8PrimaryDreqWaveCnt++; }
@@ -1746,6 +1786,7 @@ void MESHNETWORK_vResetDreqWaveCnt(void)
     u16StatBeaconsHeard   = 0U;
     u16StatAcksHeard      = 0U;
     u16StatMsgsForwarded  = 0U;
+    u16StatTxDropped      = 0U;
 }
 
 /* One-line campaign traffic summary in place of a DBG_LOG per packet —
@@ -1757,10 +1798,13 @@ void MESHNETWORK_vLogCampaignStats(const char *pcTag)
     /* cadTmo: CAD attempts that timed out this campaign — the congestion
      * indicator that used to be one DBG_LOG line per occurrence. Read-and-
      * clear, so each campaign reports only its own. */
-    DBG_LOG("MeshNetwork: %s stats - DReq heard=%u beacons heard=%u acks heard=%u forwarded=%u cadTmo=%u\r\n",
+    DBG_LOG("MeshNetwork: %s stats - DReq heard=%u beacons heard=%u acks heard=%u forwarded=%u cadTmo=%u txDrop=%u\r\n",
             pcTag, (unsigned)u16StatDReqHeard, (unsigned)u16StatBeaconsHeard,
             (unsigned)u16StatAcksHeard, (unsigned)u16StatMsgsForwarded,
-            (unsigned)LORARADIO_u16GetAndClearCadTimeouts());
+            (unsigned)LORARADIO_u16GetAndClearCadTimeouts(),
+            /* Both layers' discards in one figure: mesh-queue drops/flushes
+             * plus the radio layer's aged-out and flushed packets. */
+            (unsigned)(u16StatTxDropped + LORARADIO_u16GetAndClearTxStaleDrops()));
 }
 
 /* Small OTA responses (PrepAck/Report) ride the normal jittered mesh TX
