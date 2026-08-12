@@ -182,6 +182,12 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         /* R6: drop any TX left over from the previous campaign (e.g. a
          * late-jittered forward) so it can't fire at the start of this one. */
         MESHNETWORK_vFlushTxQueue();
+#ifdef STORAGE_BACKEND_FLASH
+        /* Likewise drop an OtaPrep latched last campaign but never serviced —
+         * left set, it makes the session-id latch reject this campaign's Prep
+         * and the unit stops accepting firmware entirely. */
+        FOTA_vDropStalePrep();
+#endif
 
         DBG_LOG("DeviceDiscovery %X: Woke up for discovery.\r\n",
             LORARADIO_u32GetUniqueId());

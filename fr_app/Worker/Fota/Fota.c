@@ -714,16 +714,42 @@ void FOTA_vOnLoraPacket(const uint8_t *pu8Buf, uint16_t u16Len)
             {
                 if (u32NewSid != tPrep.u32SessionId)
                 {
-                    DBG("Fota: OtaPrep sid=%08X ignored (locked to %08X)\r\n",
-                        u32NewSid, tPrep.u32SessionId);
+                    /* A pending Prep that no one ever picked up goes stale.
+                     * Without this the latch is permanent: if the AppTask had
+                     * already left its campaign loop when the Prep landed,
+                     * bPrepPending stays set forever and every future OtaPrep
+                     * is refused here for having a different session id — the
+                     * device silently stops accepting firmware for good.
+                     * (bRxSessionActive is deliberately NOT expired here; a
+                     * live transfer has its own OTA_LORA_RX_IDLE_MS timeout.) */
+                    if (bPrepPending && !bRxSessionActive &&
+                        (osKernelGetTickCount() - u32LastSessionPktTick) >= OTA_PREP_PENDING_MAX_MS)
+                    {
+                        DBG_LOG("Fota: stale pending OtaPrep sid=%08X expired - accepting sid=%08X\r\n",
+                                (unsigned)tPrep.u32SessionId, (unsigned)u32NewSid);
+                        bPrepPending = false;
+                        /* fall through and latch the new session below */
+                    }
+                    else
+                    {
+                        /* DBG_LOG, not DBG: this rejection is exactly what a
+                         * wedged unit does forever, and as a UART-only line it
+                         * was invisible in a flash-log dump — the failure left
+                         * no trace at all in the field. */
+                        DBG_LOG("Fota: OtaPrep sid=%08X ignored (locked to %08X)\r\n",
+                                (unsigned)u32NewSid, (unsigned)tPrep.u32SessionId);
+                        return;
+                    }
+                }
+                else
+                {
+                    /* Same-sid re-arrival — normal PREP_REPEATS retransmit
+                     * from the already-latched primary. Just refresh the
+                     * activity timer so any concurrent silence timeout
+                     * doesn't fire while the primary is still announcing. */
+                    u32LastSessionPktTick = osKernelGetTickCount();
                     return;
                 }
-                /* Same-sid re-arrival — normal PREP_REPEATS retransmit
-                 * from the already-latched primary. Just refresh the
-                 * activity timer so any concurrent silence timeout
-                 * doesn't fire while the primary is still announcing. */
-                u32LastSessionPktTick = osKernelGetTickCount();
-                return;
             }
 
             tPrep.u32SessionId   = u32NewSid;
@@ -1349,6 +1375,22 @@ void FOTA_vDistribute(void)
 bool FOTA_bPrepPending(void)
 {
     return bPrepPending;
+}
+
+void FOTA_vDropStalePrep(void)
+{
+    /* Called at campaign start. A Prep still pending here was latched during
+     * an EARLIER campaign and never serviced — the AppTask that should have
+     * consumed it has long since slept. It can never be acted on now, and
+     * leaving it set makes the session-id latch reject this campaign's Prep
+     * too. Drop it so this wake starts able to accept firmware.
+     * Never touches a live receive (bRxSessionActive). */
+    if (bPrepPending && !bRxSessionActive)
+    {
+        DBG_LOG("Fota: dropping stale pending OtaPrep sid=%08X from a previous campaign\r\n",
+                (unsigned)tPrep.u32SessionId);
+        bPrepPending = false;
+    }
 }
 
 void FOTA_vArmAcceptance(void)

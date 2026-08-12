@@ -62,6 +62,12 @@ uint32_t LORARADIO_u32GetRandomNumber(uint32_t max_value);
 bool     LORARADIO_bCarrierSense(void);
 bool     LORARADIO_bCarrierSenseAndWait(uint32_t maxWaitMs);
 
+/* Number of CAD attempts that timed out (no CAD result inside the 300 ms
+ * window) since the last call; reading clears the tally. Reported once per
+ * campaign in the mesh stats line rather than logged per occurrence, which
+ * under congestion ran to hundreds of lines and buried everything else. */
+uint16_t LORARADIO_u16GetAndClearCadTimeouts(void);
+
 void LORARADIO_vEnterDeepSleep(void);
 void LORARADIO_vWakeUp(void);
 

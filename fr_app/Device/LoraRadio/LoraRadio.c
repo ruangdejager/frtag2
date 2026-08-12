@@ -52,6 +52,12 @@ static osMessageQueueId_t xLoRaTxQueue;
 static osMessageQueueId_t xLoRaRxQueue;
 static osThreadId_t       LORARADIO_vRadioTask_handle;
 
+/* CAD-timeout tally. A CAD that never reports a result within the 300 ms
+ * window is normal-ish under congestion but used to emit a DBG_LOG line every
+ * single time — hundreds per campaign, drowning the flash log. Counted here
+ * and reported once per campaign via the mesh stats line. */
+static volatile uint16_t u16CadTimeoutCount = 0;
+
 /* Pending radio events captured during carrier-sense / back-off */
 static volatile uint32_t gRadioPendingEvents = 0;
 
@@ -331,7 +337,11 @@ bool LORARADIO_bCarrierSense(void)
 
     if (r & osFlagsError)
     {
-        DBG_LOG("Loraradio: CAD timeout, assuming busy\r\n");
+        /* Counted, not logged per occurrence: under congestion this fires
+         * hundreds of times per campaign and used to bury everything else in
+         * the flash log. The tally is reported once per campaign instead —
+         * see LORARADIO_u16GetAndClearCadTimeouts(). */
+        if (u16CadTimeoutCount < UINT16_MAX) u16CadTimeoutCount++;
         return false;
     }
 
@@ -364,6 +374,13 @@ bool LORARADIO_bCarrierSense(void)
         LORARADIO_vStashPendingEvents(r);
     }
     return false;
+}
+
+uint16_t LORARADIO_u16GetAndClearCadTimeouts(void)
+{
+    uint16_t u16Count = u16CadTimeoutCount;
+    u16CadTimeoutCount = 0U;
+    return u16Count;
 }
 
 /* --------------------------------------------------------------------------

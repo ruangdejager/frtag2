@@ -1754,9 +1754,13 @@ void MESHNETWORK_vResetDreqWaveCnt(void)
  * MESHNETWORK_vResetDreqWaveCnt() to start a fresh campaign's tally. */
 void MESHNETWORK_vLogCampaignStats(const char *pcTag)
 {
-    DBG_LOG("MeshNetwork: %s stats - DReq heard=%u beacons heard=%u acks heard=%u forwarded=%u\r\n",
+    /* cadTmo: CAD attempts that timed out this campaign — the congestion
+     * indicator that used to be one DBG_LOG line per occurrence. Read-and-
+     * clear, so each campaign reports only its own. */
+    DBG_LOG("MeshNetwork: %s stats - DReq heard=%u beacons heard=%u acks heard=%u forwarded=%u cadTmo=%u\r\n",
             pcTag, (unsigned)u16StatDReqHeard, (unsigned)u16StatBeaconsHeard,
-            (unsigned)u16StatAcksHeard, (unsigned)u16StatMsgsForwarded);
+            (unsigned)u16StatAcksHeard, (unsigned)u16StatMsgsForwarded,
+            (unsigned)LORARADIO_u16GetAndClearCadTimeouts());
 }
 
 /* Small OTA responses (PrepAck/Report) ride the normal jittered mesh TX

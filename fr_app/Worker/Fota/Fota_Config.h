@@ -171,6 +171,23 @@ typedef struct
                                              arrived on the air.            */
 #define OTA_LORA_REPAIR_ROUNDS    3U      /* repair passes per window          */
 #define OTA_LORA_RX_IDLE_MS       20000U  /* secondary: session silence abort  */
+
+/* How long a latched-but-unserviced OtaPrep stays valid on a secondary.
+ *
+ * bPrepPending is set by the mesh-parser task and consumed by the AppTask.
+ * If the AppTask has already left its campaign loop when the Prep lands (a
+ * congested campaign can push the primary's TimeSync/OtaPrep phase out past
+ * the secondary's silence timeout), nothing ever consumes it — and the
+ * first-primary-wins latch then rejects EVERY later OtaPrep because its
+ * session id differs. Field case: one unit sat locked to a dead session id
+ * for ~18 h, refusing an update all 37 of its peers took, and only recovered
+ * when a shake-wake happened to disarm acceptance.
+ *
+ * So a pending Prep expires: past this age with no receive started, a
+ * different-session OtaPrep is allowed to take over. Sized off
+ * OTA_LORA_RX_IDLE_MS — the same "this session is dead" scale used for an
+ * in-progress transfer. */
+#define OTA_PREP_PENDING_MAX_MS   OTA_LORA_RX_IDLE_MS
 #define OTA_LORA_SESSION_MAX_MS   (12UL * 60UL * 1000UL)
 
 /* ---- Multi-primary coexistence (listen-before-distribute) ----

@@ -138,6 +138,13 @@ void FOTA_vDisarmAcceptance(void);
 bool FOTA_bAcceptanceArmed(void);
 bool FOTA_bAcceptanceArmedViaKernel(void);
 
+/* Discard an OtaPrep that was latched in a previous campaign and never
+ * serviced. Call at campaign start: such a Prep can no longer be acted on,
+ * and while it lingers the session-id latch refuses every new OtaPrep — which
+ * is how a unit can silently stop accepting firmware indefinitely. No-op
+ * during a live receive. */
+void FOTA_vDropStalePrep(void);
+
 /* --------------------------------------------------------------------------
  * Session priority
  * -------------------------------------------------------------------------- */
