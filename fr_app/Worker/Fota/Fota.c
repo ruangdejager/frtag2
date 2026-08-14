@@ -200,6 +200,60 @@ static uint8_t FOTA_u8CalcImageXor224(uint32_t u32Start, uint32_t u32Len)
     return FOTA_u8CalcImageXorRangeBuf(u32Start, u32Len, au8Buf, sizeof(au8Buf));
 }
 
+/* Direct test for "a page program was aborted part-way": an interrupted
+ * NOR page program leaves the bytes it already burned in place and the rest
+ * of the page at 0xFF, so a truncated page shows up as a run of trailing
+ * 0xFF inside an image that should have none of any length. Needs no
+ * reference copy of the image — the signature is self-evident in the stored
+ * bytes — which is what makes it usable in the field.
+ *
+ * Reports fully-blank pages separately from partially-written ones: all-0xFF
+ * means the page was never programmed at all, a partial tail means the
+ * program started and was cut off. Which of the two appears (and at what
+ * offset) distinguishes a lost write from an aborted one. */
+static void FOTA_vScanBlankRuns(uint32_t u32Len)
+{
+    uint8_t  au8Page[FOTA_DRIVER_PAGE_SIZE];
+    uint32_t u32BlankPages = 0U;
+    uint32_t u32PartialTail = 0U;
+    uint32_t u32FirstBlank = 0xFFFFFFFFUL;
+    uint32_t u32FirstPartial = 0xFFFFFFFFUL;
+
+    for (uint32_t u32Off = 0U; u32Off < u32Len; u32Off += FOTA_DRIVER_PAGE_SIZE)
+    {
+        uint16_t u16Chunk = (uint16_t)((u32Len - u32Off) > FOTA_DRIVER_PAGE_SIZE
+                                       ? FOTA_DRIVER_PAGE_SIZE
+                                       : (u32Len - u32Off));
+        if (!FOTA_bReadImage(u32Off, au8Page, u16Chunk))
+            continue;
+
+        /* Count trailing 0xFF for this page. */
+        uint16_t u16Tail = 0U;
+        while (u16Tail < u16Chunk && au8Page[u16Chunk - 1U - u16Tail] == 0xFFU)
+            u16Tail++;
+
+        if (u16Tail == u16Chunk)
+        {
+            u32BlankPages++;
+            if (u32FirstBlank == 0xFFFFFFFFUL) u32FirstBlank = u32Off;
+        }
+        else if (u16Tail >= 16U)
+        {
+            u32PartialTail++;
+            if (u32FirstPartial == 0xFFFFFFFFUL) u32FirstPartial = u32Off;
+        }
+
+        if ((u32Off % 0x8000UL) == 0U && u32Off > 0U)
+            osDelay(1);
+    }
+
+    DBG_LOG("Fota: BLANKSCAN blankPages=%lu (first 0x%lX) partialTail>=16B=%lu (first 0x%lX)\r\n",
+            (unsigned long)u32BlankPages,
+            (unsigned long)(u32FirstBlank   == 0xFFFFFFFFUL ? 0UL : u32FirstBlank),
+            (unsigned long)u32PartialTail,
+            (unsigned long)(u32FirstPartial == 0xFFFFFFFFUL ? 0UL : u32FirstPartial));
+}
+
 /* A transient SPI/flash read glitch was confirmed on hardware: a fresh
  * full-image XOR pass can occasionally return a wrong value while the
  * stored bytes are actually fine, and a plain immediate re-read recovers
@@ -1214,6 +1268,15 @@ void FOTA_vDistribute(void)
                         u8Q);
             }
         }
+
+        /* Direct test of the aborted-page-program theory — see
+         * FOTA_vScanBlankRuns. If exactly one page reports a partial 0xFF
+         * tail, a write really was cut off mid-program and the quarter it
+         * lands in should match the disagreeing Q above. If nothing blank
+         * turns up at all, the stored bytes are fully written and the fault
+         * is upstream of the flash (what we XOR, or what we were told to
+         * expect) rather than in the storage. */
+        FOTA_vScanBlankRuns(tMeta.u32SizeBytes);
 
         /* Do NOT erase on the first failures. The in-function retry budget
          * only defends against a glitch WITHIN one verify pass; a supply-rail
