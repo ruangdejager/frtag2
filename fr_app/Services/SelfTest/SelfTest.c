@@ -14,7 +14,8 @@
 #include "Gps.h"                   /* GPS_bSelfTest                  */
 
 #ifdef STORAGE_BACKEND_FLASH
-#  include "Flash.h"               /* FLASH_bVerifyDevice            */
+#  include "Flash.h"               /* FLASH_bVerifyDeviceEx          */
+#  include "Flash_Config.h"        /* FLASH_MANUFACTURER_ID          */
 #endif
 
 /* Result flags default to true so a not-applicable test naturally reports
@@ -71,8 +72,26 @@ void SELFTEST_vRunAndReport(void)
     /* Ext flash — JEDEC-ID via the existing FLASH_bVerifyDevice helper.
      * Compiled out entirely when the storage backend is MicroSD. */
 #ifdef STORAGE_BACKEND_FLASH
-    bFlashRan = true;
-    bFlashOk  = FLASH_bVerifyDevice();
+    {
+        uint8_t au8Id[3]   = {0};
+        uint8_t u8Attempts = 0U;
+
+        bFlashRan = true;
+        bFlashOk  = FLASH_bVerifyDeviceEx(au8Id, &u8Attempts);
+
+        /* Always log the raw ID bytes, not just the verdict. A single bad
+         * JEDEC read was reporting FAIL on units whose flash was demonstrably
+         * healthy (reading, writing and holding the log), and with only a
+         * pass/fail there was no way to tell a real fault from a transient.
+         * The byte pattern is the diagnostic — see FLASH_bVerifyDeviceEx. */
+        if (bFlashOk && u8Attempts > 1U)
+            DBG_LOG("SelfTest: flash JEDEC %02X %02X %02X OK on attempt %u (first read(s) transient)\r\n",
+                    au8Id[0], au8Id[1], au8Id[2], (unsigned)u8Attempts);
+        else if (!bFlashOk)
+            DBG_LOG("SelfTest: flash JEDEC read FAILED %ux - last bytes %02X %02X %02X (expected mfr %02X)\r\n",
+                    (unsigned)u8Attempts, au8Id[0], au8Id[1], au8Id[2],
+                    (unsigned)FLASH_MANUFACTURER_ID);
+    }
 #endif
 
     DBG_LOG("SelfTest: gps=%s acc=%s flash=%s\r\n",

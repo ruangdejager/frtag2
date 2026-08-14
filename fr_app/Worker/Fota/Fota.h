@@ -145,6 +145,15 @@ bool FOTA_bAcceptanceArmedViaKernel(void);
  * during a live receive. */
 void FOTA_vDropStalePrep(void);
 
+/* False once a PRE-SEND verify of the staged image has failed and not yet
+ * been cleared by a good one — i.e. we hold an image we could not confirm we
+ * can actually deliver. The TimeSync advertisement is gated on this so a
+ * primary in that state stops telling the fleet an update exists; otherwise
+ * every secondary arms for firmware that never arrives. The image itself is
+ * kept (see OTA_PRESEND_FAIL_ERASE_THRESHOLD) — this is only about what we
+ * advertise. */
+bool FOTA_bStagedImageTrusted(void);
+
 /* --------------------------------------------------------------------------
  * Session priority
  * -------------------------------------------------------------------------- */

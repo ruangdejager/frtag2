@@ -15,6 +15,13 @@ bool    FLASH_bDeviceBusy(void);
 uint8_t FLASH_u8ReadStatusReg(void);
 bool    FLASH_bVerifyDevice(void);          /* reads JEDEC ID; DBG-warns on mismatch */
 
+/* As FLASH_bVerifyDevice, but retried (FLASH_JEDEC_READ_ATTEMPTS) and
+ * reporting evidence: pu8Id receives the last 3 ID bytes read, pu8Attempts the
+ * number of tries used. Both optional (NULL to ignore). Use this where the
+ * result is going to be shown to a human or acted on — a bare pass/fail off a
+ * single read is not trustworthy enough to call a chip dead. */
+bool    FLASH_bVerifyDeviceEx(uint8_t *pu8Id, uint8_t *pu8Attempts);
+
 /* All operations below wait for the device to go ready (bounded timeout)
  * before issuing their command, and return false without touching the
  * flash if the device is still busy or the SPI transaction failed -

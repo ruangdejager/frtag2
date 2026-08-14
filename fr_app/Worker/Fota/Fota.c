@@ -548,6 +548,13 @@ static volatile bool bFwAcceptViaKernel;
 /* Primary on-demand distribution request. */
 static volatile bool bDistributeReq;
 
+/* Consecutive PRE-SEND verify failures on the staged image. Non-zero means
+ * "we could not confirm this copy is deliverable", which suppresses the
+ * TimeSync advertisement (FOTA_bStagedImageTrusted) so secondaries don't arm
+ * for an update that won't arrive. Only a sustained streak justifies erasing
+ * — see the PRE-SEND block in FOTA_vDistribute. Cleared by any good verify. */
+static volatile uint8_t u8PreSendFailStreak = 0U;
+
 /* Multi-primary listen-before-distribute: RTC tick of the last Ota* packet
  * heard whose session id was not our own (i.e. another primary's live
  * session). 0 = none heard yet. Set in FOTA_vOnLoraPacket regardless of
@@ -1139,25 +1146,54 @@ void FOTA_vDistribute(void)
     uint8_t u8PreSendXor;
     if (!FOTA_bVerifyImageXorRetry(0U, tMeta.u32SizeBytes, tMeta.u8Xor8, &u8PreSendXor))
     {
-        DBG_LOG("Fota: PRE-SEND xor mismatch (stored=0x%02X, meta=0x%02X) - "
-                "primary's own copy has drifted since acquire, aborting distribute\r\n",
-                (unsigned)u8PreSendXor, (unsigned)tMeta.u8Xor8);
+        if (u8PreSendFailStreak < UINT8_MAX) u8PreSendFailStreak++;
 
-        /* Confirmed corrupt, not a transient glitch (every retry attempt
-         * disagreed - see FOTA_bVerifyImageXorRetry). Leaving a known-bad
-         * image staged means every subsequent wake re-fails this exact
-         * same check forever. Erase scratch + metadata so
-         * FOTA_bGetMeta()/the distribute-pending check see "nothing
-         * staged" and the next FOTA_bUartAcquire() naturally re-pulls a
-         * fresh copy instead of retrying a corrupt one indefinitely. */
-        if (!FOTA_bEraseScratch())
-            DBG_LOG("Fota: scratch erase after PRE-SEND mismatch FAILED\r\n");
+        DBG_LOG("Fota: PRE-SEND xor mismatch (stored=0x%02X, meta=0x%02X) - "
+                "aborting distribute (consecutive failure %u/%u)\r\n",
+                (unsigned)u8PreSendXor, (unsigned)tMeta.u8Xor8,
+                (unsigned)u8PreSendFailStreak,
+                (unsigned)OTA_PRESEND_FAIL_ERASE_THRESHOLD);
+
+        /* Do NOT erase on the first failures. The in-function retry budget
+         * only defends against a glitch WITHIN one verify pass; a supply-rail
+         * transient can just as easily spoil every attempt of a single pass
+         * while the stored bytes are perfectly fine — and this board has a
+         * documented rail-sag/flash-read interaction (see
+         * OTA_LORA_CHUNK_GAP_MS). Erasing on that evidence destroys a good
+         * image and forces a needless 100 kB re-download, which is exactly
+         * the loop one field primary got stuck in: verify-fail, erase,
+         * re-acquire, repeat, never distributing once.
+         *
+         * So require the failure to repeat across SEPARATE campaigns before
+         * wiping anything. Meanwhile the image stays put and simply isn't
+         * advertised (FOTA_bStagedImageTrusted), so no secondary arms for an
+         * update that can't be delivered. A single good verify clears the
+         * streak and everything resumes. */
+        if (u8PreSendFailStreak >= OTA_PRESEND_FAIL_ERASE_THRESHOLD)
+        {
+            DBG_LOG("Fota: %u consecutive PRE-SEND failures - erasing scratch, will re-acquire\r\n",
+                    (unsigned)u8PreSendFailStreak);
+            if (!FOTA_bEraseScratch())
+                DBG_LOG("Fota: scratch erase after PRE-SEND mismatch FAILED\r\n");
+            u8PreSendFailStreak = 0U;
+        }
+        else
+        {
+            DBG_LOG("Fota: keeping staged image - %u in-pass re-reads all failed, but that is "
+                    "one bad window; re-verifying next campaign (%u more before erase)\r\n",
+                    (unsigned)FOTA_XOR_VERIFY_MAX_ATTEMPTS,
+                    (unsigned)(OTA_PRESEND_FAIL_ERASE_THRESHOLD - u8PreSendFailStreak));
+        }
 
         bDistributeActive = false;
         LOG_vSuspend(false);
         FLASH_vInhibitDeepPowerDown(false);
         return;
     }
+
+    /* Verified clean: the staged copy is deliverable, so clear any suspicion
+     * raised by earlier failed passes and let it be advertised again. */
+    u8PreSendFailStreak = 0U;
 
     uint8_t au8Prep[OTA_PKT_PREP_LEN];
     au8Prep[0] = (uint8_t)MeshPktType_OtaPrep;
@@ -1375,6 +1411,11 @@ void FOTA_vDistribute(void)
 bool FOTA_bPrepPending(void)
 {
     return bPrepPending;
+}
+
+bool FOTA_bStagedImageTrusted(void)
+{
+    return (u8PreSendFailStreak == 0U);
 }
 
 void FOTA_vDropStalePrep(void)

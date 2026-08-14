@@ -1142,7 +1142,23 @@ static void DEVICE_DISCOVERY_vSendTS(void)
 #ifdef STORAGE_BACKEND_FLASH
     FotaMeta_t tMeta;
     if (FOTA_bGetMeta(&tMeta) && tMeta.bValid)
-        u32StagedVer = tMeta.u32Version;
+    {
+        /* Only advertise what we can actually deliver. bValid alone says the
+         * metadata is intact, not that the image still verifies — a primary
+         * whose PRE-SEND check keeps failing would otherwise keep telling the
+         * whole fleet "newer fw available", arming every secondary for an
+         * update it can never send. Suppress the advertisement until a good
+         * verify clears the suspicion; the image itself is kept. */
+        if (FOTA_bStagedImageTrusted())
+        {
+            u32StagedVer = tMeta.u32Version;
+        }
+        else
+        {
+            DBG_LOG("Fota: staged v%lu not advertised - last PRE-SEND verify failed\r\n",
+                    (unsigned long)tMeta.u32Version);
+        }
+    }
 #endif
 
     MESHNETWORK_vSendTimeSync(RTC_u64GetUTC(), MESHNETWORK_tGetWakeupInterval(),

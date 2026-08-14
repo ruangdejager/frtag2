@@ -76,4 +76,11 @@
 /* Expected JEDEC manufacturer ID */
 #define FLASH_MANUFACTURER_ID       0x1FU       /* Adesto/Dialog */
 
+/* JEDEC-ID read attempts before declaring the part absent/faulty. A single
+ * read is not trustworthy on this board — a transient (supply-rail sag from a
+ * concurrent radio/GPS current spike) can corrupt one read of an otherwise
+ * healthy chip, and calling that "flash FAIL" is both wrong and dangerous if
+ * anything acts on it. */
+#define FLASH_JEDEC_READ_ATTEMPTS   5U
+
 #endif /* DEVICE_FLASH_FLASH_CONFIG_H_ */

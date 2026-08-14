@@ -188,6 +188,19 @@ typedef struct
  * OTA_LORA_RX_IDLE_MS — the same "this session is dead" scale used for an
  * in-progress transfer. */
 #define OTA_PREP_PENDING_MAX_MS   OTA_LORA_RX_IDLE_MS
+
+/* Consecutive PRE-SEND verify failures (each in a separate campaign) before
+ * the primary gives up on its staged image and erases it to re-acquire.
+ *
+ * Deliberately not 1. The per-pass retry budget only rules out a glitch
+ * within one verify; a supply-rail transient can spoil a whole pass while the
+ * stored bytes are fine, and erasing on that evidence throws away a good
+ * 100 kB image and re-downloads it. A field primary looped exactly that way
+ * — verify-fail, erase, re-acquire, repeat every few minutes, never
+ * distributing once. Requiring the failure to reproduce across campaigns
+ * separates a real corruption from a transient, and costs only a delayed
+ * re-acquire when it is real. */
+#define OTA_PRESEND_FAIL_ERASE_THRESHOLD  3U
 #define OTA_LORA_SESSION_MAX_MS   (12UL * 60UL * 1000UL)
 
 /* ---- Multi-primary coexistence (listen-before-distribute) ----

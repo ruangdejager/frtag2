@@ -293,16 +293,54 @@ uint8_t FLASH_u8ReadStatusReg(void)
 
 bool FLASH_bVerifyDevice(void)
 {
+    return FLASH_bVerifyDeviceEx(NULL, NULL);
+}
+
+bool FLASH_bVerifyDeviceEx(uint8_t *pu8Id, uint8_t *pu8Attempts)
+{
+    uint8_t id[3] = {0};
+    bool    bOk   = false;
+    uint8_t u8Try = 0U;
+
     FLASH_vLock();
     FLASH_vEnsureAwake();
-    uint8_t cmd    = FLASH_CMD_JEDEC_ID;
-    uint8_t id[3]  = {0};
-    FLASH_DRIVER_vSelect();
-    FLASH_DRIVER_vWrite(&cmd, 1);
-    FLASH_DRIVER_vRead(id, 3);
-    FLASH_DRIVER_vDeselect();
-    bool bOk = (id[0] == FLASH_MANUFACTURER_ID);
+
+    /* Retried, not single-shot. A single JEDEC read can come back wrong while
+     * the part is perfectly healthy — the same transient this codebase already
+     * documents elsewhere (see OTA_LORA_CHUNK_GAP_MS: a supply-rail sag makes
+     * a too-soon flash read return corrupt bytes). Reporting FAIL off one bad
+     * read was declaring every unit's flash dead while it was demonstrably
+     * reading, writing and holding the log fine.
+     *
+     * The raw bytes are handed back so the caller can log what actually came
+     * off the wire, which is what distinguishes the cases:
+     *   00 00 00 -> no clock/data (AF, wiring, bus not restored)
+     *   FF FF FF -> MISO idle / CS never asserted
+     *   other    -> CPOL/CPHA, timing, or genuinely the wrong part */
+    for (u8Try = 1U; u8Try <= FLASH_JEDEC_READ_ATTEMPTS; u8Try++)
+    {
+        uint8_t cmd = FLASH_CMD_JEDEC_ID;
+
+        id[0] = id[1] = id[2] = 0U;
+        FLASH_DRIVER_vSelect();
+        FLASH_DRIVER_vWrite(&cmd, 1);
+        FLASH_DRIVER_vRead(id, 3);
+        FLASH_DRIVER_vDeselect();
+
+        if (id[0] == FLASH_MANUFACTURER_ID) { bOk = true; break; }
+
+        osDelay(2);   /* let the rail settle before re-reading */
+    }
+
     FLASH_vUnlock();
+
+    if (pu8Id != NULL)
+    {
+        pu8Id[0] = id[0]; pu8Id[1] = id[1]; pu8Id[2] = id[2];
+    }
+    if (pu8Attempts != NULL)
+        *pu8Attempts = u8Try > FLASH_JEDEC_READ_ATTEMPTS ? FLASH_JEDEC_READ_ATTEMPTS : u8Try;
+
     return bOk;
 }
 
