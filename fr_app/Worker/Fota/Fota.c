@@ -428,8 +428,22 @@ bool FOTA_bUartAcquire(void)
     DBG_LOG("Fota: acquiring v%lu (%lu file bytes)\r\n",
             (unsigned long)u32Version, (unsigned long)u32FileBytes);
 
+    /* Own the flash for the whole acquire, exactly as vDistribute and
+     * vSecondaryReceive already do — this path was the odd one out. Two
+     * distinct reasons, both of which bit us:
+     *   - LOG_vSuspend: the DbgLog consumer writes this same chip from
+     *     another task, interleaving log pages with image pages for ~40 s.
+     *   - InhibitDeepPowerDown: that same consumer parks the chip in DPD
+     *     when it finishes a drain, and a park landing on top of an
+     *     in-flight image page program truncates that page.
+     * Every exit below must undo both. */
+    FLASH_vInhibitDeepPowerDown(true);
+    LOG_vSuspend(true);
+
     if (!FOTA_bEraseScratch())
     {
+        LOG_vSuspend(false);
+        FLASH_vInhibitDeepPowerDown(false);
         (void)FARMRANGER_bFwReportDone(false);
         return false;
     }
@@ -445,6 +459,8 @@ bool FOTA_bUartAcquire(void)
         if (!FOTA_bFetchAndStoreBlock(u32Offset, u16Len))
         {
             DBG_LOG("Fota: acquire FAILED\r\n");
+            LOG_vSuspend(false);
+            FLASH_vInhibitDeepPowerDown(false);
             (void)FARMRANGER_bFwReportDone(false);
             return false;
         }
@@ -477,16 +493,25 @@ bool FOTA_bUartAcquire(void)
          * a state-consistency fix. */
         if (!FOTA_bEraseScratch())
             DBG_LOG("Fota: scratch erase after acquire xor mismatch FAILED\r\n");
+        LOG_vSuspend(false);
+        FLASH_vInhibitDeepPowerDown(false);
         (void)FARMRANGER_bFwReportDone(false);
         return false;
     }
 
     if (!FOTA_bCommitMetadata(u32Version, u32StopAddr, u8Xor))
     {
+        LOG_vSuspend(false);
+        FLASH_vInhibitDeepPowerDown(false);
         DBG_LOG("Fota: metadata commit FAILED\r\n");
         (void)FARMRANGER_bFwReportDone(false);
         return false;
     }
+
+    /* Image and metadata are both committed — hand the chip back to the
+     * logger so the lines below are actually persisted. */
+    LOG_vSuspend(false);
+    FLASH_vInhibitDeepPowerDown(false);
 
     DBG_LOG("Fota: image v%lu stored OK (size=%luB, xor=0x%02X, map 0x%08lX..0x%08lX)\r\n",
             (unsigned long)u32Version, (unsigned long)u32Size, u8Xor,
@@ -1144,7 +1169,22 @@ void FOTA_vDistribute(void)
      * FOTA_bVerifyImageXorRetry. Only a mismatch that survives every retry
      * means the primary's own copy has actually drifted. */
     uint8_t u8PreSendXor;
-    if (!FOTA_bVerifyImageXorRetry(0U, tMeta.u32SizeBytes, tMeta.u8Xor8, &u8PreSendXor))
+    bool bPreSendOk = FOTA_bVerifyImageXorRetry(0U, tMeta.u32SizeBytes, tMeta.u8Xor8, &u8PreSendXor);
+
+    /* Diagnostic: same probe as the secondary's receive-side check — see
+     * there for why. Referenced from that comment but never actually added
+     * here until now, which is why every prior PRE-SEND failure report gave
+     * no more detail than "the whole image disagrees". Runs on every check,
+     * not just on failure, so a field log always has it whether or not this
+     * particular pass happened to mismatch. */
+    {
+        uint8_t u8Xor64  = FOTA_u8CalcImageXorRange(0U, tMeta.u32SizeBytes);
+        uint8_t u8Xor224 = FOTA_u8CalcImageXor224(0U, tMeta.u32SizeBytes);
+        DBG_LOG("Fota: PROBE 64B-buf=0x%02X 224B-buf=0x%02X expected=0x%02X\r\n",
+                (unsigned)u8Xor64, (unsigned)u8Xor224, (unsigned)tMeta.u8Xor8);
+    }
+
+    if (!bPreSendOk)
     {
         if (u8PreSendFailStreak < UINT8_MAX) u8PreSendFailStreak++;
 
@@ -1153,6 +1193,27 @@ void FOTA_vDistribute(void)
                 (unsigned)u8PreSendXor, (unsigned)tMeta.u8Xor8,
                 (unsigned)u8PreSendFailStreak,
                 (unsigned)OTA_PRESEND_FAIL_ERASE_THRESHOLD);
+
+        /* Bisect into quarters to localize which part of the image disagrees
+         * — same technique as the secondary's receive-side mismatch. Turns
+         * "the whole image disagrees" into "here's the ~25 KB window", which
+         * is what actually lets a byte-offset root cause be found instead of
+         * guessed at. */
+        {
+            uint32_t u32Q = tMeta.u32SizeBytes / 4U;
+            uint32_t au32Start[4] = { 0U, u32Q, 2U * u32Q, 3U * u32Q };
+            uint32_t au32Len[4]   = { u32Q, u32Q, u32Q, tMeta.u32SizeBytes - (3U * u32Q) };
+            for (uint8_t i = 0U; i < 4U; i++)
+            {
+                uint8_t u8Q = FOTA_u8CalcImageXorRange(au32Start[i], au32Len[i]);
+                DBG_LOG("  Q%u [0x%lX..0x%lX] (chunks %lu..%lu) xor=0x%02X\r\n", i,
+                        (unsigned long)au32Start[i],
+                        (unsigned long)(au32Start[i] + au32Len[i] - 1U),
+                        (unsigned long)(au32Start[i] / OTA_LORA_CHUNK_LEN),
+                        (unsigned long)((au32Start[i] + au32Len[i] - 1U) / OTA_LORA_CHUNK_LEN),
+                        u8Q);
+            }
+        }
 
         /* Do NOT erase on the first failures. The in-function retry budget
          * only defends against a glitch WITHIN one verify pass; a supply-rail

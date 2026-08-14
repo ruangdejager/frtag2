@@ -10,7 +10,8 @@
 #include "dbg_log.h"
 
 #include "DeviceDiscovery.h"       /* DEVICE_DISCOVERY_eGetDeviceRole */
-#include "Acc.h"                   /* ACC_bDeviceIdOk                */
+#include "Acc.h"                   /* ACC_bDeviceIdOkEx              */
+#include "Acc_Config.h"            /* ACC_WHO_AM_I_VALUE             */
 #include "Gps.h"                   /* GPS_bSelfTest                  */
 
 #ifdef STORAGE_BACKEND_FLASH
@@ -65,9 +66,23 @@ void SELFTEST_vRunAndReport(void)
         bGpsOk  = GPS_bSelfTest(1500U);   /* > one 1 Hz NMEA epoch */
     }
 
-    /* Accelerometer — fitted on both roles; WHO_AM_I via the existing
-     * ACC_bDeviceIdOk() helper. */
-    bAccOk = ACC_bDeviceIdOk();
+    /* Accelerometer — fitted on both roles. Retried and raw-byte reported for
+     * the same reason as the flash JEDEC read below: one bad WHO_AM_I is a
+     * rail transient, and a bare pass/fail can't tell that from a real fault.
+     * This is what was reporting acc=FAIL on primaries whose ACC was fine. */
+    {
+        uint8_t u8Id       = 0U;
+        uint8_t u8Attempts = 0U;
+
+        bAccOk = ACC_bDeviceIdOkEx(&u8Id, &u8Attempts);
+
+        if (bAccOk && u8Attempts > 1U)
+            DBG_LOG("SelfTest: acc WHO_AM_I %02X OK on attempt %u (first read(s) transient)\r\n",
+                    u8Id, (unsigned)u8Attempts);
+        else if (!bAccOk)
+            DBG_LOG("SelfTest: acc WHO_AM_I read FAILED %ux - last byte %02X (expected %02X)\r\n",
+                    (unsigned)u8Attempts, u8Id, (unsigned)ACC_WHO_AM_I_VALUE);
+    }
 
     /* Ext flash — JEDEC-ID via the existing FLASH_bVerifyDevice helper.
      * Compiled out entirely when the storage backend is MicroSD. */

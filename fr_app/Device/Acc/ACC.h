@@ -44,6 +44,12 @@ void    ACC_vInit(void);
 void    ACC_vConfigIdle(void);
 uint8_t ACC_u8GetDeviceId(void);
 bool    ACC_bDeviceIdOk(void);
+
+/* WHO_AM_I check with retries. Hands back the last raw byte read and how many
+ * attempts it took, so a self-test can log what actually came off the wire
+ * instead of just "FAIL". pu8Id / pu8Attempts may be NULL.
+ * ACC_bDeviceIdOk() is this with both discarded. */
+bool    ACC_bDeviceIdOkEx(uint8_t *pu8Id, uint8_t *pu8Attempts);
 uint8_t ACC_u8NumSamplesInFifo(void);
 void    ACC_vGetAccSample(acc_t *pAcc);
 void    ACC_vTestRegsConfigError(void);

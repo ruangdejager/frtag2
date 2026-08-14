@@ -220,7 +220,17 @@ void INIT_vInitialization(void *parameters)
          * primary doesn't track movement. Left in its undefined power-on state
          * its I/O drew ~115 uA; configured-but-active (25 Hz, un-drained FIFO)
          * ~45 uA; full power-down was worse (floating SPI inputs crowbar). So
-         * use a low-power, no-FIFO idle config - I/O active, nothing to overrun. */
+         * use a low-power, no-FIFO idle config - I/O active, nothing to overrun.
+         *
+         * Full AN3308 bring-up runs first, then the idle profile on top. The
+         * idle table only writes 6 registers and assumes power-on defaults for
+         * every other one — true after a cold boot, but not after a warm reset
+         * (an OTA install resets into a running device whose ACC keeps its
+         * previous configuration). Establishing the known-good baseline first
+         * makes the primary's ACC state identical to the secondary's before
+         * the idle profile is applied, so the boot self-test reads a device in
+         * a defined state on both roles. */
+        ACC_vInit();
         ACC_vConfigIdle();
         /* Primary: bring up the Farmranger UART link to the fr9 logger board.
          * (Debug UART is a separate peripheral, so the two no longer conflict.) */

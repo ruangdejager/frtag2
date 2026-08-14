@@ -83,6 +83,10 @@ static void FLASH_vEnsureAwake(void)
  * seconds, so its post-erase wait gets its own, much longer, budget. */
 #define FLASH_CHIP_ERASE_TIMEOUT_MS   30000U
 
+/* Likewise a 64 KB block erase — well beyond a page program, well under a
+ * chip erase. */
+#define FLASH_BLOCK_ERASE_TIMEOUT_MS  10000U
+
 /* Bounded by real elapsed time, not loop iterations: FLASH_bDeviceBusy()
  * issues two SPI transactions, each individually bounded by SPI_TIMEOUT
  * (1000 ms). If the SPI2 bus is stalled (e.g. contention with another
@@ -401,6 +405,15 @@ bool FLASH_vPageWrite(uint32_t addr, const uint8_t *buf, uint16_t len)
     FLASH_DRIVER_vDeselect();
     if (!bOk)
         FLASH_vWriteDisable();   /* never leave the device armed (WEL=1) */
+    else
+        /* Wait for the program to actually commit before returning. This used
+         * to be deferred to the *next* operation's pre-wait, which meant the
+         * last write of any burst was left in flight with nothing guarding it
+         * — a concurrent deep-power-down or a reset in that window truncated
+         * the page. Making the write self-contained is what removes that
+         * whole class of silent corruption; the cost is the ~1-3 ms we were
+         * already paying, just accounted to the write that incurs it. */
+        bOk = FLASH_bWaitReady();
     FLASH_vUnlock();
     return bOk;
 }
@@ -432,6 +445,8 @@ bool FLASH_vSectorErase(uint32_t addr)
     FLASH_DRIVER_vDeselect();
     if (!bOk)
         FLASH_vWriteDisable();   /* never leave the device armed (WEL=1) */
+    else
+        bOk = FLASH_bWaitReady();   /* commit before returning — see FLASH_vPageWrite */
     FLASH_vUnlock();
     return bOk;
 }
@@ -463,6 +478,10 @@ bool FLASH_vBlockErase(uint32_t addr)
     FLASH_DRIVER_vDeselect();
     if (!bOk)
         FLASH_vWriteDisable();   /* never leave the device armed (WEL=1) */
+    else
+        /* 64 KB erase is far slower than a sector erase, so it gets its own
+         * budget rather than the generic pre-command one. */
+        bOk = FLASH_bWaitReadyTimeout(FLASH_BLOCK_ERASE_TIMEOUT_MS);
     FLASH_vUnlock();
     return bOk;
 }
@@ -528,6 +547,27 @@ void FLASH_vDeepPowerDown(void)
         FLASH_vUnlock();
         return;     /* already parked — don't churn SPI */
     }
+
+    /* NEVER park the device over a live program/erase. 0xB9 issued while WIP
+     * is set ABORTS the operation in progress, and the page it was committing
+     * is left half-programmed: the bytes already burned stand, the rest stay
+     * 0xFF. Nothing reports an error — the data is simply wrong from then on.
+     *
+     * This is reachable because the write primitives used to return with the
+     * program still in flight (see FLASH_vPageWrite) while this call comes
+     * from the DbgLog consumer on a *different* task (Log.c) — so a log drain
+     * landing inside an OTA image write silently corrupted that page. The
+     * mutex serialises the SPI commands but says nothing about WIP, so it
+     * never prevented this on its own.
+     *
+     * Skip the park rather than block: parking is a pure power optimisation
+     * and the caller is a background drain, so the next idle pass gets it. */
+    if (FLASH_bDeviceBusy())
+    {
+        FLASH_vUnlock();
+        return;
+    }
+
     uint8_t cmd = FLASH_CMD_DEEP_PWR_DOWN;
     FLASH_DRIVER_vSelect();
     FLASH_DRIVER_vWrite(&cmd, 1);
