@@ -242,6 +242,21 @@ static uint16_t u16StatTxDropped;
  * without needing to track individual packet-type ticks. */
 static uint32_t u32LastDiscoveryPktTick = 0;
 
+/* Set the moment any DReq is heard this campaign — see
+ * MESHNETWORK_bCampaignHeard() in the header for what it is for. Written from
+ * the parser task, read from the AppTask; a bool write is atomic on this core
+ * and a one-pass-late read only costs one more 250 ms poll. */
+static volatile bool bCampaignHeard = false;
+
+/* The primary ends a wave after MESH_DISCOVERY_IDLE_MS of beacon silence, and
+ * every beacon is queued with up to MESH_TX_JITTER_MAX_MS of TX jitter. If the
+ * idle ever drops to or below the jitter, a lone node in a sparse outer ring
+ * could still be holding its jittered beacon when its wave is declared over —
+ * losing exactly the deep tags this change exists to catch. */
+#if (MESH_DISCOVERY_IDLE_MS <= MESH_TX_JITTER_MAX_MS)
+#  error "MESH_DISCOVERY_IDLE_MS must exceed MESH_TX_JITTER_MAX_MS"
+#endif
+
 /* ---- Forward declarations ---- */
 static void MESHNETWORK_vTxTask(void *pvParameters);
 static bool MESHNETWORK_bSendPacket(const uint8_t *pBuf, size_t u32Len);
@@ -297,6 +312,42 @@ static void FORWARD_vAdd(uint32_t u32MsgId)
         tForwardRing.u32Ring[tForwardRing.u8Head] = u32MsgId;
         tForwardRing.u8Head = (tForwardRing.u8Head + 1) % FORWARD_RING_SIZE;
         if (tForwardRing.u8Count < FORWARD_RING_SIZE) tForwardRing.u8Count++;
+        osMutexRelease(xForwardRingMutex);
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * DReq dedup — separate from the forward ring on purpose, see
+ * MESH_DREQ_DEDUPE_SIZE. Shares xForwardRingMutex (same access pattern, never
+ * nested, and a second mutex would buy nothing).
+ * -------------------------------------------------------------------------- */
+static uint32_t au32DreqSeen[MESH_DREQ_DEDUPE_SIZE];
+static uint8_t  u8DreqSeenHead;
+static uint8_t  u8DreqSeenCount;
+
+static bool DREQ_bHasSeen(uint32_t u32DreqId)
+{
+    bool bFound = false;
+    if (osMutexAcquire(xForwardRingMutex, 100) == osOK)
+    {
+        for (uint8_t i = 0; i < u8DreqSeenCount; i++)
+        {
+            uint8_t idx = (uint8_t)((u8DreqSeenHead + MESH_DREQ_DEDUPE_SIZE -
+                                     u8DreqSeenCount + i) % MESH_DREQ_DEDUPE_SIZE);
+            if (au32DreqSeen[idx] == u32DreqId) { bFound = true; break; }
+        }
+        osMutexRelease(xForwardRingMutex);
+    }
+    return bFound;
+}
+
+static void DREQ_vAdd(uint32_t u32DreqId)
+{
+    if (osMutexAcquire(xForwardRingMutex, 100) == osOK)
+    {
+        au32DreqSeen[u8DreqSeenHead] = u32DreqId;
+        u8DreqSeenHead = (uint8_t)((u8DreqSeenHead + 1U) % MESH_DREQ_DEDUPE_SIZE);
+        if (u8DreqSeenCount < MESH_DREQ_DEDUPE_SIZE) u8DreqSeenCount++;
         osMutexRelease(xForwardRingMutex);
     }
 }
@@ -782,6 +833,59 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
     {
         NodeRole_e eRole = MESHNETWORK_eGetRole();
 
+        /* Heard a campaign, whoever relayed it and whatever wave. Keeps the
+         * radio on past APP_SECONDARY_SILENCE_MS while the frontier works
+         * outward — see MESHNETWORK_bCampaignHeard(). */
+        bCampaignHeard = true;
+
+        /* ---- Wave 1: flood, but only direct hearers beacon ----
+         *
+         * The frontier otherwise advances exactly one ring per wave: the
+         * primary sends each DReq once, only FORWARDERs relay it, and a node
+         * becomes a FORWARDER only once acked. So wave N reaches depth N, and
+         * discoverable depth is capped at APP_PRIMARY_MAX_WAVES — a spread
+         * herd loses its outermost tags off the end of that budget.
+         *
+         * Wave 1 is therefore relayed by EVERY node, deduped, purely as a
+         * "a campaign is running, stay awake" signal. It deliberately does
+         * NOT recruit beaconers: only nodes that heard the primary itself
+         * (hop 0) beacon, so the per-wave roll-call keeps its existing shape
+         * and the channel does not fill with the whole herd answering at
+         * once. Waves 2+ fall through to the unchanged logic below.
+         *
+         * The relay carries hop+1 like any other, so a node that hears only
+         * this flood still records a truthful hop count. */
+        if (u8WaveCnt <= 1U)
+        {
+            if (!DREQ_bHasSeen(u32DreqId) && !MESHNETWORK_bTxBacklogHigh())
+            {
+                uint8_t u8Out[32];
+                size_t  u32OutLen = 0;
+                if (MESHNETWORK_bEncodeDReq(u32DreqId,
+                                            (uint8_t)(u8SenderHopCount + 1),
+                                            u8WaveCnt,
+                                            u8Out, sizeof(u8Out), &u32OutLen))
+                {
+                    DREQ_vAdd(u32DreqId);
+                    MESHNETWORK_bSendPacket(u8Out, u32OutLen);
+                    DBG("MeshNetwork: DReq wave-1 flood relayed (hop %u)\r\n",
+                        (unsigned)(u8SenderHopCount + 1));
+                    u16StatMsgsForwarded++;
+                    EVTLOG(LOG_TX_DREQ, 2);
+                }
+            }
+
+            /* Relayed copy: stay awake, but do not join the roll-call yet —
+             * this node's own wave will come. */
+            if (u8SenderHopCount != 0U)
+            {
+                if ((u8PrimaryDreqWaveCnt == u8WaveCnt) && (s16Rssi > i16BestDreqRssi))
+                    i16BestDreqRssi = s16Rssi;
+                return;
+            }
+            /* hop == 0: heard the primary directly — fall through and beacon. */
+        }
+
         /* Re-arm after a beacon cap: the primary issues a BRAND-NEW dreq id
          * for every wave (DeviceDiscovery.c's campaign loop) precisely to ask
          * again, so a node that burned its beacon budget on the previous wave
@@ -811,7 +915,7 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
         }
         else if (eRole == NODE_ROLE_FORWARDER)
         {
-            if (!FORWARD_bHasSeen(u32DreqId) && !MESHNETWORK_bTxBacklogHigh())
+            if (!DREQ_bHasSeen(u32DreqId) && !MESHNETWORK_bTxBacklogHigh())
             {
                 uint8_t u8Out[32];
                 size_t  u32OutLen = 0;
@@ -820,7 +924,7 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
                                             u8WaveCnt,
                                             u8Out, sizeof(u8Out), &u32OutLen))
                 {
-                    FORWARD_vAdd(u32DreqId);
+                    DREQ_vAdd(u32DreqId);
                     MESHNETWORK_bSendPacket(u8Out, u32OutLen);
                     DBG("MeshNetwork: DReq forwarded\r\n");
                     u16StatMsgsForwarded++;
@@ -1760,7 +1864,25 @@ void MESHNETWORK_vResetNodeRole(void)
         bNodeAckedThisCampaign = false;
         osMutexRelease(xRoleMutex);
     }
+
+    /* Drop the stay-awake latch and the DReq dedup history together: both are
+     * per-campaign. Keeping either would make the NEXT campaign either skip
+     * its silence timeout with no evidence, or refuse to relay a wave-1 flood
+     * whose id happened to repeat. */
+    bCampaignHeard = false;
+    if (osMutexAcquire(xForwardRingMutex, 100) == osOK)
+    {
+        u8DreqSeenHead  = 0U;
+        u8DreqSeenCount = 0U;
+        osMutexRelease(xForwardRingMutex);
+    }
+
     osTimerStop(xBeaconTimer);   /* outside the lock */
+}
+
+bool MESHNETWORK_bCampaignHeard(void)
+{
+    return bCampaignHeard;
 }
 
 /* R6: drop any TX still queued (e.g. a late-jittered forward from the previous

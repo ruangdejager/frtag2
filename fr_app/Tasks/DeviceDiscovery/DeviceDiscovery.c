@@ -365,9 +365,24 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 if ((uint32_t)(u32Now - u32CampaignStart) >= APP_DISCOVERY_WINDOW_TIMEOUT_MS)
                     break;   /* hard cap */
 
+                /* Silence only ends the campaign for a node that has heard
+                 * NOTHING. Once a DReq has been heard — the wave-1 flood
+                 * reaches the whole mesh for this purpose — we know a campaign
+                 * is running and that we are inside its footprint, so quiet air
+                 * means "the frontier has not reached my ring yet", not
+                 * "nothing is out there". Bailing there is what lost the deep
+                 * tags: u32SilenceRef starts at campaign start, so a node
+                 * awaiting its wave was already 10 s into its own death clock
+                 * at wake-up. Such a node now holds until TimeSync or the
+                 * 180 s hard cap above.
+                 *
+                 * A node that truly hears nothing keeps the old behaviour
+                 * unchanged, so out-of-range units cost no extra power — which
+                 * is why the flood is worth its airtime. */
                 if (!MESHNETWORK_bIsBeaconing() &&
+                    !MESHNETWORK_bCampaignHeard() &&
                     (uint32_t)(u32Now - u32SilenceRef) >= APP_SECONDARY_SILENCE_MS)
-                    break;   /* radio silence, not beaconing */
+                    break;   /* radio silence, nothing heard, not beaconing */
             }
 
             if (bTimeSync)

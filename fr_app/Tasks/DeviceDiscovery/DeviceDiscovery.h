@@ -27,7 +27,15 @@
 #define APP_SECONDARY_POLL_MS              250U          /* secondary wait poll cadence */
 
 /* Primary issues at most this many DReq waves per campaign (R8). */
-#define APP_PRIMARY_MAX_WAVES              5U
+/* Ceiling on DReq waves per campaign. Each wave advances the discovery
+ * frontier by one ring (only acked nodes relay, so wave N reaches depth N),
+ * which makes this the maximum discoverable herd depth. Raised 5 -> 8 after
+ * field data showed the count falling off exactly as the needed wave depth
+ * rose (wave 2 -> 28 tags found, wave 3 -> 27, wave 4 -> 24): a spread herd
+ * was running out of budget before its outermost tags were asked. Costs
+ * nothing on a tight herd — the primary already ends a campaign as soon as a
+ * wave turns up no new beacons. */
+#define APP_PRIMARY_MAX_WAVES              8U
 
 /* Secondary, flash backend only: once armed (see MESHNETWORK_vHandleTimeSync
  * auto-arm off the staged-fw version carried in TimeSync), how long to keep

@@ -17,12 +17,34 @@
 /* ---- Timing constants ---- */
 #define MESH_BEACON_INTERVAL_MS       3500U   /* beacon retry period while awaiting ACK */
 #define MESH_PRIMARY_ACK_INTERVAL_MS  2000U
-#define MESH_DISCOVERY_IDLE_MS        7000U
+/* Beacon silence that ends one DReq wave on the primary. Was 7000: with the
+ * frontier advancing one ring per wave (see MESHNETWORK_vHandleDReq), a spread
+ * herd needs several waves and 7 s of dead air each was the bulk of a 100 s
+ * campaign. Must stay above MESH_TX_JITTER_MAX_MS (a beacon is queued with up
+ * to that much jitter, so a shorter idle could end the wave before the only
+ * node in a sparse outer ring has transmitted) — asserted in MeshNetwork.c. */
+#define MESH_DISCOVERY_IDLE_MS        3000U
 /* Dedup window. R5 (meshOptimise) raises this to 64 to cut re-forward storms in
- * large fleets, but +128 B no longer fits the current RAM budget (~592 B free),
- * so it stays at 32 for now - fine for the present 3-node test. Revisit with a
- * RAM reclaim before scaling the fleet. (uint8 head/count allow up to 255.) */
-#define FORWARD_RING_SIZE             32
+ * large fleets, but +128 B does not fit the current RAM budget, so it stays
+ * small. Revisit with a RAM reclaim before scaling the fleet. (uint8
+ * head/count allow up to 255.)
+ *
+ * 32 -> 24, and now BEACON/ACK ids only: DReq ids moved out to their own store
+ * (MESH_DREQ_DEDUPE_SIZE below), so this ring no longer has to hold them and
+ * the 8 slots they used to occupy pay for that store exactly. Net zero RAM on
+ * a part whose .bss is byte-exact full, and strictly better behaviour — the
+ * two id classes can no longer evict one another. */
+#define FORWARD_RING_SIZE             24
+
+/* DReq ids get their own dedup store rather than sharing the ring above. The
+ * ring carries beacon and ack ids too, and one campaign pushes far more of
+ * those through it than it has slots (28 nodes x up to 6 beacons per wave),
+ * so a DReq id is evicted within a fraction of a second of busy traffic. That
+ * is survivable while only forwarders relay DReqs, but the wave-1 flood has
+ * every node relaying — an evicted id would let the same DReq be re-forwarded
+ * on each lap around the mesh. 8 entries covers APP_PRIMARY_MAX_WAVES with
+ * margin and cannot be displaced by beacon/ack churn. */
+#define MESH_DREQ_DEDUPE_SIZE         8U
 /* 120 (was 128): freed 160 B of .bss for the superOptimise fixes on a part
  * whose RAM was byte-exact full. Still far beyond a realistic per-primary
  * fleet — D-Acks carry 8 ids per 2 s, so even 120 nodes need ~30 s of ack
@@ -251,6 +273,16 @@ bool            MESHNETWORK_bGetGpsEnabled(void);
  * the caller doesn't know the node's internal beacon dreq id). */
 void MESHNETWORK_vStopBeaconingSelf(void);
 bool MESHNETWORK_bIsBeaconing(void);     /* true while this node is beaconing */
+
+/* True once this node has heard a DReq this campaign — directly or relayed,
+ * any wave. Positive proof that a campaign is running and that this node is
+ * inside its footprint, which is what the wave-1 flood exists to deliver to
+ * nodes the frontier has not reached yet. DeviceDiscovery uses it to keep the
+ * radio on instead of timing out on APP_SECONDARY_SILENCE_MS while it waits
+ * for its ring's turn. A node that has heard nothing keeps the old behaviour
+ * exactly, so out-of-range units cost no extra power. Cleared by
+ * MESHNETWORK_vResetNodeRole() at campaign end. */
+bool MESHNETWORK_bCampaignHeard(void);
 void MESHNETWORK_vFlushTxQueue(void);    /* drop any pending TX (call on campaign wake) */
 bool MESHNETWORK_bGetDiscoveredNeighbors(MeshDiscoveredNeighbor_t *pBuffer,
                                          uint16_t u16MaxEntries,
