@@ -29,8 +29,8 @@
  * "tag <ID> <cmd>" over the mesh at the same time.
  * See fr_app/Worker/FrKernel/FrKernel_Config.h.
  * -------------------------------------------------------------------------- */
-// #define FRKERNEL_INTERFACE_UART        /* debug UART (bench use) */
- #define FRKERNEL_INTERFACE_LORA        /* LoRa radio (deployed secondary) */
+ #define FRKERNEL_INTERFACE_UART        /* debug UART (bench use) */
+// #define FRKERNEL_INTERFACE_LORA        /* LoRa radio (deployed secondary) */
 //#define FRKERNEL_INTERFACE_LORA_BRIDGE    /* UART<->LoRa relay (bench test rig) */
 
 /* --------------------------------------------------------------------------
