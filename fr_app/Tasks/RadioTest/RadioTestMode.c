@@ -326,6 +326,21 @@ bool RADIOTESTMODE_bEnter(void)
      * RADIOTESTMODE_vExit, and nowhere else, so the pairing stays obvious. */
     SYSTEM_vSleepLockAcquire();
 
+    /* ...and hold the RADIO out of deep sleep, which is a separate thing from
+     * the MCU sleep lock above. Both are needed and neither substitutes for
+     * the other: the sleep lock keeps the core running and the debug UART
+     * alive, this keeps the transceiver able to answer a CAD.
+     *
+     * Taken BEFORE the wake-up below, because the thing it defends against is
+     * already in flight by the time we get here: entering the test from a
+     * FrKernel session clears s_bConnected, which releases DeviceDiscovery's
+     * AppTask from its "waiting for release" hold, and the campaign tail that
+     * follows calls LORARADIO_vEnterDeepSleep(). Without this the test wakes
+     * the radio, sends one or two beacons, and is then slept out from under —
+     * after which every carrier sense times out with no IRQ and the terminal
+     * shows an endlessly busy channel instead of a sleeping radio. */
+    LORARADIO_vSetKeepAwake(true);
+
     /* Make sure the radio is actually awake: the command may have arrived in a
      * kernel window that would otherwise have ended in a deep sleep. */
     LORARADIO_vWakeUp();
@@ -487,6 +502,13 @@ void RADIOTESTMODE_vExit(const char *pcReason)
      * what stops the next RADIOTESTMODE_u32ServiceBeacon on the mesh TX worker
      * dead, and puts that worker back on osWaitForever. */
     bActive = false;
+
+    /* Hand the radio's power state back to its normal owners. Released here,
+     * with bActive, rather than down beside SYSTEM_vSleepLockRelease() so the
+     * two early returns below cannot leave the radio pinned awake for the rest
+     * of the unit's uptime — that would cost real battery on a secondary and
+     * would be invisible until someone noticed the drain. */
+    LORARADIO_vSetKeepAwake(false);
 
     if (bIsListener)
         LORARADIO_vSetNoiseFloorSampling(false);

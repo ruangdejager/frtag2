@@ -124,4 +124,20 @@ void LORARADIO_vFlushTxQueue(void);
 void LORARADIO_vEnterDeepSleep(void);
 void LORARADIO_vWakeUp(void);
 
+/* Hold the radio out of deep sleep, or release that hold.
+ *
+ * The chip has several owners on different tasks (DeviceDiscovery's campaign
+ * tail, its basic-beacon path, its sleep-mode entry), and each of them calls
+ * LORARADIO_vEnterDeepSleep() when ITS work is done — which is not the same as
+ * the radio being idle. A long-running user of the radio that outlives those
+ * owners takes this for its duration; while it is held,
+ * LORARADIO_vEnterDeepSleep() does nothing.
+ *
+ * This is the RADIO's power state, and is independent of
+ * SYSTEM_vSleepLockAcquire(), which holds the MCU out of STOP2. A radio test
+ * needs both: the sleep lock keeps the core running and the debug UART alive,
+ * this keeps the transceiver able to answer a CAD. Not nested — a single
+ * boolean, because there is exactly one such user. */
+void LORARADIO_vSetKeepAwake(bool bEnable);
+
 #endif /* DEVICE_LORARADIO_LORARADIO_H_ */

@@ -105,6 +105,11 @@ static volatile bool    bNoiseFloorSampling = false;
  * needs it. */
 static volatile bool    bTxInProgress      = false;
 
+/* While set, LORARADIO_vEnterDeepSleep() is a no-op — see the comment there.
+ * Held by the runtime radio range test for its duration, because the chip has
+ * other owners whose normal teardown would otherwise sleep it mid-test. */
+static volatile bool    bKeepAwake         = false;
+
 static uint8_t u8DevEUI[8];
 
 /* -------------------------------------------------------------------------- */
@@ -575,8 +580,34 @@ bool LORARADIO_bCarrierSenseAndWait(uint32_t maxWaitMs)
     return false;
 }
 
-void LORARADIO_vEnterDeepSleep(void) { LORARADIO_DRIVER_vEnterDeepSleep(); }
+void LORARADIO_vEnterDeepSleep(void)
+{
+    /* Refuse while someone holds the radio awake. The chip is a shared
+     * resource with several owners on different tasks — DeviceDiscovery's
+     * campaign tail, its basic-beacon path and its sleep-mode entry all call
+     * this — and a caller finishing ITS work is not evidence that the radio is
+     * idle. The radio range test found this the hard way: entering it from a
+     * FrKernel session released the AppTask's "waiting for release" hold, and
+     * the campaign tail that followed deep-slept the chip out from under a
+     * test that had just started. Every CAD after that timed out at 300 ms
+     * with no IRQ, which reads on the terminal as an endlessly busy channel
+     * rather than as a sleeping radio.
+     *
+     * Gated here rather than at each call site: this is the layer that owns
+     * the chip's power state, it is one place instead of four, and a call site
+     * added later cannot silently reintroduce the same failure. */
+    if (bKeepAwake)
+        return;
+
+    LORARADIO_DRIVER_vEnterDeepSleep();
+}
+
 void LORARADIO_vWakeUp(void)         { LORARADIO_DRIVER_vWakeUp(); }
+
+void LORARADIO_vSetKeepAwake(bool bEnable)
+{
+    bKeepAwake = bEnable;
+}
 
 /* --------------------------------------------------------------------------
  * LORARADIO_vNotifyFromISR — set thread flags from ISR context
