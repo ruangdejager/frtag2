@@ -57,7 +57,14 @@
  * the code.
  * -------------------------------------------------------------------------- */
 #define LEDS_ALLOWED                      /* currently unreferenced in code */
-// #define ENABLE_RADIO_TEST              /* radio smoke-test task, see fr_app/Tasks/RadioTest */
+/* ENABLE_RADIO_TEST — radio link/range test. The strapped secondary beacons
+ * every 5 s; the strapped primary listens and logs RSSI/SNR plus beacons
+ * missed. One image serves both boards, the role strap decides which is
+ * which. Skips MeshNetwork/DeviceDiscovery. See fr_app/Tasks/RadioTest.
+ * (Keep the note above the line, not trailing it: a trailing block comment
+ * spanning several lines stops being a comment the moment the define is
+ * commented out with //, and the rest of it lands in the translation unit.) */
+// #define ENABLE_RADIO_TEST
 // #define ENABLE_LOW_POWER_RECOVERY      /* see fr_app/Tasks/DeviceDiscovery/DeviceDiscovery.h */
 
 /* --------------------------------------------------------------------------

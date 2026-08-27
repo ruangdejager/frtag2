@@ -1,16 +1,24 @@
 /*
  * RadioTest.h
  *
- * Standalone radio smoke-test task.
+ * Standalone radio link/range test task.
  *
  * Enabled by defining ENABLE_RADIO_TEST in fr_app/inc/config/build_config.h.
  *
  * When ENABLE_RADIO_TEST is defined:
- *   - This task transmits "Blink!\r\n" at 0.5 Hz over LoRa.
- *   - The LoRa radio task logs "LoraRadio: TX done IRQ" on every successful TX.
- *   - DeviceDiscovery and MeshNetwork are NOT initialised (they also use the radio).
+ *   - The GPIO role strap picks what this unit does, so one image serves both
+ *     boards of the pair:
+ *       SECONDARY — beacons its unique ID + a sequence number every 5 s.
+ *       PRIMARY   — listens and logs the RSSI/SNR of each beacon received,
+ *                   the channel noise floor and link margin, plus a running
+ *                   count of beacons missed (sequence gaps).
+ *   - DeviceDiscovery and MeshNetwork are NOT initialised (they also use the
+ *     radio), so this task drains the LoRa RX queue itself.
+ *   - init.c holds a sleep lock for the life of the build so the unit stays
+ *     out of STOP2 and never goes deaf or mute mid-test.
  *
- * DBG output is visible on the debug UART (always enabled).
+ * DBG_LOG output goes to the debug UART and the ext-flash log, so a range
+ * walk is recoverable from flash afterwards.
  */
 
 #ifndef FR_APP_TASKS_RADIOTEST_RADIOTEST_H_
