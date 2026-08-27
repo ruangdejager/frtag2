@@ -107,10 +107,10 @@
  * a handshake and a ~6.5 s verdict wait) plus two fr9 session opens. */
 #define RTM_STOP_WAIT_MS    20000U
 
-/* Thread flags */
-#define RTM_FLAG_BEACON     (1UL << 0)   /* beacon timer fired           */
-#define RTM_FLAG_RX         (1UL << 1)   /* a beacon landed in the queue */
-#define RTM_FLAG_STOP       (1UL << 2)   /* exit requested               */
+/* Thread flags. No RTM_FLAG_BEACON: the beacon role has no osTimer behind it
+ * (see the note on RtmCtx_t below) — RTM_vTask just times its own wait out. */
+#define RTM_FLAG_RX         (1UL << 0)   /* a beacon landed in the queue */
+#define RTM_FLAG_STOP       (1UL << 1)   /* exit requested               */
 
 /* --------------------------------------------------------------------------
  * State
@@ -125,10 +125,18 @@ typedef struct {
     int8_t   i8Snr;
 } RtmBeacon_t;
 
-/* Everything the mode needs while it is running, in one heap block. */
+/* Everything the mode needs while it is running, in one heap block.
+ *
+ * No timer object for the beacon cadence, on purpose: MeshNetwork's own
+ * beacon timer exists to hand off to a SEPARATE already-running TX task via a
+ * tiny callback on the FreeRTOS timer-service stack. RTM_vTask is not that —
+ * it is a full task with its own stack, so it can just time its own wait out
+ * every RTM_BEACON_MS and send from there. A software timer would be a second
+ * heap allocation (its control block) for something a plain wait already
+ * does, and on a secondary this heap is tight enough that this genuinely
+ * mattered — see the comment on RTM_STACK_SIZE_BEACON. */
 typedef struct {
     osMessageQueueId_t xRxQueue;      /* listener only */
-    osTimerId_t        xBeaconTimer;  /* beacon only   */
 
     uint32_t u32TxSeq;                /* beacon: next sequence number      */
 
@@ -165,11 +173,18 @@ static RtmCtx_t      *pCtx         = NULL;
  * "could not enter" that gives a field failure nothing to go on. */
 static const char *pcLastEnterError = "";
 
+/* Backing store for a failure reason that needs to carry a number (free-heap
+ * byte counts) rather than just a fixed string. Sized exactly for the longest
+ * message this file builds — "out of heap (task): 65535 B free, wanted
+ * 65535" is 46 chars — not rounded up: every static byte here is RAM this
+ * build cannot spare (see RTM_STACK_SIZE_BEACON's comment on how tight the
+ * heap already is; the same scarcity applies to .bss). */
+static char acLastEnterError[47];
+
 /* --------------------------------------------------------------------------
  * Forward declarations
  * -------------------------------------------------------------------------- */
 static void RTM_vTask(void *arg);
-static void RTM_vBeaconTimerCallback(void *arg);
 static void RTM_vSendBeacon(void);
 static void RTM_vHandleBeacon(const RtmBeacon_t *pB);
 static void RTM_vLogToFr9(const FarmrangerRtBeacon_t *pRow);
@@ -203,9 +218,11 @@ bool RADIOTESTMODE_bEnter(void)
     pCtx = pvPortMalloc(sizeof(RtmCtx_t));
     if (pCtx == NULL)
     {
-        pcLastEnterError = "out of heap (ctx)";
-        DBG_LOG("RadioTest: enter failed - out of heap for ctx, %u B free\r\n",
-                (unsigned)xPortGetFreeHeapSize());
+        snprintf(acLastEnterError, sizeof(acLastEnterError),
+                "out of heap (ctx): %u B free, wanted %u",
+                (unsigned)xPortGetFreeHeapSize(), (unsigned)sizeof(RtmCtx_t));
+        pcLastEnterError = acLastEnterError;
+        DBG_LOG("RadioTest: enter failed - %s\r\n", acLastEnterError);
         return false;
     }
     /* memset gives every counter its zero and, importantly, leaves bFr9Up
@@ -213,27 +230,18 @@ bool RADIOTESTMODE_bEnter(void)
      * listener that never hears one never raises the attention line. */
     memset(pCtx, 0, sizeof(RtmCtx_t));
 
+    /* Beacon role needs nothing else here — no timer object; see the note on
+     * RtmCtx_t for why. */
     if (bIsListener)
     {
         pCtx->xRxQueue = osMessageQueueNew(4U, sizeof(RtmBeacon_t), NULL);
         if (pCtx->xRxQueue == NULL)
         {
-            pcLastEnterError = "out of heap (rx queue)";
-            DBG_LOG("RadioTest: enter failed - no RX queue, %u B free\r\n",
+            snprintf(acLastEnterError, sizeof(acLastEnterError),
+                    "out of heap (rx queue): %u B free",
                     (unsigned)xPortGetFreeHeapSize());
-            RTM_vTeardown();
-            return false;
-        }
-    }
-    else
-    {
-        pCtx->xBeaconTimer = osTimerNew(RTM_vBeaconTimerCallback,
-                                        osTimerPeriodic, NULL, NULL);
-        if (pCtx->xBeaconTimer == NULL)
-        {
-            pcLastEnterError = "out of heap (timer)";
-            DBG_LOG("RadioTest: enter failed - no beacon timer, %u B free\r\n",
-                    (unsigned)xPortGetFreeHeapSize());
+            pcLastEnterError = acLastEnterError;
+            DBG_LOG("RadioTest: enter failed - %s\r\n", acLastEnterError);
             RTM_vTeardown();
             return false;
         }
@@ -256,9 +264,14 @@ bool RADIOTESTMODE_bEnter(void)
     xRtmTask = osThreadNew(RTM_vTask, NULL, &attr);
     if (xRtmTask == NULL)
     {
-        pcLastEnterError = "out of heap (task)";
-        DBG_LOG("RadioTest: enter failed - no task, %u B free (wanted %u)\r\n",
+        /* The number, not just the category: this ack is very likely the
+         * only place a remote operator ever sees this, and "out of heap" on
+         * its own leaves them guessing exactly how far short it fell. */
+        snprintf(acLastEnterError, sizeof(acLastEnterError),
+                "out of heap (task): %u B free, wanted %u",
                 (unsigned)xPortGetFreeHeapSize(), (unsigned)attr.stack_size);
+        pcLastEnterError = acLastEnterError;
+        DBG_LOG("RadioTest: enter failed - %s\r\n", acLastEnterError);
         bTaskRunning = false;
         RTM_vTeardown();
         return false;
@@ -292,9 +305,6 @@ bool RADIOTESTMODE_bEnter(void)
     MESHNETWORK_vStopPrimaryAck();
     MESHNETWORK_vFlushTxQueue();
     LORARADIO_vFlushTxQueue();
-
-    if (!bIsListener)
-        osTimerStart(pCtx->xBeaconTimer, RTM_BEACON_MS);
 
     DBG_LOG("RadioTest: ENTERED as %s\r\n",
             bIsListener ? "PRIMARY (listen)" : "SECONDARY (beacon)");
@@ -383,28 +393,12 @@ static void RTM_vTeardown(void)
 
     if (pCtx != NULL)
     {
-        if (pCtx->xBeaconTimer != NULL)
-        {
-            osTimerStop(pCtx->xBeaconTimer);
-            osTimerDelete(pCtx->xBeaconTimer);
-        }
         if (pCtx->xRxQueue != NULL)
             osMessageQueueDelete(pCtx->xRxQueue);
 
         vPortFree(pCtx);
         pCtx = NULL;
     }
-}
-
-/* --------------------------------------------------------------------------
- * Beacon timer - kept tiny: it runs on the FreeRTOS timer-service task, whose
- * stack cannot carry packet building or a DBG_LOG timestamp format.
- * -------------------------------------------------------------------------- */
-static void RTM_vBeaconTimerCallback(void *arg)
-{
-    (void)arg;
-    if (bActive && xRtmTask != NULL)
-        osThreadFlagsSet(xRtmTask, RTM_FLAG_BEACON);
 }
 
 /* --------------------------------------------------------------------------
@@ -455,20 +449,32 @@ static void RTM_vTask(void *arg)
 {
     (void)arg;
 
+    /* Beacon role has no timer object (see the note on RtmCtx_t) - it just
+     * times its own wait out every RTM_BEACON_MS and sends from there.
+     * Listener role reacts to RTM_FLAG_RX; its timeout is only a periodic
+     * liveness check, nothing is timed off it. */
+    const uint32_t u32WaitMs = bIsListener ? 1000U : RTM_BEACON_MS;
+
     for (;;)
     {
-        uint32_t flags = osThreadFlagsWait(RTM_FLAG_BEACON | RTM_FLAG_RX | RTM_FLAG_STOP,
-                                           osFlagsWaitAny, 1000U);
+        uint32_t flags = osThreadFlagsWait(RTM_FLAG_RX | RTM_FLAG_STOP,
+                                           osFlagsWaitAny, u32WaitMs);
         if (flags & osFlagsError)
             flags = 0U;
 
         if (!bActive || (flags & RTM_FLAG_STOP) || pCtx == NULL)
             break;
 
-        if (flags & RTM_FLAG_BEACON)
+        if (!bIsListener)
+        {
+            /* Nothing else can set a flag for this role (RADIOTESTMODE_vOnBeacon
+             * only signals the listener), so reaching here with STOP already
+             * ruled out means the wait timed out - RTM_BEACON_MS since the
+             * last beacon. */
             RTM_vSendBeacon();
+            continue;
+        }
 
-        if (bIsListener)
         {
             RtmBeacon_t tB;
             while (pCtx->xRxQueue != NULL &&
