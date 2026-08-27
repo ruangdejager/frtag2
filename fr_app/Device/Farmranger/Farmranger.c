@@ -797,24 +797,32 @@ bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
 /* "DeviceId,Seq,RSSI,SNR,NoiseFloor,Margin,Missed<tab>" — worst case ~48 chars. */
 #define FR_RT_ROW_MAX 64
 
-/* Format one measured beacon. Column order must match the fr9-side header in
- * FRTAG_vRtLogCmdHandler. Margin is rssi - noiseFloor, reported as 0 when no
- * noise floor was sampled (the row then carries nf=0 too, so the two agree). */
+/* NoiseFloor value meaning "no sample taken yet". Must match
+ * FRTAG_RTLOG_NF_NONE in the fr9's frtag.c, which prints it as "nf=n/a".
+ * INT16_MIN, chosen because it can never be a real dBm reading. */
+#define FR_RT_NF_NONE (-32768)
+
+/* Format one measured beacon. Field order must match FRTAG_vRtLogEmitRow on
+ * the fr9 — the two are a wire contract and neither can change alone.
+ *
+ * Carries only what the fr9 prints. Margin is rssi - noiseFloor, derivable by
+ * whoever reads the log; missed beacons are visible as gaps in Seq, which is
+ * what Seq is for. Sending either would be sending a number that has to stay
+ * consistent with two others across a wire, to save an arithmetic operation
+ * on the reader's side. */
 static int FARMRANGER_iFormatRtRow(char *row, const FarmrangerRtBeacon_t *b)
 {
-    bool bHaveNf  = (b->i16NoiseFloor != LORA_NOISE_FLOOR_INVALID);
-    int  iNf      = bHaveNf ? (int)b->i16NoiseFloor : 0;
-    int  iMargin  = bHaveNf ? (int)(b->i16Rssi - b->i16NoiseFloor) : 0;
+    int iNf = (b->i16NoiseFloor != LORA_NOISE_FLOOR_INVALID)
+              ? (int)b->i16NoiseFloor
+              : FR_RT_NF_NONE;
 
     return snprintf(row, FR_RT_ROW_MAX,
-                    "%X,%lu,%d,%d,%d,%d,%lu\t",
+                    "%X,%lu,%d,%d,%d\t",
                     (unsigned int)b->u32DeviceId,
                     (unsigned long)b->u32Seq,
                     b->i16Rssi,
                     b->i8Snr,
-                    iNf,
-                    iMargin,
-                    (unsigned long)b->u32Missed);
+                    iNf);
 }
 
 /* One AT+RTLOG upload attempt: handshake, paced row stream, verdict — the

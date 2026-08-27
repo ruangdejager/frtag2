@@ -39,8 +39,8 @@
  *
  *  - Every beacon goes to the fr9 immediately, nothing is buffered, so the
  *    flash log tracks the walk live and a unit that loses power mid-test has
- *    already banked what it heard. The Farmranger session is held open across
- *    beacons to make that cheap - see RTM_FR9_SESSION_MS.
+ *    already banked what it heard. One beacon, one fr9 session - see
+ *    RTM_vLogToFr9.
  */
 
 #include "RadioTestMode.h"
@@ -103,28 +103,10 @@
 #define RTM_TAG_LEN         3U
 #define RTM_LINE_MAX        48U
 
-/* fr9 logging. Every beacon is pushed to the fr9 the moment it is measured -
- * nothing is buffered - so the flash log tracks the walk live and a unit that
- * loses power mid-test has already banked everything it heard.
- *
- * To make that affordable the Farmranger session is opened once and HELD for
- * the duration, rather than a fresh session per beacon. A session costs a GPIO
- * attention edge and the fr9's fixed ~1 s wait before it answers RDY, and -
- * more to the point - the fr9 writes a session-start line to the very syslog
- * we are trying to read. At one session per 5 s beacon that is ~720 lines an
- * hour of noise around the data. Held open, each beacon costs only the
- * AT+RTLOG exchange, which is tens of milliseconds.
- *
- * The fr9 force-ends a session at FRTAG_SESSION_MAX_S (600 s) even with the
- * attention line still asserted, and needs a fresh rising edge to start
- * another - so recycle ours before it gets there rather than discovering it
- * mid-beacon. */
-#define RTM_FR9_SESSION_MS  540000U   /* 9 min, inside the fr9's 600 s cap */
-
 /* How long RADIOTESTMODE_vExit waits for the task to wind itself down. Sized
  * for the worst case on the way out: the task may be mid-upload for a beacon
- * it just measured, and that upload can cost two AT+RTLOG attempts (each with
- * a handshake and a ~6.5 s verdict wait) plus two fr9 session opens. */
+ * it just measured — an fr9 session open (~1 s to RDY) plus an AT+RTLOG whose
+ * verdict wait is ~6.5 s. */
 #define RTM_STOP_WAIT_MS    20000U
 
 /* Thread flags. Listener only — there is no task on the beacon side to flag. */
@@ -166,8 +148,6 @@ typedef struct {
     uint32_t u32LastSeq;
     bool     bHaveLast;
 
-    bool     bFr9Up;                  /* Farmranger session currently open  */
-    uint32_t u32Fr9SessionStart;      /* tick it was opened, for the recycle */
     uint32_t u32Fr9Logged;            /* beacons the fr9 acknowledged        */
     uint32_t u32Fr9Failed;            /* beacons it did not                  */
 } RtmCtx_t;
@@ -207,8 +187,6 @@ static char acLastEnterError[47];
 static void     RTM_vTask(void *arg);
 static void     RTM_vHandleBeacon(const RtmBeacon_t *pB);
 static void     RTM_vLogToFr9(const FarmrangerRtBeacon_t *pRow);
-static bool     RTM_bFr9SessionOpen(void);
-static void     RTM_vFr9SessionClose(void);
 static void     RTM_vTeardown(void);
 static uint32_t RTM_u32BiggestFreeBlock(void);
 
@@ -260,9 +238,6 @@ bool RADIOTESTMODE_bEnter(void)
         DBG_LOG("RadioTest: enter failed - %s\r\n", acLastEnterError);
         return false;
     }
-    /* memset gives every counter its zero and, importantly, leaves bFr9Up
-     * false: the fr9 session is opened lazily by the first beacon, so a
-     * listener that never hears one never raises the attention line. */
     memset(pCtx, 0, sizeof(RtmCtx_t));
 
     if (bIsListener)
@@ -729,9 +704,10 @@ static void RTM_vTask(void *arg)
     /* Winding down. Anything already measured is already on the fr9 - that is
      * the point of logging per beacon - but the queue may still hold beacons
      * the parser handed us in the last moments, and the last beacons of a
-     * range walk are the ones from the far end. Log those, then drop the
-     * attention line so the fr9 can end its session cleanly instead of sitting
-     * out its 600 s cap.
+     * range walk are the ones from the far end. Log those before going.
+     *
+     * No session to close: each beacon opens and drops its own, so by here the
+     * attention line is already low.
      *
      * Done here rather than in RADIOTESTMODE_vExit so it runs on this task's
      * stack and cannot race the loop above. */
@@ -744,8 +720,6 @@ static void RTM_vTask(void *arg)
         {
             RTM_vHandleBeacon(&tB);
         }
-
-        RTM_vFr9SessionClose();
 
         DBG_LOG("RadioTest: fr9 logged=%lu failed=%lu\r\n",
                 (unsigned long)pCtx->u32Fr9Logged,
@@ -822,91 +796,48 @@ static void RTM_vHandleBeacon(const RtmBeacon_t *pB)
 }
 
 /* --------------------------------------------------------------------------
- * Primary: fr9 session handling
+ * Primary: push one beacon to the fr9, as it is measured
+ *
+ * One beacon, one session: assert the attention line, wait for RDY, send the
+ * single AT+RTLOG, de-assert. Every beacon therefore starts from a known
+ * state, which is the whole point - a session held across beacons has to stay
+ * healthy for the length of a range walk, and when it does not (the fr9's own
+ * 600 s cap, a reset, a cable knocked loose) the failure is silent and every
+ * subsequent beacon is lost. That is what the held-session version did in
+ * practice: it logged the first beacon and then nothing.
+ *
+ * The cost is the fr9's fixed ~1 s wait before it answers RDY, once per
+ * beacon. Against a 5 s cadence that is affordable, and it buys a design with
+ * no session lifetime to manage, no recycle timer, and nothing to go stale.
  * -------------------------------------------------------------------------- */
-
-/* Raise the attention line and wait for the fr9's RDY. */
-static bool RTM_bFr9SessionOpen(void)
+static void RTM_vLogToFr9(const FarmrangerRtBeacon_t *pRow)
 {
-    if (pCtx == NULL)
-        return false;
+    bool bOk;
 
-    if (pCtx->bFr9Up)
-        return true;
+    if (pCtx == NULL || pRow == NULL)
+        return;
 
     if (!FARMRANGER_bDeviceOn())
     {
         DBG_LOG("RadioTest: fr9 did not answer RDY\r\n");
-        return false;
+        pCtx->u32Fr9Failed++;
+        FARMRANGER_vDeviceOff();   /* drop the line again; no session to keep */
+        return;
     }
 
-    pCtx->bFr9Up             = true;
-    pCtx->u32Fr9SessionStart = osKernelGetTickCount();
-    return true;
-}
-
-static void RTM_vFr9SessionClose(void)
-{
-    if (pCtx == NULL || !pCtx->bFr9Up)
-        return;
+    bOk = FARMRANGER_bLogRadioTestData(pRow, 1U);
 
     FARMRANGER_vDeviceOff();
-    pCtx->bFr9Up = false;
 
-    /* Hold the attention line low long enough for the fr9 to actually see the
-     * edge. It debounces GPIO1 for 20 ms and starts a session on the RISING
-     * edge, so a close immediately followed by an open - which is exactly what
-     * the recycle path does - would otherwise look like no change at all and
-     * the fr9 would stay in the session it had already given up on. */
+    /* Hold the attention line low long enough for the fr9 to see the falling
+     * edge before the next beacon raises it again. It debounces GPIO1 for
+     * 20 ms and starts a session on the RISING edge, so back-to-back sessions
+     * that never showed a clean low would look like no edge at all. There are
+     * ~5 s until the next beacon, so this costs nothing. */
     osDelay(50);
-}
 
-/* --------------------------------------------------------------------------
- * Primary: push one beacon to the fr9, as it is measured
- * -------------------------------------------------------------------------- */
-static void RTM_vLogToFr9(const FarmrangerRtBeacon_t *pRow)
-{
-    if (pCtx == NULL || pRow == NULL)
-        return;
-
-    /* Recycle before the fr9's own 600 s cap force-ends the session under us.
-     * Done here, between beacons, so the drop/raise never lands in the middle
-     * of an AT+RTLOG exchange. */
-    if (pCtx->bFr9Up &&
-        (osKernelGetTickCount() - pCtx->u32Fr9SessionStart) >= RTM_FR9_SESSION_MS)
-    {
-        RTM_vFr9SessionClose();
-    }
-
-    if (!RTM_bFr9SessionOpen())
-    {
+    if (bOk)
+        pCtx->u32Fr9Logged++;
+    else
         pCtx->u32Fr9Failed++;
-        return;
-    }
-
-    if (FARMRANGER_bLogRadioTestData(pRow, 1U))
-    {
-        pCtx->u32Fr9Logged++;
-        return;
-    }
-
-    /* One retry, and only after a full session recycle. A failed upload nearly
-     * always means the session is gone (the fr9 timed it out, or the board was
-     * reset or unplugged mid-walk); retrying into the same dead session would
-     * just spend another verdict timeout to learn the same thing. Reopening
-     * gives the fr9 the fresh rising edge it needs to start a new one.
-     *
-     * If that also fails, count it and move on rather than fight for one row:
-     * the next beacon is 5 s away, the terminal log already has this one, and
-     * the gap is visible in the Seq column of the fr9 log. */
-    RTM_vFr9SessionClose();
-
-    if (RTM_bFr9SessionOpen() && FARMRANGER_bLogRadioTestData(pRow, 1U))
-    {
-        pCtx->u32Fr9Logged++;
-        DBG_LOG("RadioTest: fr9 session recycled mid-test\r\n");
-        return;
-    }
-
-    pCtx->u32Fr9Failed++;
 }

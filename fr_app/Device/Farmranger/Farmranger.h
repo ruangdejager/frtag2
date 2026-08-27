@@ -120,14 +120,14 @@ typedef struct {
     int8_t   i8Snr;          /* dB                                          */
 } FarmrangerRtBeacon_t;
 
-/* Upload measured beacons to the fr9 for logging to its flash — normally one
- * at a time, as each beacon is heard. Same handshake/pacing/verdict contract
- * as FARMRANGER_bLogData against the fr9's AT+RTLOG handler, but a SINGLE
- * attempt: the caller is expected to be keeping up with a live 5 s beacon
- * stream, so recovery is its decision, not ours (see the note on the
- * implementation). The caller also owns the connect/disconnect
- * (FARMRANGER_bDeviceOn / FARMRANGER_vDeviceOff), exactly as for AT+LOG —
- * and for the radio test that session is held open across many beacons. */
+/* Upload measured beacons to the fr9 for logging to its flash — in practice
+ * one at a time, as each beacon is heard. Same handshake/pacing/verdict
+ * contract as FARMRANGER_bLogData against the fr9's AT+RTLOG handler, but a
+ * SINGLE attempt: the caller is expected to be keeping up with a live 5 s
+ * beacon stream, so recovery is its decision, not ours (see the note on the
+ * implementation). The caller owns the connect/disconnect
+ * (FARMRANGER_bDeviceOn / FARMRANGER_vDeviceOff), exactly as for AT+LOG; the
+ * radio test opens and drops a session per beacon. */
 bool FARMRANGER_bLogRadioTestData(const FarmrangerRtBeacon_t *pBeacons,
                                   uint16_t u16Count);
 
