@@ -600,7 +600,23 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
          * the entry flushes the radio TX queue, which would otherwise discard
          * an ack queued ahead of it. TX still works once the mode is up — it
          * is only the receive path a secondary closes. */
-        if (RADIOTESTMODE_bEnter())
+
+        /* Never over a broadcast. This is an action command, so without this
+         * check "tag * radiotest" would put EVERY secondary in earshot into
+         * beacon mode at once — each one deaf to the radio from that moment,
+         * including to this kernel, and recoverable only by physically
+         * shaking it. On a deployed herd that means finding and handling
+         * every animal. A range test is a two-unit bench/field procedure and
+         * has no broadcast form worth having; refuse rather than offer one.
+         *
+         * Guarded here rather than by listing it in apacQueries[]: that would
+         * make bulk drop it silently, and silence is the wrong answer to a
+         * command that would have been this destructive. */
+        if (bBulk)
+        {
+            DBG_LOG("FrKernel: refusing bulk 'radiotest' — address a single device\r\n");
+        }
+        else if (RADIOTESTMODE_bEnter())
         {
             FRKERNEL_vAck(eXport, bBulk,
                           RADIOTESTMODE_bIsListener()

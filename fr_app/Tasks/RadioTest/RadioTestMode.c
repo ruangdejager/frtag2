@@ -173,13 +173,15 @@ static RtmCtx_t      *pCtx         = NULL;
  * "could not enter" that gives a field failure nothing to go on. */
 static const char *pcLastEnterError = "";
 
-/* Backing store for a failure reason that needs to carry numbers (heap byte
- * counts) rather than just a fixed string. Sized exactly for the longest
- * message this file builds — "task heap: 65535 free, 65535 blk, want 65535"
- * is 43 chars — not rounded up: every static byte here is RAM this build
- * cannot spare. .bss ends 8 bytes short of the reserved heap/stack block in
- * the linker script, so "cannot spare" is literal. */
-static char acLastEnterError[47];
+/* Every reason above is a string literal in flash, deliberately. An earlier
+ * version formatted heap byte counts into a 47-byte static buffer, which was
+ * scaffolding for a heap failure the design has since removed — the beacon
+ * role allocates nothing but its 44-byte context now. 47 bytes of permanently
+ * resident RAM to describe a failure that no longer happens is a bad trade in
+ * a build that links with well under 100 bytes to spare. The numbers still go
+ * to DBG_LOG on the failing unit, which formats into the log ring and costs no
+ * static at all; only the ack, which has to outlive this function, is fixed
+ * text. */
 
 /* --------------------------------------------------------------------------
  * Forward declarations
@@ -188,7 +190,6 @@ static void     RTM_vTask(void *arg);
 static void     RTM_vHandleBeacon(const RtmBeacon_t *pB);
 static void     RTM_vLogToFr9(const FarmrangerRtBeacon_t *pRow);
 static void     RTM_vTeardown(void);
-static uint32_t RTM_u32BiggestFreeBlock(void);
 
 /* --------------------------------------------------------------------------
  * Public state
@@ -230,12 +231,13 @@ bool RADIOTESTMODE_bEnter(void)
     pCtx = pvPortMalloc(sizeof(RtmCtx_t));
     if (pCtx == NULL)
     {
-        snprintf(acLastEnterError, sizeof(acLastEnterError),
-                "ctx heap: %u free, %u blk",
-                (unsigned)xPortGetFreeHeapSize(),
-                (unsigned)RTM_u32BiggestFreeBlock());
-        pcLastEnterError = acLastEnterError;
-        DBG_LOG("RadioTest: enter failed - %s\r\n", acLastEnterError);
+        /* Fixed string for the ack (it has to outlive this function), numbers
+         * to the log. Note the free TOTAL is only indicative: heap_4 satisfies
+         * a request from ONE block, so a failure here can read as plenty free
+         * and still be genuine. */
+        pcLastEnterError = "out of heap (ctx)";
+        DBG_LOG("RadioTest: enter failed - ctx alloc of %u B, %u B free total\r\n",
+                (unsigned)sizeof(RtmCtx_t), (unsigned)xPortGetFreeHeapSize());
         return false;
     }
     memset(pCtx, 0, sizeof(RtmCtx_t));
@@ -245,12 +247,9 @@ bool RADIOTESTMODE_bEnter(void)
         pCtx->xRxQueue = osMessageQueueNew(4U, sizeof(RtmBeacon_t), NULL);
         if (pCtx->xRxQueue == NULL)
         {
-            snprintf(acLastEnterError, sizeof(acLastEnterError),
-                    "queue heap: %u free, %u blk",
-                    (unsigned)xPortGetFreeHeapSize(),
-                    (unsigned)RTM_u32BiggestFreeBlock());
-            pcLastEnterError = acLastEnterError;
-            DBG_LOG("RadioTest: enter failed - %s\r\n", acLastEnterError);
+            pcLastEnterError = "out of heap (queue)";
+            DBG_LOG("RadioTest: enter failed - RX queue, %u B free total\r\n",
+                    (unsigned)xPortGetFreeHeapSize());
             RTM_vTeardown();
             return false;
         }
@@ -269,19 +268,16 @@ bool RADIOTESTMODE_bEnter(void)
         xRtmTask = osThreadNew(RTM_vTask, NULL, &attr);
         if (xRtmTask == NULL)
         {
-            /* Both numbers, not just the category. This ack is very likely the
-             * only place a remote operator ever sees this, and the free TOTAL
-             * on its own is actively misleading — "2640 B free, wanted 2048"
-             * is what made three rounds of stack-size guessing look
-             * reasonable. The biggest single block is the figure heap_4
-             * actually decides on. */
-            snprintf(acLastEnterError, sizeof(acLastEnterError),
-                    "task heap: %u free, %u blk, want %u",
-                    (unsigned)xPortGetFreeHeapSize(),
-                    (unsigned)RTM_u32BiggestFreeBlock(),
-                    (unsigned)attr.stack_size);
-            pcLastEnterError = acLastEnterError;
-            DBG_LOG("RadioTest: enter failed - %s\r\n", acLastEnterError);
+            /* Log the size wanted alongside the total free. They can disagree
+             * wildly and both be right — heap_4 allocates from a single block,
+             * and "2640 B free, wanted 2048" failing is what sent three rounds
+             * of stack-size guessing down the wrong path. Only the listener
+             * (a primary) reaches this at all; the beacon role stopped needing
+             * a task of its own. */
+            pcLastEnterError = "out of heap (task)";
+            DBG_LOG("RadioTest: enter failed - task stack %u B, %u B free total\r\n",
+                    (unsigned)attr.stack_size,
+                    (unsigned)xPortGetFreeHeapSize());
             bTaskRunning = false;
             RTM_vTeardown();
             return false;
@@ -582,47 +578,6 @@ static void RTM_vTeardown(void)
 
         vPortFree(pDoomed);
     }
-}
-
-/* --------------------------------------------------------------------------
- * Heap diagnostics
- * -------------------------------------------------------------------------- */
-
-/* Largest single block pvPortMalloc would hand out right now.
- *
- * xPortGetFreeHeapSize() is the SUM of every free block, which is why a
- * failure can read "2640 B free, wanted 2048" and be entirely genuine: heap_4
- * has to satisfy a request out of ONE block, and this build fragments the
- * heap by design - the init task frees its 1 KB stack when it exits, leaving
- * a hole in the middle of everything allocated during boot. Reporting the sum
- * alone is what sent three commits chasing the wrong number.
- *
- * Probed rather than read: this FreeRTOS predates vPortGetHeapStats and
- * heap_4.c is third-party, so a binary search on pvPortMalloc is the only way
- * to see the split from up here. ~11 allocations to 16-byte resolution, all
- * of them on a path that has already failed and is about to return. */
-static uint32_t RTM_u32BiggestFreeBlock(void)
-{
-    uint32_t u32Lo = 0U;
-    uint32_t u32Hi = (uint32_t)xPortGetFreeHeapSize();
-
-    while ((u32Hi - u32Lo) > 16U)
-    {
-        uint32_t  u32Mid = u32Lo + ((u32Hi - u32Lo) / 2U);
-        void     *pProbe = pvPortMalloc(u32Mid);
-
-        if (pProbe != NULL)
-        {
-            vPortFree(pProbe);
-            u32Lo = u32Mid;
-        }
-        else
-        {
-            u32Hi = u32Mid;
-        }
-    }
-
-    return u32Lo;
 }
 
 /* --------------------------------------------------------------------------
