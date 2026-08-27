@@ -96,6 +96,15 @@ static volatile uint32_t gRadioPendingEvents = 0;
 static int16_t          i16NoiseFloor      = LORA_NOISE_FLOOR_INVALID;
 static volatile bool    bNoiseFloorSampling = false;
 
+/* True from the moment a packet is pulled off xLoRaTxQueue until this task is
+ * done with it (sent, or dropped after carrier-sense failed) — the window in
+ * which the queue itself reads empty even though a TX is still in flight,
+ * because osMessageQueueGet() dequeues before carrier-sense runs. Queue depth
+ * alone cannot tell a caller "wait, something is still being tried"; this can.
+ * See LORARADIO_u16GetTxQueueDepth()'s header comment for the caller that
+ * needs it. */
+static volatile bool    bTxInProgress      = false;
+
 static uint8_t u8DevEUI[8];
 
 /* -------------------------------------------------------------------------- */
@@ -343,6 +352,7 @@ void LORARADIO_vRadioTask(void *arg)
                 }
 
                 u8Sent++;
+                bTxInProgress = true;
 
                 uint8_t crc = LORARADIO_u8CRC8_Calculate(pkt.buffer, pkt.length);
                 pkt.buffer[pkt.length++] = crc;
@@ -355,15 +365,18 @@ void LORARADIO_vRadioTask(void *arg)
                         events |= stashed;
                         DBG_LOG("Loraradio: TX REQ interrupted by events 0x%08lX\r\n", stashed);
                         LORARADIO_DRIVER_vEnterRxMode(0);
+                        bTxInProgress = false;
                         continue;
                     }
                     DBG_LOG("Loraradio: TX REQ abort — carrier busy\r\n");
                     LORARADIO_DRIVER_vEnterRxMode(0);
+                    bTxInProgress = false;
                     continue;
                 }
 
                 LORARADIO_DRIVER_bTransmitPayload(pkt.buffer, pkt.length);
                 LORARADIO_DRIVER_vEnterRxMode(0x00);
+                bTxInProgress = false;
             }
         }
     }
@@ -379,6 +392,16 @@ void LORARADIO_vSetNoiseFloorSampling(bool bEnable)
         i16NoiseFloor = LORA_NOISE_FLOOR_INVALID;
 
     bNoiseFloorSampling = bEnable;
+}
+
+uint16_t LORARADIO_u16GetTxQueueDepth(void)
+{
+    return (uint16_t)osMessageQueueGetCount(xLoRaTxQueue);
+}
+
+bool LORARADIO_bTxInProgress(void)
+{
+    return bTxInProgress;
 }
 
 uint32_t LORARADIO_u32GetUniqueId(void)

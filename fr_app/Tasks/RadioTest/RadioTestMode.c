@@ -13,6 +13,19 @@
  *    static is three flags and two pointers — the minimum needed for the gates
  *    in MeshNetwork and DeviceDiscovery to be a cheap read on the hot path.
  *
+ *  - The beacon role has no task and no timer. It allocates its context and
+ *    nothing else, and runs on MESHNETWORK_vTxTask via
+ *    RADIOTESTMODE_u32ServiceBeacon. That is not tidiness, it is the only
+ *    thing that fits: a secondary reaches this code with roughly 2.6 KB of
+ *    FreeRTOS heap left, split across free blocks, and heap_4 must satisfy a
+ *    request from ONE of them. Three attempts at sizing a beacon task ended
+ *    in "could not enter (out of heap (task): 2640 B free, wanted 2048)" —
+ *    a sum that looks sufficient right up until you remember it is a sum.
+ *    Only the listener, which must block for seconds inside a Farmranger AT
+ *    exchange and therefore cannot borrow anyone's task, still creates one,
+ *    and only a primary — which has GPS, Movement and SolarPower absent from
+ *    its heap and ~6.5 KB more of it free — ever takes that path.
+ *
  *  - The listener does NOT drain the LoRa RX queue. That queue belongs to
  *    MESHNETWORK_vParserTask in a production build, which is the key
  *    difference from the compile-time ENABLE_RADIO_TEST build in RadioTest.c
@@ -51,27 +64,34 @@
  * Tunables
  * -------------------------------------------------------------------------- */
 
-/* Unlike the compile-time ENABLE_RADIO_TEST build, this task has to fit on the
- * heap ALONGSIDE everything the mesh build already created — LoRa radio task,
- * MeshNetwork's two tasks, DeviceDiscovery's two tasks, FrKernel, GPS, and on
- * a secondary Movement/ACC/SolarPower/Battery too. Those already commit on
- * the order of 30+ KB of the 46 KB FreeRTOS heap between their stacks and
- * queues, so headroom here is genuinely tight and the two roles are sized
- * separately rather than sharing one figure:
+/* Listener only — the beacon role creates no task at all; see the note at the
+ * top of the file and RADIOTESTMODE_u32ServiceBeacon below.
  *
- *   - The secondary's call depth is shallow — build a packet, LORARADIO_bTxPacket,
- *     DBG_LOG — so *4 is ample with margin.
- *   - The primary's is not: RTM_vHandleBeacon runs into
- *     FARMRANGER_bLogRadioTestData -> FARMRANGER_bRtLogAttempt, which has its
- *     own row/cmd/response buffers on the stack before it even reaches
- *     FARMRANGER_bATSend and the UART layer beneath it. Keep the *6 the
- *     compile-time RadioTest.c task already uses for the same reason FrKernel
- *     does (see FrKernel.c's own *6 comment) — trimming this one and hitting
- *     a real overrun would be a much worse failure than the extra 1 KB. */
-#define RTM_STACK_SIZE_BEACON   (configMINIMAL_STACK_SIZE * 4)
+ * Unlike the compile-time ENABLE_RADIO_TEST build, this task has to fit on the
+ * heap ALONGSIDE everything the mesh build already created — LoRa radio task,
+ * MeshNetwork's two tasks, DeviceDiscovery's two tasks, FrKernel, Farmranger's
+ * two, Battery and Power. Those already commit on the order of 30 KB of the
+ * 46 KB FreeRTOS heap between their stacks and queues, so headroom is tight
+ * even here, where it is least tight.
+ *
+ * It stays at *6 regardless. -fstack-usage measures the deep path —
+ * RTM_vTask 32 + RTM_vHandleBeacon 72 + FARMRANGER_bLogRadioTestData 288
+ * (its own row/cmd/response/line buffers) + FARMRANGER_bATSend 40 — at ~430 B,
+ * and under all of it sits DBG_LOG's localtime/strftime/vsnprintf, which is
+ * library code -fstack-usage cannot see. It is that unmeasured tail, not the
+ * 430 B, that the margin is for. Same figure the compile-time RadioTest.c
+ * task uses, for the same reason FrKernel does (see FrKernel.c's own *6
+ * comment) — and unlike the beacon role, this allocation is not the one that
+ * was failing: only a primary ever reaches it. */
 #define RTM_STACK_SIZE_LISTEN   (configMINIMAL_STACK_SIZE * 6)
 
 #define RTM_BEACON_MS       5000U    /* 0.2 Hz, per the test spec */
+
+/* Deliberately shorter than RTM_BEACON_MS: how long to wait, when a beacon
+ * comes due but a PREVIOUS one is still sitting in the LoRa TX queue, before
+ * checking again. See the "one at a time" note on RADIOTESTMODE_u32ServiceBeacon
+ * for why that check exists at all. */
+#define RTM_BEACON_RETRY_MS 500U
 
 /* Beacon frame: [0] = type, [1..] = ASCII "RT <id:hex> <seq:dec>".
  *
@@ -107,8 +127,7 @@
  * a handshake and a ~6.5 s verdict wait) plus two fr9 session opens. */
 #define RTM_STOP_WAIT_MS    20000U
 
-/* Thread flags. No RTM_FLAG_BEACON: the beacon role has no osTimer behind it
- * (see the note on RtmCtx_t below) — RTM_vTask just times its own wait out. */
+/* Thread flags. Listener only — there is no task on the beacon side to flag. */
 #define RTM_FLAG_RX         (1UL << 0)   /* a beacon landed in the queue */
 #define RTM_FLAG_STOP       (1UL << 1)   /* exit requested               */
 
@@ -125,20 +144,21 @@ typedef struct {
     int8_t   i8Snr;
 } RtmBeacon_t;
 
-/* Everything the mode needs while it is running, in one heap block.
+/* Everything the mode needs while it is running, in one heap block — the only
+ * allocation a beaconing secondary makes, at 44 bytes plus heap_4's 8-byte
+ * block header.
  *
- * No timer object for the beacon cadence, on purpose: MeshNetwork's own
- * beacon timer exists to hand off to a SEPARATE already-running TX task via a
- * tiny callback on the FreeRTOS timer-service stack. RTM_vTask is not that —
- * it is a full task with its own stack, so it can just time its own wait out
- * every RTM_BEACON_MS and send from there. A software timer would be a second
- * heap allocation (its control block) for something a plain wait already
- * does, and on a secondary this heap is tight enough that this genuinely
- * mattered — see the comment on RTM_STACK_SIZE_BEACON. */
+ * No timer object for the beacon cadence, and no task either: the beacon runs
+ * on MESHNETWORK_vTxTask, which keeps its own deadline here and calls
+ * RADIOTESTMODE_u32ServiceBeacon when it comes round. MeshNetwork's own beacon
+ * timer exists to hand work off from the tiny FreeRTOS timer-service stack to
+ * that same TX task; there is no reason to take the long way round to a task
+ * we are already running on. */
 typedef struct {
     osMessageQueueId_t xRxQueue;      /* listener only */
 
     uint32_t u32TxSeq;                /* beacon: next sequence number      */
+    uint32_t u32NextBeaconTick;       /* beacon: tick the next one is due  */
 
     uint32_t u32RxCount;              /* listener bookkeeping              */
     uint32_t u32Missed;
@@ -173,24 +193,24 @@ static RtmCtx_t      *pCtx         = NULL;
  * "could not enter" that gives a field failure nothing to go on. */
 static const char *pcLastEnterError = "";
 
-/* Backing store for a failure reason that needs to carry a number (free-heap
- * byte counts) rather than just a fixed string. Sized exactly for the longest
- * message this file builds — "out of heap (task): 65535 B free, wanted
- * 65535" is 46 chars — not rounded up: every static byte here is RAM this
- * build cannot spare (see RTM_STACK_SIZE_BEACON's comment on how tight the
- * heap already is; the same scarcity applies to .bss). */
+/* Backing store for a failure reason that needs to carry numbers (heap byte
+ * counts) rather than just a fixed string. Sized exactly for the longest
+ * message this file builds — "task heap: 65535 free, 65535 blk, want 65535"
+ * is 43 chars — not rounded up: every static byte here is RAM this build
+ * cannot spare. .bss ends 8 bytes short of the reserved heap/stack block in
+ * the linker script, so "cannot spare" is literal. */
 static char acLastEnterError[47];
 
 /* --------------------------------------------------------------------------
  * Forward declarations
  * -------------------------------------------------------------------------- */
-static void RTM_vTask(void *arg);
-static void RTM_vSendBeacon(void);
-static void RTM_vHandleBeacon(const RtmBeacon_t *pB);
-static void RTM_vLogToFr9(const FarmrangerRtBeacon_t *pRow);
-static bool RTM_bFr9SessionOpen(void);
-static void RTM_vFr9SessionClose(void);
-static void RTM_vTeardown(void);
+static void     RTM_vTask(void *arg);
+static void     RTM_vHandleBeacon(const RtmBeacon_t *pB);
+static void     RTM_vLogToFr9(const FarmrangerRtBeacon_t *pRow);
+static bool     RTM_bFr9SessionOpen(void);
+static void     RTM_vFr9SessionClose(void);
+static void     RTM_vTeardown(void);
+static uint32_t RTM_u32BiggestFreeBlock(void);
 
 /* --------------------------------------------------------------------------
  * Public state
@@ -215,12 +235,27 @@ bool RADIOTESTMODE_bEnter(void)
 
     bIsListener = (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY);
 
+    /* A beaconing secondary has no task of its own — it rides MeshNetwork's TX
+     * worker. Refuse up front if that worker is not there rather than entering
+     * a mode that would then never transmit: that is the case in an
+     * ENABLE_RADIO_TEST build, where MESHNETWORK_vInit is skipped entirely and
+     * the compile-time test in RadioTest.c owns the radio instead. A silent
+     * no-beacon "success" would be indistinguishable, from the far end of a
+     * range walk, from a link that simply does not reach. */
+    if (!bIsListener && !MESHNETWORK_bTxWorkerReady())
+    {
+        pcLastEnterError = "no mesh TX worker";
+        DBG_LOG("RadioTest: enter failed - %s\r\n", pcLastEnterError);
+        return false;
+    }
+
     pCtx = pvPortMalloc(sizeof(RtmCtx_t));
     if (pCtx == NULL)
     {
         snprintf(acLastEnterError, sizeof(acLastEnterError),
-                "out of heap (ctx): %u B free, wanted %u",
-                (unsigned)xPortGetFreeHeapSize(), (unsigned)sizeof(RtmCtx_t));
+                "ctx heap: %u free, %u blk",
+                (unsigned)xPortGetFreeHeapSize(),
+                (unsigned)RTM_u32BiggestFreeBlock());
         pcLastEnterError = acLastEnterError;
         DBG_LOG("RadioTest: enter failed - %s\r\n", acLastEnterError);
         return false;
@@ -230,51 +265,58 @@ bool RADIOTESTMODE_bEnter(void)
      * listener that never hears one never raises the attention line. */
     memset(pCtx, 0, sizeof(RtmCtx_t));
 
-    /* Beacon role needs nothing else here — no timer object; see the note on
-     * RtmCtx_t for why. */
     if (bIsListener)
     {
         pCtx->xRxQueue = osMessageQueueNew(4U, sizeof(RtmBeacon_t), NULL);
         if (pCtx->xRxQueue == NULL)
         {
             snprintf(acLastEnterError, sizeof(acLastEnterError),
-                    "out of heap (rx queue): %u B free",
-                    (unsigned)xPortGetFreeHeapSize());
+                    "queue heap: %u free, %u blk",
+                    (unsigned)xPortGetFreeHeapSize(),
+                    (unsigned)RTM_u32BiggestFreeBlock());
             pcLastEnterError = acLastEnterError;
             DBG_LOG("RadioTest: enter failed - %s\r\n", acLastEnterError);
             RTM_vTeardown();
             return false;
         }
+
+        const osThreadAttr_t attr = {
+            .name       = "RadioTestMode",
+            .stack_size = RTM_STACK_SIZE_LISTEN * sizeof(StackType_t),
+            .priority   = osPriorityNormal,
+        };
+
+        /* Set before the thread is created: the task clears it on the way out,
+         * and a task that gets scheduled before osThreadNew returns must not
+         * observe a stale false here. */
+        bTaskRunning = true;
+
+        xRtmTask = osThreadNew(RTM_vTask, NULL, &attr);
+        if (xRtmTask == NULL)
+        {
+            /* Both numbers, not just the category. This ack is very likely the
+             * only place a remote operator ever sees this, and the free TOTAL
+             * on its own is actively misleading — "2640 B free, wanted 2048"
+             * is what made three rounds of stack-size guessing look
+             * reasonable. The biggest single block is the figure heap_4
+             * actually decides on. */
+            snprintf(acLastEnterError, sizeof(acLastEnterError),
+                    "task heap: %u free, %u blk, want %u",
+                    (unsigned)xPortGetFreeHeapSize(),
+                    (unsigned)RTM_u32BiggestFreeBlock(),
+                    (unsigned)attr.stack_size);
+            pcLastEnterError = acLastEnterError;
+            DBG_LOG("RadioTest: enter failed - %s\r\n", acLastEnterError);
+            bTaskRunning = false;
+            RTM_vTeardown();
+            return false;
+        }
     }
-
-    /* Two attrs, not one: see the stack-size comment above for why the roles
-     * cannot share a figure on a heap this tight. */
-    const osThreadAttr_t attr = {
-        .name       = "RadioTestMode",
-        .stack_size = (bIsListener ? RTM_STACK_SIZE_LISTEN : RTM_STACK_SIZE_BEACON)
-                      * sizeof(StackType_t),
-        .priority   = osPriorityNormal,
-    };
-
-    /* Set before the thread is created: the task clears it on the way out, and
-     * a task that gets scheduled before osThreadNew returns must not observe a
-     * stale false here. */
-    bTaskRunning = true;
-
-    xRtmTask = osThreadNew(RTM_vTask, NULL, &attr);
-    if (xRtmTask == NULL)
+    else
     {
-        /* The number, not just the category: this ack is very likely the
-         * only place a remote operator ever sees this, and "out of heap" on
-         * its own leaves them guessing exactly how far short it fell. */
-        snprintf(acLastEnterError, sizeof(acLastEnterError),
-                "out of heap (task): %u B free, wanted %u",
-                (unsigned)xPortGetFreeHeapSize(), (unsigned)attr.stack_size);
-        pcLastEnterError = acLastEnterError;
-        DBG_LOG("RadioTest: enter failed - %s\r\n", acLastEnterError);
-        bTaskRunning = false;
-        RTM_vTeardown();
-        return false;
+        /* Due immediately, so the first beacon goes out on the TX worker's
+         * very next pass rather than 5 s after the operator sees the ack. */
+        pCtx->u32NextBeaconTick = osKernelGetTickCount();
     }
 
     /* Hold the system out of STOP2 for the duration. STOP2 parks the debug
@@ -306,9 +348,126 @@ bool RADIOTESTMODE_bEnter(void)
     MESHNETWORK_vFlushTxQueue();
     LORARADIO_vFlushTxQueue();
 
-    DBG_LOG("RadioTest: ENTERED as %s\r\n",
-            bIsListener ? "PRIMARY (listen)" : "SECONDARY (beacon)");
+    /* The TX worker we are about to beacon from is parked on osWaitForever
+     * with nothing left to wake it - the gates above just made sure of that.
+     * Poke it so it goes round once more and picks up the beacon deadline as
+     * its timeout. After bActive, or it would go straight back to sleep. */
+    if (!bIsListener)
+        MESHNETWORK_vWakeTxWorker();
+
+    /* Free heap on the way in, not just when it runs out: this is the number
+     * that decides whether the mode fits, and having it logged for a
+     * successful entry is what makes the next failure a comparison rather
+     * than another first data point. */
+    DBG_LOG("RadioTest: ENTERED as %s, %u B heap free\r\n",
+            bIsListener ? "PRIMARY (listen)" : "SECONDARY (beacon)",
+            (unsigned)xPortGetFreeHeapSize());
     return true;
+}
+
+/* --------------------------------------------------------------------------
+ * RADIOTESTMODE_u32ServiceBeacon - runs on MESHNETWORK_vTxTask
+ * -------------------------------------------------------------------------- */
+uint32_t RADIOTESTMODE_u32ServiceBeacon(void)
+{
+    LoraRadio_Packet_t pkt;
+    uint32_t           u32Now;
+    uint32_t           u32Seq;
+    uint32_t           u32Id;
+    int                n;
+
+    /* Cheap out first: this is on every trip round the mesh TX worker's loop
+     * in normal operation, and must cost one volatile read. */
+    if (!bActive || bIsListener)
+        return osWaitForever;
+
+    u32Now = osKernelGetTickCount();
+
+    /* Read the context and claim the beacon in one atomic step, then work from
+     * locals only. We are on a task this file does not own, and
+     * RADIOTESTMODE_vExit can free pCtx from Movement (shake) or from FrKernel
+     * at any moment. Nothing below the critical section touches pCtx, so the
+     * worst a teardown landing mid-beacon can do is put one last frame on the
+     * air - it can never dereference freed memory, whatever the priorities of
+     * the two tasks happen to be. */
+    taskENTER_CRITICAL();
+
+    if (!bActive || pCtx == NULL)
+    {
+        taskEXIT_CRITICAL();
+        return osWaitForever;
+    }
+
+    /* Signed difference, so this survives the tick counter wrapping. */
+    if ((int32_t)(pCtx->u32NextBeaconTick - u32Now) > 0)
+    {
+        uint32_t u32Left = pCtx->u32NextBeaconTick - u32Now;
+        taskEXIT_CRITICAL();
+        return u32Left;             /* woken early - nothing due yet */
+    }
+
+    taskEXIT_CRITICAL();
+
+    /* One of our own beacons outstanding at a time, never two.
+     *
+     * RTM_BEACON_MS (5 s) and LORA_TX_CARRIER_WAIT_MS (5 s, the radio task's
+     * own carrier-sense budget per packet) are numerically equal, which is not
+     * a coincidence to route around so much as a fact to respect: under a busy
+     * channel, a packet can still be being carrier-sensed when the NEXT
+     * beacon becomes due by our own clock. Enqueuing anyway would let our
+     * beacons pile up behind each other — worse, faster than they can
+     * possibly be sent — for no gain.
+     *
+     * Both checks are needed: the radio task DEQUEUES a packet before it
+     * carrier-senses it, so the queue alone reads empty for the entire
+     * multi-second window a packet can be in flight — that window is exactly
+     * what caused the pile-up, so it is the one that must not be missed.
+     *
+     * Checking here, before claiming the sequence number, means a beacon
+     * delayed this way is not yet "sent" and is retried at its own number
+     * rather than skipped — the count of genuinely un-transmittable beacons is
+     * what RTM_BEACON_RETRY_MS is for. */
+    if (LORARADIO_u16GetTxQueueDepth() > 0U || LORARADIO_bTxInProgress())
+        return RTM_BEACON_RETRY_MS;
+
+    taskENTER_CRITICAL();
+
+    if (!bActive || pCtx == NULL)
+    {
+        taskEXIT_CRITICAL();
+        return osWaitForever;
+    }
+
+    /* Claimed even though the send below may drop it: to the listener a
+     * dropped beacon is identical to one that never made it across, and the
+     * sequence gap should say so. */
+    u32Seq                  = pCtx->u32TxSeq++;
+    pCtx->u32NextBeaconTick = u32Now + RTM_BEACON_MS;
+
+    taskEXIT_CRITICAL();
+
+    u32Id = LORARADIO_u32GetUniqueId();
+
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.buffer[0] = (uint8_t)MeshPktType_Reserved;
+
+    n = snprintf((char *)&pkt.buffer[1],
+                 (size_t)(LORA_MAX_PACKET_SIZE - 2),
+                 RTM_TAG "%04lX %lu",
+                 (unsigned long)u32Id, (unsigned long)u32Seq);
+
+    if (n > 0)
+    {
+        pkt.length = (uint8_t)(n + 1);
+
+        if (LORARADIO_bTxPacket(&pkt))
+            DBG_LOG("RadioTest: TX seq=%lu\r\n", (unsigned long)u32Seq);
+        else
+            DBG_LOG("RadioTest: TX drop seq=%lu (queue full)\r\n",
+                    (unsigned long)u32Seq);
+    }
+
+    return RTM_BEACON_MS;
 }
 
 /* --------------------------------------------------------------------------
@@ -316,14 +475,17 @@ bool RADIOTESTMODE_bEnter(void)
  * -------------------------------------------------------------------------- */
 void RADIOTESTMODE_vExit(const char *pcReason)
 {
-    uint32_t u32Rx     = (pCtx != NULL) ? pCtx->u32RxCount : 0U;
-    uint32_t u32Missed = (pCtx != NULL) ? pCtx->u32Missed  : 0U;
+    uint32_t u32Rx     = 0U;
+    uint32_t u32Missed = 0U;
+    uint32_t u32Tx     = 0U;
 
     if (!bActive)
         return;
 
     /* Clear the gates first so the mesh is live again the moment we stop, and
-     * so nothing new is handed to a queue we are about to delete. */
+     * so nothing new is handed to a queue we are about to delete. It is also
+     * what stops the next RADIOTESTMODE_u32ServiceBeacon on the mesh TX worker
+     * dead, and puts that worker back on osWaitForever. */
     bActive = false;
 
     if (bIsListener)
@@ -337,8 +499,8 @@ void RADIOTESTMODE_vExit(const char *pcReason)
      * by the time we free anything it is genuinely done with it.
      *
      * The bound is generous because that final flush is up to three AT+RTLOG
-     * attempts. On a secondary there is no flush and this returns almost at
-     * once, so the shake path (Movement task) never stalls. */
+     * attempts. Listener only - a beaconing secondary has no task, so the
+     * shake path (Movement task) skips all of this and returns at once. */
     if (xRtmTask != NULL)
     {
         uint32_t u32Start = osKernelGetTickCount();
@@ -361,26 +523,42 @@ void RADIOTESTMODE_vExit(const char *pcReason)
             SYSTEM_vSleepLockRelease();
             return;
         }
+    }
 
-        u32Rx     = (pCtx != NULL) ? pCtx->u32RxCount : u32Rx;
-        u32Missed = (pCtx != NULL) ? pCtx->u32Missed  : u32Missed;
+    if (pCtx != NULL)
+    {
+        u32Rx     = pCtx->u32RxCount;
+        u32Missed = pCtx->u32Missed;
+        u32Tx     = pCtx->u32TxSeq;
     }
 
     RTM_vTeardown();
 
     SYSTEM_vSleepLockRelease();
 
-    DBG_LOG("RadioTest: EXITED (%s) - rx=%lu missed=%lu\r\n",
-            (pcReason != NULL) ? pcReason : "?",
-            (unsigned long)u32Rx, (unsigned long)u32Missed);
+    /* Per role, because the other role's counters are all zero and printing
+     * them reads as a test that measured nothing. On a secondary this line is
+     * the whole result of the run - it is deaf for the duration, so the beacon
+     * count is the only thing it can report, and a shake-exit is the only
+     * place it gets reported. */
+    if (bIsListener)
+        DBG_LOG("RadioTest: EXITED (%s) - rx=%lu missed=%lu\r\n",
+                (pcReason != NULL) ? pcReason : "?",
+                (unsigned long)u32Rx, (unsigned long)u32Missed);
+    else
+        DBG_LOG("RadioTest: EXITED (%s) - tx=%lu\r\n",
+                (pcReason != NULL) ? pcReason : "?",
+                (unsigned long)u32Tx);
 }
 
-/* Free everything the mode allocated. The task has already exited by the time
- * this runs from RADIOTESTMODE_vExit; from RADIOTESTMODE_bEnter's failure path
- * it either never started or is terminated here. Safe with any subset built,
- * which is what makes it usable as that failure path. */
+/* Free everything the mode allocated. The listener's task has already exited
+ * by the time this runs from RADIOTESTMODE_vExit; from RADIOTESTMODE_bEnter's
+ * failure path it either never started or is terminated here. Safe with any
+ * subset built, which is what makes it usable as that failure path. */
 static void RTM_vTeardown(void)
 {
+    RtmCtx_t *pDoomed;
+
     if (xRtmTask != NULL)
     {
         if (bTaskRunning)
@@ -391,18 +569,74 @@ static void RTM_vTeardown(void)
         xRtmTask = NULL;
     }
 
-    if (pCtx != NULL)
-    {
-        if (pCtx->xRxQueue != NULL)
-            osMessageQueueDelete(pCtx->xRxQueue);
+    /* Unpublish before freeing, in one atomic step. RADIOTESTMODE_u32ServiceBeacon
+     * runs on the mesh TX worker and reads pCtx under the same critical
+     * section, so it either gets a context that is still whole or sees NULL -
+     * there is no window in which it holds a pointer we are freeing. */
+    taskENTER_CRITICAL();
+    pDoomed = pCtx;
+    pCtx    = NULL;
+    taskEXIT_CRITICAL();
 
-        vPortFree(pCtx);
-        pCtx = NULL;
+    if (pDoomed != NULL)
+    {
+        if (pDoomed->xRxQueue != NULL)
+            osMessageQueueDelete(pDoomed->xRxQueue);
+
+        vPortFree(pDoomed);
     }
 }
 
 /* --------------------------------------------------------------------------
+ * Heap diagnostics
+ * -------------------------------------------------------------------------- */
+
+/* Largest single block pvPortMalloc would hand out right now.
+ *
+ * xPortGetFreeHeapSize() is the SUM of every free block, which is why a
+ * failure can read "2640 B free, wanted 2048" and be entirely genuine: heap_4
+ * has to satisfy a request out of ONE block, and this build fragments the
+ * heap by design - the init task frees its 1 KB stack when it exits, leaving
+ * a hole in the middle of everything allocated during boot. Reporting the sum
+ * alone is what sent three commits chasing the wrong number.
+ *
+ * Probed rather than read: this FreeRTOS predates vPortGetHeapStats and
+ * heap_4.c is third-party, so a binary search on pvPortMalloc is the only way
+ * to see the split from up here. ~11 allocations to 16-byte resolution, all
+ * of them on a path that has already failed and is about to return. */
+static uint32_t RTM_u32BiggestFreeBlock(void)
+{
+    uint32_t u32Lo = 0U;
+    uint32_t u32Hi = (uint32_t)xPortGetFreeHeapSize();
+
+    while ((u32Hi - u32Lo) > 16U)
+    {
+        uint32_t  u32Mid = u32Lo + ((u32Hi - u32Lo) / 2U);
+        void     *pProbe = pvPortMalloc(u32Mid);
+
+        if (pProbe != NULL)
+        {
+            vPortFree(pProbe);
+            u32Lo = u32Mid;
+        }
+        else
+        {
+            u32Hi = u32Mid;
+        }
+    }
+
+    return u32Lo;
+}
+
+/* --------------------------------------------------------------------------
  * RADIOTESTMODE_vOnBeacon - parser-task context, keep it cheap
+ *
+ * "Cheap" is also what makes the pCtx reads below safe. Nothing in here
+ * blocks or yields, so this function runs to completion against every task
+ * that can call RADIOTESTMODE_vExit and free pCtx underneath it - FrKernel
+ * and Movement are both osPriorityLow, the parser this runs on is Normal.
+ * Anything added here that can block breaks that, and would need the same
+ * critical section RADIOTESTMODE_u32ServiceBeacon uses.
  * -------------------------------------------------------------------------- */
 void RADIOTESTMODE_vOnBeacon(const uint8_t *pBuf, uint8_t u8Len,
                              int16_t i16Rssi, int8_t i8Snr, int16_t i16NoiseFloor)
@@ -443,45 +677,30 @@ void RADIOTESTMODE_vOnBeacon(const uint8_t *pBuf, uint8_t u8Len,
 }
 
 /* --------------------------------------------------------------------------
- * RTM_vTask
+ * RTM_vTask - listener only
  * -------------------------------------------------------------------------- */
 static void RTM_vTask(void *arg)
 {
     (void)arg;
 
-    /* Beacon role has no timer object (see the note on RtmCtx_t) - it just
-     * times its own wait out every RTM_BEACON_MS and sends from there.
-     * Listener role reacts to RTM_FLAG_RX; its timeout is only a periodic
-     * liveness check, nothing is timed off it. */
-    const uint32_t u32WaitMs = bIsListener ? 1000U : RTM_BEACON_MS;
-
     for (;;)
     {
+        RtmBeacon_t tB;
+
+        /* The 1 s timeout is only a periodic liveness check - nothing is timed
+         * off it. Real work arrives as RTM_FLAG_RX from the parser task. */
         uint32_t flags = osThreadFlagsWait(RTM_FLAG_RX | RTM_FLAG_STOP,
-                                           osFlagsWaitAny, u32WaitMs);
+                                           osFlagsWaitAny, 1000U);
         if (flags & osFlagsError)
             flags = 0U;
 
         if (!bActive || (flags & RTM_FLAG_STOP) || pCtx == NULL)
             break;
 
-        if (!bIsListener)
+        while (pCtx->xRxQueue != NULL &&
+               osMessageQueueGet(pCtx->xRxQueue, &tB, NULL, 0U) == osOK)
         {
-            /* Nothing else can set a flag for this role (RADIOTESTMODE_vOnBeacon
-             * only signals the listener), so reaching here with STOP already
-             * ruled out means the wait timed out - RTM_BEACON_MS since the
-             * last beacon. */
-            RTM_vSendBeacon();
-            continue;
-        }
-
-        {
-            RtmBeacon_t tB;
-            while (pCtx->xRxQueue != NULL &&
-                   osMessageQueueGet(pCtx->xRxQueue, &tB, NULL, 0U) == osOK)
-            {
-                RTM_vHandleBeacon(&tB);
-            }
+            RTM_vHandleBeacon(&tB);
         }
     }
 
@@ -494,9 +713,10 @@ static void RTM_vTask(void *arg)
      *
      * Done here rather than in RADIOTESTMODE_vExit so it runs on this task's
      * stack and cannot race the loop above. */
-    if (bIsListener && pCtx != NULL)
+    if (pCtx != NULL)
     {
         RtmBeacon_t tB;
+
         while (pCtx->xRxQueue != NULL &&
                osMessageQueueGet(pCtx->xRxQueue, &tB, NULL, 0U) == osOK)
         {
@@ -513,42 +733,6 @@ static void RTM_vTask(void *arg)
     /* Last act: tell RADIOTESTMODE_vExit it is safe to free the context.
      * Returning from a CMSIS-RTOS2 thread function exits the thread. */
     bTaskRunning = false;
-}
-
-/* --------------------------------------------------------------------------
- * Secondary: one beacon
- * -------------------------------------------------------------------------- */
-static void RTM_vSendBeacon(void)
-{
-    LoraRadio_Packet_t pkt;
-    int                n;
-
-    if (pCtx == NULL)
-        return;
-
-    memset(&pkt, 0, sizeof(pkt));
-    pkt.buffer[0] = (uint8_t)MeshPktType_Reserved;
-
-    n = snprintf((char *)&pkt.buffer[1],
-                 (size_t)(LORA_MAX_PACKET_SIZE - 2),
-                 RTM_TAG "%04lX %lu",
-                 (unsigned long)LORARADIO_u32GetUniqueId(),
-                 (unsigned long)pCtx->u32TxSeq);
-
-    if (n > 0)
-    {
-        pkt.length = (uint8_t)(n + 1);
-
-        if (LORARADIO_bTxPacket(&pkt))
-            DBG_LOG("RadioTest: TX seq=%lu\r\n", (unsigned long)pCtx->u32TxSeq);
-        else
-            DBG_LOG("RadioTest: TX drop seq=%lu (queue full)\r\n",
-                    (unsigned long)pCtx->u32TxSeq);
-    }
-
-    /* Bumped even on a drop: to the listener a dropped beacon is identical to
-     * one that never made it across, and the sequence gap should say so. */
-    pCtx->u32TxSeq++;
 }
 
 /* --------------------------------------------------------------------------

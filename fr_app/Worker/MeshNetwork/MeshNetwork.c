@@ -1448,12 +1448,25 @@ static void MESHNETWORK_vTxTask(void *pvParameters)
 
     for (;;)
     {
+        /* R&D radio range test, beaconing secondary only: send this node's
+         * test beacon if one is due, and take its answer as how long we may
+         * block. Returns osWaitForever - one volatile read - in every other
+         * case, which is every case in normal operation.
+         *
+         * The test's beacon rides this task rather than owning one because on
+         * a secondary the FreeRTOS heap has no 2 KB block left to give it, and
+         * this is the right task to borrow: MESHNETWORK_bSendPacket returns
+         * false for the whole duration of a test, so nothing else can reach
+         * here while one runs, and the beacon it builds is no deeper on this
+         * stack than MESHNETWORK_vBuildAndQueueBeacon below already is. */
+        uint32_t u32Wait = RADIOTESTMODE_u32ServiceBeacon();
+
         /* Block until something needs doing: a periodic timer asked us to build
          * a beacon/ack, or a packet was queued for transmission. Blocking on
          * flags (not a busy poll) keeps the device asleep between events. */
         uint32_t u32Flags = osThreadFlagsWait(MESH_TX_FLAG_ANY,
-                                              osFlagsWaitAny, osWaitForever);
-        if (u32Flags & osFlagsError) continue;
+                                              osFlagsWaitAny, u32Wait);
+        if (u32Flags & osFlagsError) continue;   /* also the beacon timeout */
 
         /* Heavy packet construction runs here, on this task's full-size stack —
          * never on the tiny Tmr Svc stack the timer callbacks run in. */
@@ -1800,6 +1813,25 @@ void MESHNETWORK_vResetNodeRole(void)
         osMutexRelease(xRoleMutex);
     }
     osTimerStop(xBeaconTimer);   /* outside the lock */
+}
+
+/* Radio-test support. The worker exists in every build that calls
+ * MESHNETWORK_vInit, which is every production build; an ENABLE_RADIO_TEST
+ * build skips MeshNetwork entirely, and the runtime test checks this before
+ * entering rather than beaconing into a task that is not there. */
+bool MESHNETWORK_bTxWorkerReady(void)
+{
+    return (xMeshTxTaskHandle != NULL);
+}
+
+/* Nudge the TX worker so it goes round its loop once and re-evaluates how long
+ * it should block. Used on radio-test entry: by then every path that would
+ * normally wake this task is gated off, so without a poke it would sit on
+ * osWaitForever and the test's beacon deadline would never be picked up. */
+void MESHNETWORK_vWakeTxWorker(void)
+{
+    if (xMeshTxTaskHandle != NULL)
+        osThreadFlagsSet(xMeshTxTaskHandle, MESH_TX_FLAG_QUEUE);
 }
 
 /* R6: drop any TX still queued (e.g. a late-jittered forward from the previous

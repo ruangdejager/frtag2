@@ -72,6 +72,25 @@ uint32_t LORARADIO_u32GetUniqueId(void);
  * on, so production timing and SPI traffic are untouched until they do. */
 void     LORARADIO_vSetNoiseFloorSampling(bool bEnable);
 
+/* Packets currently sitting in the TX queue, waiting for the radio task to
+ * even start on them. Read-only, non-blocking.
+ *
+ * NOT sufficient on its own to answer "is a previous TX still unresolved":
+ * the radio task dequeues a packet BEFORE it carrier-senses and transmits it,
+ * so this reads zero for the entire multi-second window a packet can spend in
+ * LORARADIO_bCarrierSenseAndWait. Pair it with LORARADIO_bTxInProgress() for
+ * that; see the caller in RadioTestMode.c for why it matters there —
+ * LORA_TX_CARRIER_WAIT_MS happens to equal the radio-test beacon period, so a
+ * naive "every 5 s" scheduler can otherwise queue a second beacon before the
+ * radio task has finished trying (and possibly failing) to send the first. */
+uint16_t LORARADIO_u16GetTxQueueDepth(void);
+
+/* True from the moment the radio task pulls a packet off the TX queue until
+ * it is done with it — sent, or dropped after carrier-sense failed. This is
+ * the state LORARADIO_u16GetTxQueueDepth() cannot see; the two together are
+ * "is anything of mine still outstanding on this radio". */
+bool     LORARADIO_bTxInProgress(void);
+
 void LORARADIO_vEventRxDone(void);
 void LORARADIO_vEventTxDone(void);
 void LORARADIO_vEventCrcError(void);
