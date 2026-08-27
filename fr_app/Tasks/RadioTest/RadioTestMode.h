@@ -50,6 +50,14 @@ bool RADIOTESTMODE_bActive(void);
  * secondary. Only meaningful while RADIOTESTMODE_bActive(). */
 bool RADIOTESTMODE_bIsListener(void);
 
+/* Why the most recent RADIOTESTMODE_bEnter() call failed, or "" if the last
+ * call succeeded (or none has been made). A command that arrives over LoRa
+ * only ever gets its ack back to the caller — the reason otherwise lands
+ * solely on the failing unit's own debug UART, which a remote operator
+ * cannot read. FrKernel puts this string in the "could not enter" ack so a
+ * field failure is diagnosable without physical access to the unit. */
+const char *RADIOTESTMODE_pcLastEnterError(void);
+
 /* --------------------------------------------------------------------------
  * Entry / exit
  * -------------------------------------------------------------------------- */

@@ -50,7 +50,27 @@
 /* --------------------------------------------------------------------------
  * Tunables
  * -------------------------------------------------------------------------- */
-#define RTM_STACK_SIZE      (configMINIMAL_STACK_SIZE * 6)
+
+/* Unlike the compile-time ENABLE_RADIO_TEST build, this task has to fit on the
+ * heap ALONGSIDE everything the mesh build already created — LoRa radio task,
+ * MeshNetwork's two tasks, DeviceDiscovery's two tasks, FrKernel, GPS, and on
+ * a secondary Movement/ACC/SolarPower/Battery too. Those already commit on
+ * the order of 30+ KB of the 46 KB FreeRTOS heap between their stacks and
+ * queues, so headroom here is genuinely tight and the two roles are sized
+ * separately rather than sharing one figure:
+ *
+ *   - The secondary's call depth is shallow — build a packet, LORARADIO_bTxPacket,
+ *     DBG_LOG — so *4 is ample with margin.
+ *   - The primary's is not: RTM_vHandleBeacon runs into
+ *     FARMRANGER_bLogRadioTestData -> FARMRANGER_bRtLogAttempt, which has its
+ *     own row/cmd/response buffers on the stack before it even reaches
+ *     FARMRANGER_bATSend and the UART layer beneath it. Keep the *6 the
+ *     compile-time RadioTest.c task already uses for the same reason FrKernel
+ *     does (see FrKernel.c's own *6 comment) — trimming this one and hitting
+ *     a real overrun would be a much worse failure than the extra 1 KB. */
+#define RTM_STACK_SIZE_BEACON   (configMINIMAL_STACK_SIZE * 4)
+#define RTM_STACK_SIZE_LISTEN   (configMINIMAL_STACK_SIZE * 6)
+
 #define RTM_BEACON_MS       5000U    /* 0.2 Hz, per the test spec */
 
 /* Beacon frame: [0] = type, [1..] = ASCII "RT <id:hex> <seq:dec>".
@@ -137,6 +157,14 @@ static volatile bool  bTaskRunning = false;
 static osThreadId_t   xRtmTask     = NULL;
 static RtmCtx_t      *pCtx         = NULL;
 
+/* Why the last RADIOTESTMODE_bEnter() call failed, if it did. A LoRa-addressed
+ * command's ack is the ONLY thing the caller ever sees — the DBG_LOG lines
+ * below land on the failing unit's own debug UART, which is exactly what a
+ * remote operator cannot read. Surfaced via RADIOTESTMODE_pcLastEnterError()
+ * so FrKernel can put the real reason in the ack instead of a bare
+ * "could not enter" that gives a field failure nothing to go on. */
+static const char *pcLastEnterError = "";
+
 /* --------------------------------------------------------------------------
  * Forward declarations
  * -------------------------------------------------------------------------- */
@@ -155,20 +183,29 @@ static void RTM_vTeardown(void);
 bool RADIOTESTMODE_bActive(void)     { return bActive; }
 bool RADIOTESTMODE_bIsListener(void) { return bIsListener; }
 
+const char *RADIOTESTMODE_pcLastEnterError(void) { return pcLastEnterError; }
+
 /* --------------------------------------------------------------------------
  * RADIOTESTMODE_bEnter
  * -------------------------------------------------------------------------- */
 bool RADIOTESTMODE_bEnter(void)
 {
+    pcLastEnterError = "";
+
     if (bActive || pCtx != NULL)
+    {
+        pcLastEnterError = "already active";
         return false;
+    }
 
     bIsListener = (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY);
 
     pCtx = pvPortMalloc(sizeof(RtmCtx_t));
     if (pCtx == NULL)
     {
-        DBG_LOG("RadioTest: enter failed - out of heap\r\n");
+        pcLastEnterError = "out of heap (ctx)";
+        DBG_LOG("RadioTest: enter failed - out of heap for ctx, %u B free\r\n",
+                (unsigned)xPortGetFreeHeapSize());
         return false;
     }
     /* memset gives every counter its zero and, importantly, leaves bFr9Up
@@ -181,7 +218,9 @@ bool RADIOTESTMODE_bEnter(void)
         pCtx->xRxQueue = osMessageQueueNew(4U, sizeof(RtmBeacon_t), NULL);
         if (pCtx->xRxQueue == NULL)
         {
-            DBG_LOG("RadioTest: enter failed - no RX queue\r\n");
+            pcLastEnterError = "out of heap (rx queue)";
+            DBG_LOG("RadioTest: enter failed - no RX queue, %u B free\r\n",
+                    (unsigned)xPortGetFreeHeapSize());
             RTM_vTeardown();
             return false;
         }
@@ -192,15 +231,20 @@ bool RADIOTESTMODE_bEnter(void)
                                         osTimerPeriodic, NULL, NULL);
         if (pCtx->xBeaconTimer == NULL)
         {
-            DBG_LOG("RadioTest: enter failed - no beacon timer\r\n");
+            pcLastEnterError = "out of heap (timer)";
+            DBG_LOG("RadioTest: enter failed - no beacon timer, %u B free\r\n",
+                    (unsigned)xPortGetFreeHeapSize());
             RTM_vTeardown();
             return false;
         }
     }
 
-    static const osThreadAttr_t attr = {
+    /* Two attrs, not one: see the stack-size comment above for why the roles
+     * cannot share a figure on a heap this tight. */
+    const osThreadAttr_t attr = {
         .name       = "RadioTestMode",
-        .stack_size = RTM_STACK_SIZE * sizeof(StackType_t),
+        .stack_size = (bIsListener ? RTM_STACK_SIZE_LISTEN : RTM_STACK_SIZE_BEACON)
+                      * sizeof(StackType_t),
         .priority   = osPriorityNormal,
     };
 
@@ -212,7 +256,9 @@ bool RADIOTESTMODE_bEnter(void)
     xRtmTask = osThreadNew(RTM_vTask, NULL, &attr);
     if (xRtmTask == NULL)
     {
-        DBG_LOG("RadioTest: enter failed - no task\r\n");
+        pcLastEnterError = "out of heap (task)";
+        DBG_LOG("RadioTest: enter failed - no task, %u B free (wanted %u)\r\n",
+                (unsigned)xPortGetFreeHeapSize(), (unsigned)attr.stack_size);
         bTaskRunning = false;
         RTM_vTeardown();
         return false;

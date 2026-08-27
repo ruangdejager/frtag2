@@ -609,7 +609,14 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
         }
         else
         {
-            FRKERNEL_vAck(eXport, bBulk, "RadioTest: could not enter\r\n");
+            /* Include the reason: this ack is very likely the ONLY thing a
+             * remote operator ever sees of this failure (the detail behind it
+             * goes to DBG_LOG on the unit itself, over UART nobody out here
+             * can read). A bare "could not enter" gives a field failure
+             * nothing to act on. */
+            snprintf(resp, sizeof(resp), "RadioTest: could not enter (%s)\r\n",
+                    RADIOTESTMODE_pcLastEnterError());
+            FRKERNEL_vAck(eXport, bBulk, resp);
         }
 
         /* Terminal, same reasoning as prodsleep: drain the reply, then drop
