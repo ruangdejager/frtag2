@@ -916,22 +916,22 @@ bool FARMRANGER_bLogRadioTestData(const FarmrangerRtBeacon_t *pBeacons,
         pos += (size_t)n;
     }
 
-    /* Pass 2: upload, same retry policy as the discovery upload. */
-    for (uint8_t u8Attempt = 1U; u8Attempt <= FR_LOG_ATTEMPTS; u8Attempt++)
-    {
-        if (FARMRANGER_bRtLogAttempt(pBeacons, u16Count, pos))
-        {
-            DBG_LOG("RtLog: %u beacon(s) logged to fr9 (attempt %u)\r\n",
-                    u16Count, u8Attempt);
-            return true;
-        }
-
-        if (u8Attempt < FR_LOG_ATTEMPTS)
-            osDelay(FR_LOG_RETRY_DELAY_MS);
-    }
-
-    DBG_LOG("RtLog: all %u attempts failed\r\n", FR_LOG_ATTEMPTS);
-    return false;
+    /* One attempt only, unlike the discovery upload's three.
+     *
+     * This is called once per beacon, in line with a 5 s beacon cadence. A
+     * failed attempt already costs FR_LOG_VERDICT_MS (6.5 s) — that wait is
+     * not negotiable, because it has to outlast the fr9's own 5 s silence
+     * timeout before the next AT+RTLOG can safely go out, or the fr9 would
+     * still be in its payload state and would swallow the command text as
+     * payload. Retrying inside here would stack another 6.5 s on top and put
+     * us two or three beacons behind the live stream, to recover one row.
+     *
+     * Falling behind is the worse failure: the terminal log still holds every
+     * beacon, and a gap in the fr9 copy is visible in the Seq column anyway.
+     * The caller recycles the fr9 session and retries once — see the radio
+     * test's per-beacon logging — which covers the failure that is actually
+     * worth recovering, a session that has timed out. */
+    return FARMRANGER_bRtLogAttempt(pBeacons, u16Count, pos);
 }
 
 /* --------------------------------------------------------------------------

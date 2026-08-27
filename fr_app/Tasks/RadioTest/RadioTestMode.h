@@ -19,10 +19,11 @@
  *                way out, matching how solarsleep behaves.
  *
  *   PRIMARY   -> listens. Logs RSSI/SNR/noise-floor/link-margin and missed-
- *                beacon count for every beacon heard, and forwards the same
- *                data to the fr9 logger board over the Farmranger UART so the
- *                run is captured on fr9 flash. Keeps the FrKernel door open so
- *                "tag <ID> radio stop" can end the mode over the air.
+ *                beacon count for every beacon heard, and pushes each one to
+ *                the fr9 logger board over the Farmranger UART as it is
+ *                measured, so the run is on fr9 flash live rather than at the
+ *                end. Keeps the FrKernel door open so "tag <ID> radio stop"
+ *                can end the mode over the air.
  *
  * The mode is RAM-only and deliberately not persisted: a reboot returns the
  * unit to normal operation. A mode that survived a power cycle would be an

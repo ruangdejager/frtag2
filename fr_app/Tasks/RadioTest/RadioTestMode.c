@@ -23,6 +23,11 @@
  *    there; the logging and the Farmranger round-trip happen on our task,
  *    because an fr9 handshake can block for seconds and stalling the parser
  *    would back up the LoRa RX queue and drop packets.
+ *
+ *  - Every beacon goes to the fr9 immediately, nothing is buffered, so the
+ *    flash log tracks the walk live and a unit that loses power mid-test has
+ *    already banked what it heard. The Farmranger session is held open across
+ *    beacons to make that cheap - see RTM_FR9_SESSION_MS.
  */
 
 #include "RadioTestMode.h"
@@ -58,19 +63,29 @@
 #define RTM_TAG_LEN         3U
 #define RTM_LINE_MAX        48U
 
-/* fr9 upload batching. Beacons are buffered and flushed together rather than
- * one AT+RTLOG per beacon: each upload costs a full Farmranger session (GPIO
- * attention, ~1 s RDY handshake, command, stream, verdict, teardown), which
- * does not comfortably fit a 5 s cadence and would leave the link busy more
- * often than idle. Flushing on a count or an age bound also keeps every
- * session far shorter than the fr9's 600 s session cap. */
-#define RTM_FR9_BATCH_MAX   8U
-#define RTM_FR9_FLUSH_MS    60000U
+/* fr9 logging. Every beacon is pushed to the fr9 the moment it is measured -
+ * nothing is buffered - so the flash log tracks the walk live and a unit that
+ * loses power mid-test has already banked everything it heard.
+ *
+ * To make that affordable the Farmranger session is opened once and HELD for
+ * the duration, rather than a fresh session per beacon. A session costs a GPIO
+ * attention edge and the fr9's fixed ~1 s wait before it answers RDY, and -
+ * more to the point - the fr9 writes a session-start line to the very syslog
+ * we are trying to read. At one session per 5 s beacon that is ~720 lines an
+ * hour of noise around the data. Held open, each beacon costs only the
+ * AT+RTLOG exchange, which is tens of milliseconds.
+ *
+ * The fr9 force-ends a session at FRTAG_SESSION_MAX_S (600 s) even with the
+ * attention line still asserted, and needs a fresh rising edge to start
+ * another - so recycle ours before it gets there rather than discovering it
+ * mid-beacon. */
+#define RTM_FR9_SESSION_MS  540000U   /* 9 min, inside the fr9's 600 s cap */
 
 /* How long RADIOTESTMODE_vExit waits for the task to wind itself down. Sized
- * for the worst case: a final fr9 flush is up to FR_LOG_ATTEMPTS AT+RTLOG
- * attempts, each with a handshake, a paced stream and a verdict wait. */
-#define RTM_STOP_WAIT_MS    15000U
+ * for the worst case on the way out: the task may be mid-upload for a beacon
+ * it just measured, and that upload can cost two AT+RTLOG attempts (each with
+ * a handshake and a ~6.5 s verdict wait) plus two fr9 session opens. */
+#define RTM_STOP_WAIT_MS    20000U
 
 /* Thread flags */
 #define RTM_FLAG_BEACON     (1UL << 0)   /* beacon timer fired           */
@@ -103,9 +118,10 @@ typedef struct {
     uint32_t u32LastSeq;
     bool     bHaveLast;
 
-    uint16_t u16BatchCount;           /* fr9 upload batch                  */
-    uint32_t u32BatchStart;
-    FarmrangerRtBeacon_t tBatch[RTM_FR9_BATCH_MAX];
+    bool     bFr9Up;                  /* Farmranger session currently open  */
+    uint32_t u32Fr9SessionStart;      /* tick it was opened, for the recycle */
+    uint32_t u32Fr9Logged;            /* beacons the fr9 acknowledged        */
+    uint32_t u32Fr9Failed;            /* beacons it did not                  */
 } RtmCtx_t;
 
 /* The gates in MeshNetwork's parser and TX paths read bActive on every packet,
@@ -128,7 +144,9 @@ static void RTM_vTask(void *arg);
 static void RTM_vBeaconTimerCallback(void *arg);
 static void RTM_vSendBeacon(void);
 static void RTM_vHandleBeacon(const RtmBeacon_t *pB);
-static void RTM_vFlushToFr9(void);
+static void RTM_vLogToFr9(const FarmrangerRtBeacon_t *pRow);
+static bool RTM_bFr9SessionOpen(void);
+static void RTM_vFr9SessionClose(void);
 static void RTM_vTeardown(void);
 
 /* --------------------------------------------------------------------------
@@ -153,8 +171,10 @@ bool RADIOTESTMODE_bEnter(void)
         DBG_LOG("RadioTest: enter failed - out of heap\r\n");
         return false;
     }
+    /* memset gives every counter its zero and, importantly, leaves bFr9Up
+     * false: the fr9 session is opened lazily by the first beacon, so a
+     * listener that never hears one never raises the attention line. */
     memset(pCtx, 0, sizeof(RtmCtx_t));
-    pCtx->u32BatchStart = osKernelGetTickCount();
 
     if (bIsListener)
     {
@@ -410,21 +430,15 @@ static void RTM_vTask(void *arg)
             {
                 RTM_vHandleBeacon(&tB);
             }
-
-            /* Age-based flush, so a slow trickle of beacons still reaches the
-             * fr9 without waiting for a full batch. */
-            if (pCtx->u16BatchCount > 0U &&
-                (osKernelGetTickCount() - pCtx->u32BatchStart) >= RTM_FR9_FLUSH_MS)
-            {
-                RTM_vFlushToFr9();
-            }
         }
     }
 
-    /* Winding down. Drain what is still queued and push the tail of the run to
-     * the fr9 before going: the last beacons of a range walk - the ones from
-     * the far end - are the interesting ones, and dropping them would lose
-     * exactly the data the test was run for.
+    /* Winding down. Anything already measured is already on the fr9 - that is
+     * the point of logging per beacon - but the queue may still hold beacons
+     * the parser handed us in the last moments, and the last beacons of a
+     * range walk are the ones from the far end. Log those, then drop the
+     * attention line so the fr9 can end its session cleanly instead of sitting
+     * out its 600 s cap.
      *
      * Done here rather than in RADIOTESTMODE_vExit so it runs on this task's
      * stack and cannot race the loop above. */
@@ -437,8 +451,11 @@ static void RTM_vTask(void *arg)
             RTM_vHandleBeacon(&tB);
         }
 
-        if (pCtx->u16BatchCount > 0U)
-            RTM_vFlushToFr9();
+        RTM_vFr9SessionClose();
+
+        DBG_LOG("RadioTest: fr9 logged=%lu failed=%lu\r\n",
+                (unsigned long)pCtx->u32Fr9Logged,
+                (unsigned long)pCtx->u32Fr9Failed);
     }
 
     /* Last act: tell RADIOTESTMODE_vExit it is safe to free the context.
@@ -529,46 +546,109 @@ static void RTM_vHandleBeacon(const RtmBeacon_t *pB)
                 (unsigned long)pCtx->u32RxCount, (unsigned long)pCtx->u32Missed);
     }
 
-    if (pCtx->u16BatchCount < RTM_FR9_BATCH_MAX)
+    /* Straight to the fr9, now, while the beacon is in hand. This blocks for
+     * the AT+RTLOG exchange - tens of milliseconds normally - which is why it
+     * runs on this task and not on the parser that handed us the beacon.
+     * Anything that arrives meanwhile waits in the RX queue. */
     {
-        FarmrangerRtBeacon_t *pRow = &pCtx->tBatch[pCtx->u16BatchCount++];
-        pRow->u32DeviceId   = pB->u32Id;
-        pRow->u32Seq        = pB->u32Seq;
-        pRow->u32Missed     = pCtx->u32Missed;
-        pRow->i16Rssi       = pB->i16Rssi;
-        pRow->i16NoiseFloor = pB->i16NoiseFloor;
-        pRow->i8Snr         = pB->i8Snr;
-    }
+        FarmrangerRtBeacon_t tRow;
+        tRow.u32DeviceId   = pB->u32Id;
+        tRow.u32Seq        = pB->u32Seq;
+        tRow.u32Missed     = pCtx->u32Missed;
+        tRow.i16Rssi       = pB->i16Rssi;
+        tRow.i16NoiseFloor = pB->i16NoiseFloor;
+        tRow.i8Snr         = pB->i8Snr;
 
-    if (pCtx->u16BatchCount >= RTM_FR9_BATCH_MAX)
-        RTM_vFlushToFr9();
+        RTM_vLogToFr9(&tRow);
+    }
 }
 
 /* --------------------------------------------------------------------------
- * Primary: push the batch to the fr9
+ * Primary: fr9 session handling
  * -------------------------------------------------------------------------- */
-static void RTM_vFlushToFr9(void)
+
+/* Raise the attention line and wait for the fr9's RDY. */
+static bool RTM_bFr9SessionOpen(void)
 {
-    if (pCtx == NULL || pCtx->u16BatchCount == 0U)
+    if (pCtx == NULL)
+        return false;
+
+    if (pCtx->bFr9Up)
+        return true;
+
+    if (!FARMRANGER_bDeviceOn())
+    {
+        DBG_LOG("RadioTest: fr9 did not answer RDY\r\n");
+        return false;
+    }
+
+    pCtx->bFr9Up             = true;
+    pCtx->u32Fr9SessionStart = osKernelGetTickCount();
+    return true;
+}
+
+static void RTM_vFr9SessionClose(void)
+{
+    if (pCtx == NULL || !pCtx->bFr9Up)
         return;
 
-    /* A full session per flush, same shape as DEVICE_DISCOVERY_bBasicLogAndClear:
-     * raise the attention line, wait for RDY, upload, drop the line. Short
-     * sessions keep us well inside the fr9's 600 s session cap over a long
-     * range walk. */
-    if (FARMRANGER_bDeviceOn())
+    FARMRANGER_vDeviceOff();
+    pCtx->bFr9Up = false;
+
+    /* Hold the attention line low long enough for the fr9 to actually see the
+     * edge. It debounces GPIO1 for 20 ms and starts a session on the RISING
+     * edge, so a close immediately followed by an open - which is exactly what
+     * the recycle path does - would otherwise look like no change at all and
+     * the fr9 would stay in the session it had already given up on. */
+    osDelay(50);
+}
+
+/* --------------------------------------------------------------------------
+ * Primary: push one beacon to the fr9, as it is measured
+ * -------------------------------------------------------------------------- */
+static void RTM_vLogToFr9(const FarmrangerRtBeacon_t *pRow)
+{
+    if (pCtx == NULL || pRow == NULL)
+        return;
+
+    /* Recycle before the fr9's own 600 s cap force-ends the session under us.
+     * Done here, between beacons, so the drop/raise never lands in the middle
+     * of an AT+RTLOG exchange. */
+    if (pCtx->bFr9Up &&
+        (osKernelGetTickCount() - pCtx->u32Fr9SessionStart) >= RTM_FR9_SESSION_MS)
     {
-        (void)FARMRANGER_bLogRadioTestData(pCtx->tBatch, pCtx->u16BatchCount);
-        FARMRANGER_vDeviceOff();
-    }
-    else
-    {
-        DBG_LOG("RadioTest: fr9 did not answer RDY - batch of %u dropped\r\n",
-                pCtx->u16BatchCount);
+        RTM_vFr9SessionClose();
     }
 
-    /* Cleared either way. A retry queue would grow without bound on a bench rig
-     * with no fr9 attached, and the terminal log already has every line. */
-    pCtx->u16BatchCount = 0U;
-    pCtx->u32BatchStart = osKernelGetTickCount();
+    if (!RTM_bFr9SessionOpen())
+    {
+        pCtx->u32Fr9Failed++;
+        return;
+    }
+
+    if (FARMRANGER_bLogRadioTestData(pRow, 1U))
+    {
+        pCtx->u32Fr9Logged++;
+        return;
+    }
+
+    /* One retry, and only after a full session recycle. A failed upload nearly
+     * always means the session is gone (the fr9 timed it out, or the board was
+     * reset or unplugged mid-walk); retrying into the same dead session would
+     * just spend another verdict timeout to learn the same thing. Reopening
+     * gives the fr9 the fresh rising edge it needs to start a new one.
+     *
+     * If that also fails, count it and move on rather than fight for one row:
+     * the next beacon is 5 s away, the terminal log already has this one, and
+     * the gap is visible in the Seq column of the fr9 log. */
+    RTM_vFr9SessionClose();
+
+    if (RTM_bFr9SessionOpen() && FARMRANGER_bLogRadioTestData(pRow, 1U))
+    {
+        pCtx->u32Fr9Logged++;
+        DBG_LOG("RadioTest: fr9 session recycled mid-test\r\n");
+        return;
+    }
+
+    pCtx->u32Fr9Failed++;
 }
