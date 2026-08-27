@@ -14,11 +14,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Included here, not left to callers: ENABLE_RADIO_TEST adds a field to
- * LoraRadio_Packet_t below, and that struct is the RX/TX queue element. Every
- * translation unit must agree on its size, so the flag has to be visible
- * wherever this header is. */
-#include "build_config.h"
 #include "LoraRadio_Config.h"
 
 /* Radio event bits — used with osThreadFlagsSet / osThreadFlagsWait */
@@ -41,21 +36,18 @@ typedef struct {
      * the queue so long that sending them is pointless — see
      * LORA_TX_MAX_AGE_MS. Unused on the RX path. */
     uint32_t u32QueuedTick;
-#ifdef ENABLE_RADIO_TEST
     /* Channel noise floor in dBm, sampled by the radio task on the last idle
      * pass before this packet arrived — i.e. with the channel quiet, which is
      * what makes it a noise floor rather than just another RSSI. Compare
-     * against rssi for the link margin. RX path only; LORA_NOISE_FLOOR_INVALID
-     * until the first sample lands. Bench-only, so production builds keep
-     * their queue-element size unchanged. */
+     * against rssi for the link margin. RX path only, and only populated while
+     * sampling is switched on (see LORARADIO_vSetNoiseFloorSampling);
+     * LORA_NOISE_FLOOR_INVALID otherwise. */
     int16_t  i16NoiseFloor;
-#endif
 } LoraRadio_Packet_t;
 
-#ifdef ENABLE_RADIO_TEST
-/* No sample taken yet (the radio task has not reached an idle pass). */
+/* No sample available: sampling is off, or the radio task has not yet reached
+ * an idle pass since it was switched on. */
 #define LORA_NOISE_FLOOR_INVALID   INT16_MIN
-#endif
 
 void     LORARADIO_vInit(void);
 bool     LORARADIO_bRxPacket(LoraRadio_Packet_t *packet);
@@ -73,6 +65,31 @@ bool     LORARADIO_bTxPacketWait(LoraRadio_Packet_t *packet, uint32_t timeoutMs)
 
 void     LORARADIO_vRadioTask(void *arg);
 uint32_t LORARADIO_u32GetUniqueId(void);
+
+/* Switch channel noise-floor sampling on or off. Off by default, and left off
+ * in normal operation: when on, the radio task issues one extra SUBGRF RSSI
+ * read on each idle pass of its 50 ms loop. Only the radio-test paths turn it
+ * on, so production timing and SPI traffic are untouched until they do. */
+void     LORARADIO_vSetNoiseFloorSampling(bool bEnable);
+
+/* Packets currently sitting in the TX queue, waiting for the radio task to
+ * even start on them. Read-only, non-blocking.
+ *
+ * NOT sufficient on its own to answer "is a previous TX still unresolved":
+ * the radio task dequeues a packet BEFORE it carrier-senses and transmits it,
+ * so this reads zero for the entire multi-second window a packet can spend in
+ * LORARADIO_bCarrierSenseAndWait. Pair it with LORARADIO_bTxInProgress() for
+ * that; see the caller in RadioTestMode.c for why it matters there —
+ * LORA_TX_CARRIER_WAIT_MS happens to equal the radio-test beacon period, so a
+ * naive "every 5 s" scheduler can otherwise queue a second beacon before the
+ * radio task has finished trying (and possibly failing) to send the first. */
+uint16_t LORARADIO_u16GetTxQueueDepth(void);
+
+/* True from the moment the radio task pulls a packet off the TX queue until
+ * it is done with it — sent, or dropped after carrier-sense failed. This is
+ * the state LORARADIO_u16GetTxQueueDepth() cannot see; the two together are
+ * "is anything of mine still outstanding on this radio". */
+bool     LORARADIO_bTxInProgress(void);
 
 void LORARADIO_vEventRxDone(void);
 void LORARADIO_vEventTxDone(void);
@@ -106,5 +123,21 @@ void LORARADIO_vFlushTxQueue(void);
 
 void LORARADIO_vEnterDeepSleep(void);
 void LORARADIO_vWakeUp(void);
+
+/* Hold the radio out of deep sleep, or release that hold.
+ *
+ * The chip has several owners on different tasks (DeviceDiscovery's campaign
+ * tail, its basic-beacon path, its sleep-mode entry), and each of them calls
+ * LORARADIO_vEnterDeepSleep() when ITS work is done — which is not the same as
+ * the radio being idle. A long-running user of the radio that outlives those
+ * owners takes this for its duration; while it is held,
+ * LORARADIO_vEnterDeepSleep() does nothing.
+ *
+ * This is the RADIO's power state, and is independent of
+ * SYSTEM_vSleepLockAcquire(), which holds the MCU out of STOP2. A radio test
+ * needs both: the sleep lock keeps the core running and the debug UART alive,
+ * this keeps the transceiver able to answer a CAD. Not nested — a single
+ * boolean, because there is exactly one such user. */
+void LORARADIO_vSetKeepAwake(bool bEnable);
 
 #endif /* DEVICE_LORARADIO_LORARADIO_H_ */

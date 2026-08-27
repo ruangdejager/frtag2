@@ -88,12 +88,27 @@ static volatile uint16_t u16TxStaleDropCount = 0;
 /* Pending radio events captured during carrier-sense / back-off */
 static volatile uint32_t gRadioPendingEvents = 0;
 
-#ifdef ENABLE_RADIO_TEST
 /* Most recent channel noise-floor sample, dBm. Written only by the radio task
  * on its idle pass and stamped into each received packet — see the sampling
- * site in LORARADIO_vRadioTask for why that timing is the meaningful one. */
-static int16_t i16NoiseFloor = LORA_NOISE_FLOOR_INVALID;
-#endif
+ * site in LORARADIO_vRadioTask for why that timing is the meaningful one.
+ * Only sampled while bNoiseFloorSampling is set, which the radio-test paths
+ * turn on and normal operation leaves off. */
+static int16_t          i16NoiseFloor      = LORA_NOISE_FLOOR_INVALID;
+static volatile bool    bNoiseFloorSampling = false;
+
+/* True from the moment a packet is pulled off xLoRaTxQueue until this task is
+ * done with it (sent, or dropped after carrier-sense failed) — the window in
+ * which the queue itself reads empty even though a TX is still in flight,
+ * because osMessageQueueGet() dequeues before carrier-sense runs. Queue depth
+ * alone cannot tell a caller "wait, something is still being tried"; this can.
+ * See LORARADIO_u16GetTxQueueDepth()'s header comment for the caller that
+ * needs it. */
+static volatile bool    bTxInProgress      = false;
+
+/* While set, LORARADIO_vEnterDeepSleep() is a no-op — see the comment there.
+ * Held by the runtime radio range test for its duration, because the chip has
+ * other owners whose normal teardown would otherwise sleep it mid-test. */
+static volatile bool    bKeepAwake         = false;
 
 static uint8_t u8DevEUI[8];
 
@@ -226,7 +241,6 @@ void LORARADIO_vRadioTask(void *arg)
         /* Merge any stashed events from a carrier-sense interruption */
         events |= LORARADIO_u32ConsumePendingEvents();
 
-#ifdef ENABLE_RADIO_TEST
         /* ---------- NOISE FLOOR ----------
          * A bare 50 ms timeout with nothing queued: no IRQ fired, no TX is
          * waiting, and every path out of this loop leaves the chip in
@@ -241,19 +255,20 @@ void LORARADIO_vRadioTask(void *arg)
          * Sampling *before* the packet rather than after it is the point: the
          * reading taken while the channel was last idle is the right
          * reference for the beacon that lands next, and it costs no blocking
-         * delay waiting for the receiver to settle after an RX. */
-        if (events == 0U && osMessageQueueGetCount(xLoRaTxQueue) == 0U)
+         * delay waiting for the receiver to settle after an RX.
+         *
+         * Off unless a radio test switched it on, so normal builds issue no
+         * extra SPI traffic here. */
+        if (bNoiseFloorSampling &&
+            events == 0U && osMessageQueueGetCount(xLoRaTxQueue) == 0U)
             i16NoiseFloor = (int16_t)SUBGRF_GetRssiInst();
-#endif
 
         /* ---------- RX DONE ---------- */
         if (events & RADIO_EVT_RX_DONE)
         {
             memset(&pkt, 0, sizeof(pkt));
             LORARADIO_DRIVER_bReceivePayload(&pkt);
-#ifdef ENABLE_RADIO_TEST
             pkt.i16NoiseFloor = i16NoiseFloor;
-#endif
 
             /* Shortest valid frame is type byte + CRC byte. A 0/1-byte frame
              * (corrupt header that passed the radio CRC) would otherwise
@@ -342,6 +357,7 @@ void LORARADIO_vRadioTask(void *arg)
                 }
 
                 u8Sent++;
+                bTxInProgress = true;
 
                 uint8_t crc = LORARADIO_u8CRC8_Calculate(pkt.buffer, pkt.length);
                 pkt.buffer[pkt.length++] = crc;
@@ -354,21 +370,44 @@ void LORARADIO_vRadioTask(void *arg)
                         events |= stashed;
                         DBG_LOG("Loraradio: TX REQ interrupted by events 0x%08lX\r\n", stashed);
                         LORARADIO_DRIVER_vEnterRxMode(0);
+                        bTxInProgress = false;
                         continue;
                     }
                     DBG_LOG("Loraradio: TX REQ abort — carrier busy\r\n");
                     LORARADIO_DRIVER_vEnterRxMode(0);
+                    bTxInProgress = false;
                     continue;
                 }
 
                 LORARADIO_DRIVER_bTransmitPayload(pkt.buffer, pkt.length);
                 LORARADIO_DRIVER_vEnterRxMode(0x00);
+                bTxInProgress = false;
             }
         }
     }
 }
 
 /* -------------------------------------------------------------------------- */
+
+void LORARADIO_vSetNoiseFloorSampling(bool bEnable)
+{
+    /* Drop the stale reading when switching off, so a later run cannot report
+     * a noise floor measured minutes ago in a different place. */
+    if (!bEnable)
+        i16NoiseFloor = LORA_NOISE_FLOOR_INVALID;
+
+    bNoiseFloorSampling = bEnable;
+}
+
+uint16_t LORARADIO_u16GetTxQueueDepth(void)
+{
+    return (uint16_t)osMessageQueueGetCount(xLoRaTxQueue);
+}
+
+bool LORARADIO_bTxInProgress(void)
+{
+    return bTxInProgress;
+}
 
 uint32_t LORARADIO_u32GetUniqueId(void)
 {
@@ -541,8 +580,34 @@ bool LORARADIO_bCarrierSenseAndWait(uint32_t maxWaitMs)
     return false;
 }
 
-void LORARADIO_vEnterDeepSleep(void) { LORARADIO_DRIVER_vEnterDeepSleep(); }
+void LORARADIO_vEnterDeepSleep(void)
+{
+    /* Refuse while someone holds the radio awake. The chip is a shared
+     * resource with several owners on different tasks — DeviceDiscovery's
+     * campaign tail, its basic-beacon path and its sleep-mode entry all call
+     * this — and a caller finishing ITS work is not evidence that the radio is
+     * idle. The radio range test found this the hard way: entering it from a
+     * FrKernel session released the AppTask's "waiting for release" hold, and
+     * the campaign tail that followed deep-slept the chip out from under a
+     * test that had just started. Every CAD after that timed out at 300 ms
+     * with no IRQ, which reads on the terminal as an endlessly busy channel
+     * rather than as a sleeping radio.
+     *
+     * Gated here rather than at each call site: this is the layer that owns
+     * the chip's power state, it is one place instead of four, and a call site
+     * added later cannot silently reintroduce the same failure. */
+    if (bKeepAwake)
+        return;
+
+    LORARADIO_DRIVER_vEnterDeepSleep();
+}
+
 void LORARADIO_vWakeUp(void)         { LORARADIO_DRIVER_vWakeUp(); }
+
+void LORARADIO_vSetKeepAwake(bool bEnable)
+{
+    bKeepAwake = bEnable;
+}
 
 /* --------------------------------------------------------------------------
  * LORARADIO_vNotifyFromISR — set thread flags from ISR context

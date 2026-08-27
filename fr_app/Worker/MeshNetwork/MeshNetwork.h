@@ -252,6 +252,15 @@ bool            MESHNETWORK_bGetGpsEnabled(void);
 void MESHNETWORK_vStopBeaconingSelf(void);
 bool MESHNETWORK_bIsBeaconing(void);     /* true while this node is beaconing */
 void MESHNETWORK_vFlushTxQueue(void);    /* drop any pending TX (call on campaign wake) */
+
+/* TX-worker hooks for the runtime radio range test (RadioTestMode.c), whose
+ * beaconing secondary has no task of its own and runs on the TX worker.
+ * bTxWorkerReady lets it refuse to enter where there is no worker to run on
+ * (an ENABLE_RADIO_TEST build skips MESHNETWORK_vInit); vWakeTxWorker breaks
+ * the worker out of the indefinite wait it is in by the time the test's own
+ * gates have silenced every other path to it. */
+bool MESHNETWORK_bTxWorkerReady(void);
+void MESHNETWORK_vWakeTxWorker(void);
 bool MESHNETWORK_bGetDiscoveredNeighbors(MeshDiscoveredNeighbor_t *pBuffer,
                                          uint16_t u16MaxEntries,
                                          uint16_t *pu16ActualEntries);
