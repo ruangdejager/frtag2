@@ -88,6 +88,13 @@ static volatile uint16_t u16TxStaleDropCount = 0;
 /* Pending radio events captured during carrier-sense / back-off */
 static volatile uint32_t gRadioPendingEvents = 0;
 
+#ifdef ENABLE_RADIO_TEST
+/* Most recent channel noise-floor sample, dBm. Written only by the radio task
+ * on its idle pass and stamped into each received packet — see the sampling
+ * site in LORARADIO_vRadioTask for why that timing is the meaningful one. */
+static int16_t i16NoiseFloor = LORA_NOISE_FLOOR_INVALID;
+#endif
+
 static uint8_t u8DevEUI[8];
 
 /* -------------------------------------------------------------------------- */
@@ -219,11 +226,34 @@ void LORARADIO_vRadioTask(void *arg)
         /* Merge any stashed events from a carrier-sense interruption */
         events |= LORARADIO_u32ConsumePendingEvents();
 
+#ifdef ENABLE_RADIO_TEST
+        /* ---------- NOISE FLOOR ----------
+         * A bare 50 ms timeout with nothing queued: no IRQ fired, no TX is
+         * waiting, and every path out of this loop leaves the chip in
+         * continuous RX — so the receiver is live and the channel is quiet,
+         * which is exactly the condition an instantaneous RSSI reading needs
+         * to mean "noise floor" rather than "some other signal".
+         *
+         * Sampled here rather than from the RadioTest task because this task
+         * is the sole owner of the chip; a second task issuing SUBGRF
+         * commands would race this one on the SPI.
+         *
+         * Sampling *before* the packet rather than after it is the point: the
+         * reading taken while the channel was last idle is the right
+         * reference for the beacon that lands next, and it costs no blocking
+         * delay waiting for the receiver to settle after an RX. */
+        if (events == 0U && osMessageQueueGetCount(xLoRaTxQueue) == 0U)
+            i16NoiseFloor = (int16_t)SUBGRF_GetRssiInst();
+#endif
+
         /* ---------- RX DONE ---------- */
         if (events & RADIO_EVT_RX_DONE)
         {
             memset(&pkt, 0, sizeof(pkt));
             LORARADIO_DRIVER_bReceivePayload(&pkt);
+#ifdef ENABLE_RADIO_TEST
+            pkt.i16NoiseFloor = i16NoiseFloor;
+#endif
 
             /* Shortest valid frame is type byte + CRC byte. A 0/1-byte frame
              * (corrupt header that passed the radio CRC) would otherwise

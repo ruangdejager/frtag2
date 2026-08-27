@@ -170,12 +170,21 @@ void INIT_vInitialization(void *parameters)
 
 #ifdef ENABLE_RADIO_TEST
     /*
-     * Radio smoke-test mode: transmit "Blink!\r\n" at 0.5 Hz and confirm
-     * the TX-done IRQ fires.  MeshNetwork and DeviceDiscovery are skipped
-     * because they also drive the radio and would interfere.
+     * Radio link/range test mode: the strapped secondary beacons every 5 s,
+     * the strapped primary listens and logs the RSSI/SNR of each beacon plus
+     * any gaps in its sequence number.  MeshNetwork and DeviceDiscovery are
+     * skipped because they also drive the radio and would interfere -- which
+     * also leaves the LoRa RX queue for RadioTest to drain itself.
      * DBG output is visible on the debug UART (always enabled).
      */
     RADIO_TEST_vInit();
+
+    /* Same reasoning as the bridge below: without a permanently held sleep
+     * lock the system drops into STOP2, which parks the debug UART pins to
+     * analog (terminal goes dead) and suspends the core, so the radio task
+     * could only service RX once per 1 Hz RTC heartbeat. Survivable for the
+     * old fire-and-forget TX smoke test; fatal for a listener. */
+    SYSTEM_vSleepLockAcquire();
 #elif defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
     /*
      * UART<->LoRa FrKernel bridge (bench test rig): this primary's only job
