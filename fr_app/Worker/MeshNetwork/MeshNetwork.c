@@ -38,6 +38,7 @@
 
 #include "GPS.h"
 #include "Movement.h"
+#include "RadioTestMode.h"   /* R&D radio link/range test gates */
 
 /* ---- DBeacon flags byte (byte 15) ---- */
 #define MESH_BEACON_FLAG_STILL      0x01U   /* bit0: 1 = still, 0 = moving */
@@ -725,6 +726,17 @@ static bool MESHNETWORK_bSendPacket(const uint8_t *pBuf, size_t u32Len)
     if (pBuf == NULL || u32Len == 0 || u32Len > MESH_TX_MAX_PACKET_SIZE)
         return false;
 
+    /* Radio-test mode owns the air for the duration. This is the single
+     * chokepoint every mesh transmission passes through — own beacons, acks,
+     * forwards, TimeSync and OTA responses — so one return here silences the
+     * mesh without having to find and gate each caller.
+     *
+     * It deliberately does NOT silence the test's own beacons or FrKernel
+     * replies: both build their packets and call LORARADIO_bTxPacket
+     * directly, below this layer. */
+    if (RADIOTESTMODE_bActive())
+        return false;
+
     MeshTxItem_t tItem;
     memcpy(tItem.u8Buf, pBuf, u32Len);
     tItem.u16Len = (uint16_t)u32Len;
@@ -1359,6 +1371,33 @@ void MESHNETWORK_vParserTask(void *pvParameters)
             continue;
         }
 #endif
+
+        /* R&D radio link/range test. Same shape as the FOTA filter above:
+         * placed after the RX read so the LoRa queue still drains, and before
+         * the dispatch so a dropped packet has no side effects at all — no
+         * forward-ring insert, no neighbour update, no TimeSync notify.
+         *
+         * A beaconing secondary is deliberately deaf to everything: that is
+         * what makes the test a clean one-way measurement, and it is why the
+         * only way out is a shake. A listening primary keeps exactly two
+         * doors open — the beacons it is here to measure, and FrKernel, so
+         * "tag <ID> radio stop" can still reach it. */
+        if (RADIOTESTMODE_bActive())
+        {
+            if (!RADIOTESTMODE_bIsListener())
+                continue;
+
+            if (eType == MeshPktType_Reserved)
+            {
+                RADIOTESTMODE_vOnBeacon(tRx.buffer + 1,
+                                        (uint8_t)(tRx.length - 1),
+                                        tRx.rssi, tRx.snr, tRx.i16NoiseFloor);
+                continue;
+            }
+
+            if (eType != MeshPktType_FrKernel)
+                continue;
+        }
 
         switch (eType)
         {

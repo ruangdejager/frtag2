@@ -100,4 +100,31 @@ bool FARMRANGER_bFwGetBlock(uint32_t u32Offset, uint16_t u16Len, uint8_t *pu8Buf
 /* Report the transfer outcome to the logger. */
 bool FARMRANGER_bFwReportDone(bool bOk);
 
+/* --------------------------------------------------------------------------
+ * R&D radio-test upload (AT+RTLOG)
+ *
+ * Used only by the runtime radio link/range test (see
+ * fr_app/Tasks/RadioTest/RadioTestMode.h). Deliberately a separate AT command
+ * from AT+LOG rather than an extra field on it: the discovery upload is the
+ * primary's core job and must keep behaving byte-for-byte as it does today,
+ * on both ends of the wire.
+ * -------------------------------------------------------------------------- */
+
+/* One measured beacon, as handed to the logger. */
+typedef struct {
+    uint32_t u32DeviceId;    /* beaconing secondary's LoRa unique ID        */
+    uint32_t u32Seq;         /* beacon sequence number                      */
+    uint32_t u32Missed;      /* running total missed, from sequence gaps    */
+    int16_t  i16Rssi;        /* dBm                                         */
+    int16_t  i16NoiseFloor;  /* dBm, or LORA_NOISE_FLOOR_INVALID            */
+    int8_t   i8Snr;          /* dB                                          */
+} FarmrangerRtBeacon_t;
+
+/* Upload a batch of measured beacons to the fr9 for logging to its flash.
+ * Same handshake/pacing/verdict contract as FARMRANGER_bLogData, against the
+ * fr9's AT+RTLOG handler. The caller owns the connect/disconnect around this
+ * (FARMRANGER_bDeviceOn / FARMRANGER_vDeviceOff), exactly as for AT+LOG. */
+bool FARMRANGER_bLogRadioTestData(const FarmrangerRtBeacon_t *pBeacons,
+                                  uint16_t u16Count);
+
 #endif /* DEVICE_FARMRANGER_FARMRANGER_H_ */

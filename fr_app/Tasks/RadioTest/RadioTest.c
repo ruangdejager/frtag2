@@ -189,6 +189,10 @@ static void RADIO_TEST_vPrimaryLoop(void)
     uint32_t u32LastSeq = 0U;
     bool     bHaveLast  = false;
 
+    /* Noise-floor sampling is off by default so normal builds pay nothing for
+     * it; this build's whole purpose is the measurement, so switch it on. */
+    LORARADIO_vSetNoiseFloorSampling(true);
+
     DBG_LOG("\r\nRadioTest: PRIMARY — listening, logging RSSI per beacon\r\n");
 
     for (;;)

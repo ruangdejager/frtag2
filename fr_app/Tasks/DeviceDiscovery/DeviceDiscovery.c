@@ -34,6 +34,7 @@
 #include "SolarPower_Config.h"
 #include "Debug.h"
 #include "FrKernel.h"
+#include "RadioTestMode.h"   /* R&D radio link/range test gates */
 
 #include <stdlib.h>   /* rand() / srand() — basic-mode beacon jitter */
 
@@ -819,6 +820,15 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
         }
         uint64_t u64Slot      = u64Utc / (uint64_t)u32EffectiveIntervalS;
 
+        /* ---- R&D radio link/range test: participate in nothing ----
+         * Same shape as the ProductionSleep gate below: one continue skips
+         * the scheduled discovery wake, the basic-mode beacon window and the
+         * GPS pre-trigger. Unlike ProductionSleep this does not sleep — the
+         * mode holds its own sleep lock — it simply stops the schedule from
+         * starting campaigns underneath a test that owns the radio. */
+        if (RADIOTESTMODE_bActive())
+            continue;
+
         /* ---- ProductionSleep: secondary only — primary has no solar panel ---- */
         if (eDeviceRole == DEVICE_ROLE_SECONDARY && eProductionState == PRODUCTION_SLEEP)
         {
@@ -1228,6 +1238,19 @@ static bool DEVICE_DISCOVERY_bBasicLogAndClear(const char *pacReason)
  * -------------------------------------------------------------------------- */
 void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
 {
+    /* Shake is the documented — and, on a beaconing secondary, the only —
+     * way out of the R&D radio-test mode: once beaconing it drops every
+     * inbound packet, so no over-the-air command can reach it.
+     *
+     * Left first, before any of the normal wakeup work below, so what follows
+     * is exactly the kernel window a shake would have produced had the mode
+     * never been entered. This function is only ever reached from the
+     * secondary-only shake sequence in Movement.c (solar activation sets
+     * DISCOVERY_KERNEL_BIT directly), so a listening primary is unaffected —
+     * it exits on "tag <ID> radio stop" instead. */
+    if (RADIOTESTMODE_bActive())
+        RADIOTESTMODE_vExit("shake");
+
     /* Hold off deep sleep until the resulting (no-op) campaign completes —
      * released at the end of DEVICE_DISCOVERY_vAppTask's loop.
      *

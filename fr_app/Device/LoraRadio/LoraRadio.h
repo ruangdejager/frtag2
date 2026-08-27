@@ -14,11 +14,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Included here, not left to callers: ENABLE_RADIO_TEST adds a field to
- * LoraRadio_Packet_t below, and that struct is the RX/TX queue element. Every
- * translation unit must agree on its size, so the flag has to be visible
- * wherever this header is. */
-#include "build_config.h"
 #include "LoraRadio_Config.h"
 
 /* Radio event bits — used with osThreadFlagsSet / osThreadFlagsWait */
@@ -41,21 +36,18 @@ typedef struct {
      * the queue so long that sending them is pointless — see
      * LORA_TX_MAX_AGE_MS. Unused on the RX path. */
     uint32_t u32QueuedTick;
-#ifdef ENABLE_RADIO_TEST
     /* Channel noise floor in dBm, sampled by the radio task on the last idle
      * pass before this packet arrived — i.e. with the channel quiet, which is
      * what makes it a noise floor rather than just another RSSI. Compare
-     * against rssi for the link margin. RX path only; LORA_NOISE_FLOOR_INVALID
-     * until the first sample lands. Bench-only, so production builds keep
-     * their queue-element size unchanged. */
+     * against rssi for the link margin. RX path only, and only populated while
+     * sampling is switched on (see LORARADIO_vSetNoiseFloorSampling);
+     * LORA_NOISE_FLOOR_INVALID otherwise. */
     int16_t  i16NoiseFloor;
-#endif
 } LoraRadio_Packet_t;
 
-#ifdef ENABLE_RADIO_TEST
-/* No sample taken yet (the radio task has not reached an idle pass). */
+/* No sample available: sampling is off, or the radio task has not yet reached
+ * an idle pass since it was switched on. */
 #define LORA_NOISE_FLOOR_INVALID   INT16_MIN
-#endif
 
 void     LORARADIO_vInit(void);
 bool     LORARADIO_bRxPacket(LoraRadio_Packet_t *packet);
@@ -73,6 +65,12 @@ bool     LORARADIO_bTxPacketWait(LoraRadio_Packet_t *packet, uint32_t timeoutMs)
 
 void     LORARADIO_vRadioTask(void *arg);
 uint32_t LORARADIO_u32GetUniqueId(void);
+
+/* Switch channel noise-floor sampling on or off. Off by default, and left off
+ * in normal operation: when on, the radio task issues one extra SUBGRF RSSI
+ * read on each idle pass of its 50 ms loop. Only the radio-test paths turn it
+ * on, so production timing and SPI traffic are untouched until they do. */
+void     LORARADIO_vSetNoiseFloorSampling(bool bEnable);
 
 void LORARADIO_vEventRxDone(void);
 void LORARADIO_vEventTxDone(void);
