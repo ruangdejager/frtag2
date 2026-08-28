@@ -17,13 +17,24 @@
 #   Also removes CubeIDE's stock frtag2.hex / frtag2.bin from $mode\ so the
 #   folder only ever holds the versioned deliverables.
 #
-#   In C:\Code\farmranger-firmware\frtag2-firmware\ (the public OTA host
-#   repo) — exactly two files:
+#   In EACH OTA host repo's frtag2-firmware\ folder - exactly two files:
 #
 #     frtag2_<M>_<m>_<p>.bin           the versioned app image (raw binary)
 #                                      the OTA flow fetches over HTTP
 #     version.json                     manifest naming the .bin above
 #                                      {"version","file","size","crc32","xor"}
+#
+#   The host repos are:
+#
+#     C:\Code\farmranger-firmware\frtag2-firmware\      field units
+#     C:\Code\frtag-firmware-inhouse\frtag2-firmware\   in-house bench units
+#
+#   Both get byte-identical artefacts. Which host a unit actually fetches
+#   from is decided at fr9 build time by SWITCH_TAGFOTA_INHOUSE_HOST
+#   (fr9_application, fr_app/inc/tag_fota.h). Publishing here is only a copy
+#   into a local working tree - nothing reaches a device until that repo is
+#   committed and pushed, so the field host stays under exactly the manual
+#   control it always had.
 #
 #   NO latest*.bin/hex, NO _ota.* variants, NO combined _bl_* copies of the
 #   BIN in the public repo — the OTA path only ever fetches the app-only
@@ -81,12 +92,21 @@ $version_str = "${Major}.${Minor}.${Patch}"
 
 Write-Host "frtag2 release: v${version_str} + bootloader v${bl_version} (mode=$mode)"
 
-# Destination: the public OTA host repo (may not exist yet on first run).
-$publish_dir = "C:\Code\farmranger-firmware\frtag2-firmware"
-if (-Not (Test-Path $publish_dir)) {
-    Write-Host "Publish dir $publish_dir does not exist - creating it (repo not initialised locally?)"
-    New-Item -ItemType Directory -Path $publish_dir -Force | Out-Null
+# Destinations: the OTA host repos (either may not exist yet on a first run).
+# Field host first, in-house bench host second - identical artefacts in both.
+$publish_dirs = @(
+    "C:\Code\farmranger-firmware\frtag2-firmware",     # field units
+    "C:\Code\frtag-firmware-inhouse\frtag2-firmware"   # in-house bench units
+)
+foreach ($d in $publish_dirs) {
+    if (-Not (Test-Path $d)) {
+        Write-Host "Publish dir $d does not exist - creating it (repo not initialised locally?)"
+        New-Item -ItemType Directory -Path $d -Force | Out-Null
+    }
 }
+# Checksums below are read back off the first copy; the others are
+# byte-identical copies of the same source bin.
+$publish_dir = $publish_dirs[0]
 
 # ---- Versioned app-only HEX in Debug\ (Intel HEX for manual programming) ----
 $app_hex_versioned = "$modeDir\frtag2_${Major}_${Minor}_${Patch}.hex"
@@ -105,12 +125,15 @@ if ($has_bootloader) {
     Set-Content -Path $bl_hex_versioned -Value $combined_hex
 }
 
-# ---- Publish to farmranger-firmware\frtag2-firmware\ ------------------------
-# ONE file: the versioned app-only .bin the OTA flow actually fetches.
-# version.json below names it explicitly so fr9's manifest parser
-# (TAGFOTA_pacManifestFile) picks it up as-is — no "latest.bin" fallback.
-$app_bin_published = "$publish_dir\frtag2_${Major}_${Minor}_${Patch}.bin"
-Copy-Item $bin_file_path -Destination $app_bin_published -Force
+# ---- Publish the .bin to every host repo ------------------------------------
+# ONE file per repo: the versioned app-only .bin the OTA flow actually
+# fetches. version.json below names it explicitly so fr9's manifest parser
+# (TAGFOTA_pacManifestFile) picks it up as-is - no "latest.bin" fallback.
+$bin_name = "frtag2_${Major}_${Minor}_${Patch}.bin"
+foreach ($d in $publish_dirs) {
+    Copy-Item $bin_file_path -Destination "$d\$bin_name" -Force
+}
+$app_bin_published = "$publish_dir\$bin_name"
 
 # Read the just-published bin for checksums (identical bytes to the source
 # bin, but read from the destination in case anything went wrong in the copy).
@@ -152,7 +175,9 @@ $manifest = [ordered]@{
     xor     = $xor8_hex
 }
 $manifest_json = ($manifest | ConvertTo-Json)
-Set-Content -Path "$publish_dir\version.json" -Value $manifest_json
+foreach ($d in $publish_dirs) {
+    Set-Content -Path "$d\version.json" -Value $manifest_json
+}
 
 # ---- Cleanup CubeIDE's stock output from Debug\ -----------------------------
 # Only the two versioned HEX files are the deliverables. Leaving the stock
@@ -165,7 +190,10 @@ Write-Host "  frtag2_${Major}_${Minor}_${Patch}.hex"
 if ($has_bootloader) {
     Write-Host "  frtag2_${Major}_${Minor}_${Patch}_bl_${bl_version}.hex"
 }
-Write-Host "Published to $publish_dir :"
-Write-Host "  frtag2_${Major}_${Minor}_${Patch}.bin  ($($app_bin_bytes.Length) B, CRC32=$crc_hex, XOR8=$xor8_hex)"
-Write-Host "  version.json (v${version_str})"
+foreach ($d in $publish_dirs) {
+    Write-Host "Published to $d :"
+    Write-Host "  $bin_name  ($($app_bin_bytes.Length) B, CRC32=$crc_hex, XOR8=$xor8_hex)"
+    Write-Host "  version.json (v${version_str})"
+}
+Write-Host "Neither host repo is committed or pushed by this script - do that by hand."
 Write-Host "OK"
