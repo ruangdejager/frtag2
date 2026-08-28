@@ -129,4 +129,20 @@ uint32_t RADIOTESTMODE_u32ServiceBeacon(void);
 void RADIOTESTMODE_vOnBeacon(const uint8_t *pBuf, uint8_t u8Len,
                              int16_t i16Rssi, int8_t i8Snr, int16_t i16NoiseFloor);
 
+/* Decode one beacon frame and log it, WITHOUT being in the mode and without
+ * touching any of its state. Returns false if the frame is not one of ours.
+ *
+ * For the FRKERNEL_INTERFACE_LORA_BRIDGE bench rig, which is a passive
+ * listener on the whole mesh and has no role in a range test — it never runs
+ * RADIOTESTMODE_bEnter, so RADIOTESTMODE_vOnBeacon above would ignore it.
+ * Without this the bridge printed "MeshNetwork: Unknown pkt type 0" at every
+ * beacon, which is the one rig you would most want to watch a range test
+ * from.
+ *
+ * Stateless, so no rx/missed tallies: sequence numbers are printed and gaps
+ * are visible directly in the lines. Safe to call from the parser task — it
+ * parses and logs, nothing more. */
+bool RADIOTESTMODE_bLogBeacon(const uint8_t *pBuf, uint8_t u8Len,
+                              int16_t i16Rssi, int8_t i8Snr, int16_t i16NoiseFloor);
+
 #endif /* FR_APP_TASKS_RADIOTEST_RADIOTESTMODE_H_ */

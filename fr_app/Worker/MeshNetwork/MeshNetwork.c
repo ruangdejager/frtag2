@@ -1419,6 +1419,25 @@ void MESHNETWORK_vParserTask(void *pvParameters)
             case MeshPktType_FrKernel:
                 MESHNETWORK_vOnFrKernelPacket(tRx.buffer + 1, (uint8_t)(tRx.length - 1));
                 break;
+            case MeshPktType_Reserved:
+                /* A radio-test beacon. Only reached when this node is NOT in
+                 * the test itself — the gate above intercepts these when it
+                 * is — so this is a bystander hearing someone else's test.
+                 *
+                 * The bridge is a passive listener on the whole mesh and is
+                 * the obvious rig to watch a range test from, so it decodes
+                 * and prints. Every other build drops it silently: type 0 is
+                 * now a type we legitimately transmit, so falling through to
+                 * default's "Unknown pkt type" would have every production
+                 * unit within earshot of a test log a line every 5 s about a
+                 * packet that is not addressed to it and is not a fault. */
+#ifdef FRKERNEL_INTERFACE_LORA_BRIDGE
+                (void)RADIOTESTMODE_bLogBeacon(tRx.buffer + 1,
+                                               (uint8_t)(tRx.length - 1),
+                                               tRx.rssi, tRx.snr,
+                                               tRx.i16NoiseFloor);
+#endif
+                break;
 #ifdef STORAGE_BACKEND_FLASH
             case MeshPktType_OtaPrep:
             case MeshPktType_OtaPrepAck:

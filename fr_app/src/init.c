@@ -207,6 +207,17 @@ void INIT_vInitialization(void *parameters)
      * heartbeat instead of promptly. Without this the bridge looks "asleep"
      * within moments of boot completing. */
     SYSTEM_vSleepLockAcquire();
+
+    /* Sample the channel noise floor for the whole life of this build. The
+     * bridge is the rig a range test is watched from, and a beacon's RSSI
+     * means little without the noise it is competing against — without this
+     * every beacon line it prints would read "nf=n/a".
+     *
+     * Affordable precisely here and nowhere else: it costs the radio task one
+     * extra SUBGRF read per idle pass of its 50 ms loop, which is nothing on a
+     * mains-or-bench rig that is already pinned out of STOP2 by the lock
+     * above, and would be a needless wakeup cost on a battery-powered node. */
+    LORARADIO_vSetNoiseFloorSampling(true);
 #else
     MESHNETWORK_vInit();
     DEVICE_DISCOVERY_vInit();

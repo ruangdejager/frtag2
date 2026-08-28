@@ -590,17 +590,20 @@ static void RTM_vTeardown(void)
  * Anything added here that can block breaks that, and would need the same
  * critical section RADIOTESTMODE_u32ServiceBeacon uses.
  * -------------------------------------------------------------------------- */
-void RADIOTESTMODE_vOnBeacon(const uint8_t *pBuf, uint8_t u8Len,
-                             int16_t i16Rssi, int8_t i8Snr, int16_t i16NoiseFloor)
+/* Pull the id and sequence out of a beacon payload. Shared by the listener
+ * and by the bridge's passive print below, so the wire format is decoded in
+ * exactly one place — two copies of this would be two things to keep in step
+ * with RADIOTESTMODE_u32ServiceBeacon's snprintf. Returns false for anything
+ * that is not one of our beacons. */
+static bool RTM_bParseBeacon(const uint8_t *pBuf, uint8_t u8Len,
+                             uint32_t *pu32Id, uint32_t *pu32Seq)
 {
-    char        line[RTM_LINE_MAX];
-    char       *pEnd = NULL;
-    RtmBeacon_t tB;
-    uint8_t     len = u8Len;
+    char     line[RTM_LINE_MAX];
+    char    *pEnd = NULL;
+    uint8_t  len  = u8Len;
 
-    if (!bActive || !bIsListener || pCtx == NULL || pCtx->xRxQueue == NULL ||
-        pBuf == NULL)
-        return;
+    if (pBuf == NULL)
+        return false;
 
     if (len >= (uint8_t)RTM_LINE_MAX)
         len = (uint8_t)(RTM_LINE_MAX - 1U);
@@ -610,13 +613,27 @@ void RADIOTESTMODE_vOnBeacon(const uint8_t *pBuf, uint8_t u8Len,
 
     if (len <= (uint8_t)RTM_TAG_LEN ||
         strncmp(line, RTM_TAG, RTM_TAG_LEN) != 0)
-        return;
+        return false;
 
-    tB.u32Id = strtoul(&line[RTM_TAG_LEN], &pEnd, 16);
+    *pu32Id = strtoul(&line[RTM_TAG_LEN], &pEnd, 16);
     if (pEnd == &line[RTM_TAG_LEN])
+        return false;
+
+    *pu32Seq = strtoul(pEnd, NULL, 10);
+    return true;
+}
+
+void RADIOTESTMODE_vOnBeacon(const uint8_t *pBuf, uint8_t u8Len,
+                             int16_t i16Rssi, int8_t i8Snr, int16_t i16NoiseFloor)
+{
+    RtmBeacon_t tB;
+
+    if (!bActive || !bIsListener || pCtx == NULL || pCtx->xRxQueue == NULL)
         return;
 
-    tB.u32Seq        = strtoul(pEnd, NULL, 10);
+    if (!RTM_bParseBeacon(pBuf, u8Len, &tB.u32Id, &tB.u32Seq))
+        return;
+
     tB.i16Rssi       = i16Rssi;
     tB.i8Snr         = i8Snr;
     tB.i16NoiseFloor = i16NoiseFloor;
@@ -626,6 +643,35 @@ void RADIOTESTMODE_vOnBeacon(const uint8_t *pBuf, uint8_t u8Len,
      * missed count on the next one we do log, which is the honest outcome. */
     (void)osMessageQueuePut(pCtx->xRxQueue, &tB, 0U, 0U);
     osThreadFlagsSet(xRtmTask, RTM_FLAG_RX);
+}
+
+/* --------------------------------------------------------------------------
+ * RADIOTESTMODE_bLogBeacon - passive observer, no mode, no state
+ * -------------------------------------------------------------------------- */
+bool RADIOTESTMODE_bLogBeacon(const uint8_t *pBuf, uint8_t u8Len,
+                              int16_t i16Rssi, int8_t i8Snr, int16_t i16NoiseFloor)
+{
+    uint32_t u32Id;
+    uint32_t u32Seq;
+
+    if (!RTM_bParseBeacon(pBuf, u8Len, &u32Id, &u32Seq))
+        return false;
+
+    /* Deliberately stateless: no rx/missed tallies like the listener keeps.
+     * Those would need statics, and this build links with well under 100 bytes
+     * of RAM to spare. Nothing is lost - the sequence numbers are printed, so
+     * a gap is visible directly in the lines themselves, which is what the
+     * tally was summarising anyway. */
+    if (i16NoiseFloor == LORA_NOISE_FLOOR_INVALID)
+        DBG_LOG("RadioTest: RX id=%04lX seq=%lu rssi=%d dBm snr=%d dB nf=n/a\r\n",
+                (unsigned long)u32Id, (unsigned long)u32Seq, i16Rssi, i8Snr);
+    else
+        DBG_LOG("RadioTest: RX id=%04lX seq=%lu rssi=%d dBm snr=%d dB "
+                "nf=%d dBm margin=%d dB\r\n",
+                (unsigned long)u32Id, (unsigned long)u32Seq, i16Rssi, i8Snr,
+                i16NoiseFloor, (int)(i16Rssi - i16NoiseFloor));
+
+    return true;
 }
 
 /* --------------------------------------------------------------------------
