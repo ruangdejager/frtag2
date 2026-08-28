@@ -149,6 +149,25 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
         bool bKernelWakeup = ((u32Flags & osFlagsError) == 0U) &&
                              ((u32Flags & DISCOVERY_KERNEL_BIT) != 0U);
+
+        /* A radio test owns the radio AND the Farmranger link for its whole
+         * duration, so a campaign started now can only do harm: its DReq will
+         * not transmit (MESHNETWORK_bSendPacket refuses while a test runs), so
+         * every wave times out hearing nothing, and the logger round-trip at
+         * the end then fights the test for the same fr9 session and PA0
+         * attention line. Two owners toggling that line produced exactly the
+         * observed symptom on the fr9 - a burst of sessions at rx=0B, one
+         * cancelling the other, with the occasional stray byte from a transfer
+         * cut off when the other side de-inits the UART pins mid-character.
+         *
+         * The scheduler is already gated, so this only catches a wake whose
+         * flag was set just before the test was entered. */
+        if (RADIOTESTMODE_bActive())
+        {
+            DBG_LOG("DeviceDiscovery: radio test active - skipping campaign\r\n");
+            SYSTEM_vSleepLockRelease();
+            continue;
+        }
         bool bBasicBeaconWake = ((u32Flags & osFlagsError) == 0U) &&
                                 ((u32Flags & DISCOVERY_BASIC_BEACON_BIT) != 0U);
 
@@ -274,9 +293,24 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
                     if ((tNow - tLastBeaconTick) > MESH_DISCOVERY_IDLE_MS)
                         break;
+
+                    /* Radio test entered mid-campaign. Bail out rather than
+                     * run the waves out: MESHNETWORK_bSendPacket returns false
+                     * for the duration of a test, so the DReq never actually
+                     * goes out, no beacon can be heard in reply, and every
+                     * wave would time out on MESH_DISCOVERY_IDLE_MS — five of
+                     * them, ~35 s, followed by a logger session that fights
+                     * the test for the same Farmranger link and PA0 line. */
+                    if (RADIOTESTMODE_bActive())
+                        break;
                 }
 
-                if (!bBeaconSeenThisWave || u8WaveCount >= APP_PRIMARY_MAX_WAVES)
+                if (RADIOTESTMODE_bActive())
+                {
+                    bDiscoveryFinished = true;
+                    MESHNETWORK_vStopPrimaryAck();
+                }
+                else if (!bBeaconSeenThisWave || u8WaveCount >= APP_PRIMARY_MAX_WAVES)
                 {
                     if (bBeaconSeenThisWave)
                         DBG_LOG("DeviceDiscovery: Primary wave cap (%u) reached\r\n",
@@ -361,6 +395,12 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 /* prodsleep/solarsleep commanded mid-campaign: abandon it and
                  * head for sleep instead of running out the window. */
                 if (eProductionState == PRODUCTION_SLEEP)
+                    break;
+
+                /* Radio test entered mid-campaign: same treatment. The test
+                 * owns the radio from here, so this window can only run out
+                 * its clock hearing nothing. */
+                if (RADIOTESTMODE_bActive())
                     break;
 
                 if ((uint32_t)(u32Now - u32CampaignStart) >= APP_DISCOVERY_WINDOW_TIMEOUT_MS)
@@ -533,110 +573,131 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                     LORARADIO_u32GetUniqueId());
             }
 
-            /* ---- Logger connection + upload (fr9 Farmranger board) ---- */
-            DEVICE_DISCOVERY_DRIVER_bConnectLogger();
-
-            DBG_LOG("DeviceDiscovery %X: Logger connected.\r\n",
-                LORARADIO_u32GetUniqueId());
-
-            if (DEVICE_DISCOVERY_bSendDiscoveryData(tNeighbors, u16NeighborCount))
-                DBG_LOG("DeviceDiscovery %X: Log SUCCESS.\r\n", LORARADIO_u32GetUniqueId());
-            else
+            /* ---- Logger session (fr9 Farmranger board) ----
+             *
+             * Skipped entirely if a radio test was entered mid-campaign. The
+             * test drives the same Farmranger link and the same PA0 attention
+             * line, one beacon at a time; running this round-trip alongside it
+             * means two owners raising and dropping that line, and two
+             * producers on a 4-deep AT queue whose put timeout is 100 ms. The
+             * fr9 sees the result as a burst of sessions that carry no bytes,
+             * each cancelled by the other side, plus the odd stray character
+             * from a transfer cut off when the other DeviceOff de-inits the
+             * UART pins mid-send.
+             *
+             * The neighbour table is not lost by skipping - it stays in the
+             * mesh store and goes up on the next campaign after the test. */
+            if (RADIOTESTMODE_bActive())
             {
-                DBG_LOG("DeviceDiscovery %X: Log FAILED.\r\n", LORARADIO_u32GetUniqueId());
-                osDelay(2000);
-            }
-
-            /* ---- Timestamp sync ---- */
-            uint64_t now = DEVICE_DISCOVERY_DRIVER_u64RequestTS();
-            if (now > 0)
-                RTC_vSetUTC(now);
-            else
-                DBG_LOG("DeviceDiscovery: Failed to get timestamp\r\n");
-
-            /* ---- Settings update (interval + discovery mode + gps) ----
-             * Single AT+SETREQ round trip returns all three; the local
-             * defaults (whatever was last applied — cold boot: ADVANCED
-             * + gps on) stay in force on any parse failure. Only wake
-             * intervals in the small fixed set map to enum values; other
-             * values leave the interval untouched. */
-            uint8_t u8WakeInterval = 0U;
-            bool    bBasicMode    = false;
-            bool    bGpsEnabled   = true;
-            if (DEVICE_DISCOVERY_DRIVER_bRequestSettings(&u8WakeInterval,
-                                                        &bBasicMode,
-                                                        &bGpsEnabled))
-            {
-                if      (u8WakeInterval == 15)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_15_MIN);
-                else if (u8WakeInterval == 30)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_30_MIN);
-                else if (u8WakeInterval == 60)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_60_MIN);
-                else if (u8WakeInterval == 120) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_120_MIN);
-                else if (u8WakeInterval == 240) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_240_MIN);
-
-                MESHNETWORK_vSetDiscoveryMode(bBasicMode ? DISCOVERY_MODE_BASIC
-                                                        : DISCOVERY_MODE_ADVANCED);
-                MESHNETWORK_vSetGpsEnabled(bGpsEnabled);
-
-                DBG_LOG("DeviceDiscovery: settings applied - interval=%u min, mode=%s, gps=%u\r\n",
-                        (unsigned)u8WakeInterval,
-                        bBasicMode ? "basic" : "advanced",
-                        (unsigned)bGpsEnabled);
+                DBG_LOG("DeviceDiscovery: radio test active - skipping logger session\r\n");
             }
             else
             {
-                DBG_LOG("DeviceDiscovery: AT+SETREQ failed - keeping previous settings\r\n");
-            }
+                /* ---- Logger connection + upload (fr9 Farmranger board) ---- */
+                DEVICE_DISCOVERY_DRIVER_bConnectLogger();
 
-            /* ---- Send TimeSync to secondaries ---- *
-             * Sent BEFORE the OTA check so secondaries end their campaign
-             * here rather than waiting out the primary's fr9 round-trip
-             * (which, with the AT+FWCHECK GitHub Pages check, can now run
-             * to OTA_FWREQ_WAIT_MAX_MS). Only the primary talks to fr9 at
-             * all — secondaries have no Farmranger UART link. */
-            DEVICE_DISCOVERY_vSendTS();
-            EVTLOG(LOG_TX_TS, 1);
+                DBG_LOG("DeviceDiscovery %X: Logger connected.\r\n",
+                    LORARADIO_u32GetUniqueId());
+
+                if (DEVICE_DISCOVERY_bSendDiscoveryData(tNeighbors, u16NeighborCount))
+                    DBG_LOG("DeviceDiscovery %X: Log SUCCESS.\r\n", LORARADIO_u32GetUniqueId());
+                else
+                {
+                    DBG_LOG("DeviceDiscovery %X: Log FAILED.\r\n", LORARADIO_u32GetUniqueId());
+                    osDelay(2000);
+                }
+
+                /* ---- Timestamp sync ---- */
+                uint64_t now = DEVICE_DISCOVERY_DRIVER_u64RequestTS();
+                if (now > 0)
+                    RTC_vSetUTC(now);
+                else
+                    DBG_LOG("DeviceDiscovery: Failed to get timestamp\r\n");
+
+                /* ---- Settings update (interval + discovery mode + gps) ----
+                 * Single AT+SETREQ round trip returns all three; the local
+                 * defaults (whatever was last applied — cold boot: ADVANCED
+                 * + gps on) stay in force on any parse failure. Only wake
+                 * intervals in the small fixed set map to enum values; other
+                 * values leave the interval untouched. */
+                uint8_t u8WakeInterval = 0U;
+                bool    bBasicMode    = false;
+                bool    bGpsEnabled   = true;
+                if (DEVICE_DISCOVERY_DRIVER_bRequestSettings(&u8WakeInterval,
+                                                            &bBasicMode,
+                                                            &bGpsEnabled))
+                {
+                    if      (u8WakeInterval == 15)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_15_MIN);
+                    else if (u8WakeInterval == 30)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_30_MIN);
+                    else if (u8WakeInterval == 60)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_60_MIN);
+                    else if (u8WakeInterval == 120) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_120_MIN);
+                    else if (u8WakeInterval == 240) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_240_MIN);
+
+                    MESHNETWORK_vSetDiscoveryMode(bBasicMode ? DISCOVERY_MODE_BASIC
+                                                            : DISCOVERY_MODE_ADVANCED);
+                    MESHNETWORK_vSetGpsEnabled(bGpsEnabled);
+
+                    DBG_LOG("DeviceDiscovery: settings applied - interval=%u min, mode=%s, gps=%u\r\n",
+                            (unsigned)u8WakeInterval,
+                            bBasicMode ? "basic" : "advanced",
+                            (unsigned)bGpsEnabled);
+                }
+                else
+                {
+                    DBG_LOG("DeviceDiscovery: AT+SETREQ failed - keeping previous settings\r\n");
+                }
+
+                /* ---- Send TimeSync to secondaries ---- *
+                 * Sent BEFORE the OTA check so secondaries end their campaign
+                 * here rather than waiting out the primary's fr9 round-trip
+                 * (which, with the AT+FWCHECK GitHub Pages check, can now run
+                 * to OTA_FWREQ_WAIT_MAX_MS). Only the primary talks to fr9 at
+                 * all — secondaries have no Farmranger UART link. */
+                DEVICE_DISCOVERY_vSendTS();
+                EVTLOG(LOG_TX_TS, 1);
 
 #ifdef STORAGE_BACKEND_FLASH
-            /* ---- LoRa distribution to secondaries (if a staged image is
-             * ready) ----
-             * Right after TimeSync, before the fr9 UART check: secondaries
-             * that just auto-armed off this wake's TimeSync are still awake
-             * for a bounded window waiting for exactly this OtaPrep (see
-             * APP_OTA_PREP_WAIT_MS on the secondary side) — putting the fr9
-             * round trip (up to OTA_FWREQ_WAIT_MAX_MS) first would burn
-             * through that window for nothing. */
-            if (FOTA_bDistributePending())
-            {
-                FOTA_vDistribute();
-            }
-            else
-            {
-                /* Silent skip here used to be indistinguishable in the log
-                 * from "distribute never even got checked" — log exactly
-                 * why nothing happened instead of just falling through to
-                 * the fr9 check with no trace. Only two reasons left to
-                 * skip: FOTA_bDistributePending() no longer treats "every
-                 * target from a past session confirmed" as a permanent
-                 * stop, since that has no way to know about a secondary
-                 * that wasn't listening then — see there for why. */
-                FotaMeta_t tFotaMeta;
-                if (!FOTA_bGetMeta(&tFotaMeta))
-                    DBG_LOG("Fota: distribute check - no valid image staged\r\n");
-                else if (tFotaMeta.u32Version != VERSION_u32Get())
-                    DBG_LOG("Fota: distribute check - staged v%lu != running v%lu, skip\r\n",
-                            (unsigned long)tFotaMeta.u32Version, (unsigned long)VERSION_u32Get());
-            }
+                /* ---- LoRa distribution to secondaries (if a staged image is
+                 * ready) ----
+                 * Right after TimeSync, before the fr9 UART check: secondaries
+                 * that just auto-armed off this wake's TimeSync are still awake
+                 * for a bounded window waiting for exactly this OtaPrep (see
+                 * APP_OTA_PREP_WAIT_MS on the secondary side) — putting the fr9
+                 * round trip (up to OTA_FWREQ_WAIT_MAX_MS) first would burn
+                 * through that window for nothing. */
+                if (FOTA_bDistributePending())
+                {
+                    FOTA_vDistribute();
+                }
+                else
+                {
+                    /* Silent skip here used to be indistinguishable in the log
+                     * from "distribute never even got checked" — log exactly
+                     * why nothing happened instead of just falling through to
+                     * the fr9 check with no trace. Only two reasons left to
+                     * skip: FOTA_bDistributePending() no longer treats "every
+                     * target from a past session confirmed" as a permanent
+                     * stop, since that has no way to know about a secondary
+                     * that wasn't listening then — see there for why. */
+                    FotaMeta_t tFotaMeta;
+                    if (!FOTA_bGetMeta(&tFotaMeta))
+                        DBG_LOG("Fota: distribute check - no valid image staged\r\n");
+                    else if (tFotaMeta.u32Version != VERSION_u32Get())
+                        DBG_LOG("Fota: distribute check - staged v%lu != running v%lu, skip\r\n",
+                                (unsigned long)tFotaMeta.u32Version, (unsigned long)VERSION_u32Get());
+                }
 
-            /* ---- OTA firmware pull (logger session still up) ----
-             * Ask fr9 to check GitHub Pages for a newer image, then poll
-             * AT+FWREQ (which answers FW,WAIT while fr9's check/download is
-             * in flight). If the logger offers a newer tag firmware, acquire
-             * it into the ext-flash scratchpad. On success this arms the
-             * bootloader and RESETS — nothing after it runs this wake. */
-            FOTA_bUartAcquire();
+                /* ---- OTA firmware pull (logger session still up) ----
+                 * Ask fr9 to check GitHub Pages for a newer image, then poll
+                 * AT+FWREQ (which answers FW,WAIT while fr9's check/download is
+                 * in flight). If the logger offers a newer tag firmware, acquire
+                 * it into the ext-flash scratchpad. On success this arms the
+                 * bootloader and RESETS — nothing after it runs this wake. */
+                FOTA_bUartAcquire();
 #endif
 
-            DEVICE_DISCOVERY_DRIVER_vDisconnectLogger();
+                DEVICE_DISCOVERY_DRIVER_vDisconnectLogger();
+            }
 
             osDelay(5000);
         }
