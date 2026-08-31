@@ -17,8 +17,8 @@
 #   Also removes CubeIDE's stock frtag2.hex / frtag2.bin from $mode\ so the
 #   folder only ever holds the versioned deliverables.
 #
-#   In C:\Code\farmranger-firmware\frtag2-firmware\ (the public OTA host
-#   repo) — exactly two files:
+#   In each repo listed in $publish_dirs below (the public OTA host repo,
+#   plus the in-house mirror) — exactly two files per repo:
 #
 #     frtag2_<M>_<m>_<p>.bin           the versioned app image (raw binary)
 #                                      the OTA flow fetches over HTTP
@@ -26,9 +26,15 @@
 #                                      {"version","file","size","crc32","xor"}
 #
 #   NO latest*.bin/hex, NO _ota.* variants, NO combined _bl_* copies of the
-#   BIN in the public repo — the OTA path only ever fetches the app-only
+#   BIN in either publish repo — the OTA path only ever fetches the app-only
 #   BIN, and its filename comes from version.json's "file" field (fr9's
 #   TAGFOTA_pacManifestFile returns whatever the manifest names).
+#
+#   This script only ever writes files into those repos' working trees. It
+#   never runs git add/commit/push there, and never will — committing and
+#   pushing C:\Code\farmranger-firmware and C:\Code\frtag-firmware-inhouse
+#   is a manual, deliberate step for a human, not something a build step
+#   does on every compile.
 #
 # For a first-time programming of a fresh MCU: flash frtag2_<M>_<m>_<p>_bl_<b>.hex
 # — contains bootloader + application. After that every OTA update ships
@@ -81,11 +87,19 @@ $version_str = "${Major}.${Minor}.${Patch}"
 
 Write-Host "frtag2 release: v${version_str} + bootloader v${bl_version} (mode=$mode)"
 
-# Destination: the public OTA host repo (may not exist yet on first run).
-$publish_dir = "C:\Code\farmranger-firmware\frtag2-firmware"
-if (-Not (Test-Path $publish_dir)) {
-    Write-Host "Publish dir $publish_dir does not exist - creating it (repo not initialised locally?)"
-    New-Item -ItemType Directory -Path $publish_dir -Force | Out-Null
+# Destinations: every repo that mirrors the app-only .bin + version.json.
+# Both are separate local git repos this script only ever writes files
+# into - see the file-header note on why nothing here ever commits or
+# pushes them.
+$publish_dirs = @(
+    "C:\Code\farmranger-firmware\frtag2-firmware",
+    "C:\Code\frtag-firmware-inhouse\frtag2-firmware"
+)
+foreach ($publish_dir in $publish_dirs) {
+    if (-Not (Test-Path $publish_dir)) {
+        Write-Host "Publish dir $publish_dir does not exist - creating it (repo not initialised locally?)"
+        New-Item -ItemType Directory -Path $publish_dir -Force | Out-Null
+    }
 }
 
 # ---- Versioned app-only HEX in Debug\ (Intel HEX for manual programming) ----
@@ -105,18 +119,11 @@ if ($has_bootloader) {
     Set-Content -Path $bl_hex_versioned -Value $combined_hex
 }
 
-# ---- Publish to farmranger-firmware\frtag2-firmware\ ------------------------
-# ONE file: the versioned app-only .bin the OTA flow actually fetches.
-# version.json below names it explicitly so fr9's manifest parser
-# (TAGFOTA_pacManifestFile) picks it up as-is — no "latest.bin" fallback.
-$app_bin_published = "$publish_dir\frtag2_${Major}_${Minor}_${Patch}.bin"
-Copy-Item $bin_file_path -Destination $app_bin_published -Force
+# ---- Checksums, computed once against the bin CubeIDE just built ------------
+# Same bytes get published to every repo in $publish_dirs, so the CRC/XOR are
+# computed once here rather than once per destination.
+$app_bin_bytes = [System.IO.File]::ReadAllBytes($bin_file_path)
 
-# Read the just-published bin for checksums (identical bytes to the source
-# bin, but read from the destination in case anything went wrong in the copy).
-$app_bin_bytes = [System.IO.File]::ReadAllBytes($app_bin_published)
-
-# ---- version.json (OTA manifest) --------------------------------------------
 # CRC32 (IEEE 802.3, poly 0xEDB88320) computed manually to avoid PowerShell
 # hex-literal quirks (>= 0x80000000 parses as negative Int32; use ToUInt32).
 $CRC32_POLY = [Convert]::ToUInt32("EDB88320", 16)
@@ -152,7 +159,25 @@ $manifest = [ordered]@{
     xor     = $xor8_hex
 }
 $manifest_json = ($manifest | ConvertTo-Json)
-Set-Content -Path "$publish_dir\version.json" -Value $manifest_json
+
+# ---- Publish to every repo in $publish_dirs ----------------------------------
+# ONE file each: the versioned app-only .bin the OTA flow actually fetches,
+# plus the version.json naming it. version.json's "file" field is what fr9's
+# manifest parser (TAGFOTA_pacManifestFile) goes by — no "latest.bin"
+# fallback, and both repos get byte-identical bin + manifest.
+foreach ($publish_dir in $publish_dirs) {
+    $app_bin_published = "$publish_dir\frtag2_${Major}_${Minor}_${Patch}.bin"
+    Copy-Item $bin_file_path -Destination $app_bin_published -Force
+
+    # Verify the copy landed intact before trusting it as a deliverable.
+    $published_len = (Get-Item $app_bin_published).Length
+    if ($published_len -ne $app_bin_bytes.Length) {
+        Write-Host "Publish to $publish_dir FAILED - size mismatch ($published_len vs $($app_bin_bytes.Length))"
+        exit 1
+    }
+
+    Set-Content -Path "$publish_dir\version.json" -Value $manifest_json
+}
 
 # ---- Cleanup CubeIDE's stock output from Debug\ -----------------------------
 # Only the two versioned HEX files are the deliverables. Leaving the stock
@@ -165,7 +190,9 @@ Write-Host "  frtag2_${Major}_${Minor}_${Patch}.hex"
 if ($has_bootloader) {
     Write-Host "  frtag2_${Major}_${Minor}_${Patch}_bl_${bl_version}.hex"
 }
-Write-Host "Published to $publish_dir :"
-Write-Host "  frtag2_${Major}_${Minor}_${Patch}.bin  ($($app_bin_bytes.Length) B, CRC32=$crc_hex, XOR8=$xor8_hex)"
-Write-Host "  version.json (v${version_str})"
+Write-Host "Published ($($app_bin_bytes.Length) B, CRC32=$crc_hex, XOR8=$xor8_hex):"
+foreach ($publish_dir in $publish_dirs) {
+    Write-Host "  $publish_dir\frtag2_${Major}_${Minor}_${Patch}.bin"
+    Write-Host "  $publish_dir\version.json (v${version_str})"
+}
 Write-Host "OK"
