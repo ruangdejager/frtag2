@@ -56,6 +56,46 @@ static void FLASH_vUnlock(void)
     osMutexRelease(xFlashMutex);
 }
 
+/* Read-failure telemetry — see Flash_ReadFailReason_t in Flash.h for why a
+ * bare false return was not enough. Recorded under the flash mutex by
+ * FLASH_vRead, read out (and cleared) by whoever is diagnosing. Details are
+ * kept for the FIRST failure of a batch, so a later cascade cannot bury what
+ * actually went wrong first. */
+static volatile uint16_t               u16RdFailCount  = 0U;
+static volatile Flash_ReadFailReason_t tRdFailReason   = FLASH_RDFAIL_NONE;
+static volatile uint32_t               u32RdFailAddr   = 0U;
+static volatile uint8_t                u8RdFailHal     = 0U;
+
+/* Call with the flash mutex held. */
+static void FLASH_vRecordReadFail(Flash_ReadFailReason_t tReason,
+                                  uint32_t u32Addr, uint8_t u8Hal)
+{
+    if (u16RdFailCount == 0U)
+    {
+        tRdFailReason = tReason;
+        u32RdFailAddr = u32Addr;
+        u8RdFailHal   = u8Hal;
+    }
+    if (u16RdFailCount < UINT16_MAX) u16RdFailCount++;
+}
+
+uint16_t FLASH_u16GetAndClearReadFails(Flash_ReadFailReason_t *ptReason,
+                                       uint32_t *pu32Addr,
+                                       uint8_t  *pu8HalStatus)
+{
+    FLASH_vLock();
+    uint16_t u16Count = u16RdFailCount;
+    if (ptReason     != NULL) *ptReason     = tRdFailReason;
+    if (pu32Addr     != NULL) *pu32Addr     = u32RdFailAddr;
+    if (pu8HalStatus != NULL) *pu8HalStatus = u8RdFailHal;
+    u16RdFailCount = 0U;
+    tRdFailReason  = FLASH_RDFAIL_NONE;
+    u32RdFailAddr  = 0U;
+    u8RdFailHal    = 0U;
+    FLASH_vUnlock();
+    return u16Count;
+}
+
 /* --------------------------------------------------------------------------
  * Internal helpers
  * -------------------------------------------------------------------------- */
@@ -353,6 +393,7 @@ bool FLASH_vRead(uint32_t addr, uint8_t *buf, uint16_t len)
     FLASH_vLock();
     if (!bDevicePresent)
     {
+        FLASH_vRecordReadFail(FLASH_RDFAIL_ABSENT, addr, 0U);
         FLASH_vUnlock();
         return false;
     }
@@ -365,14 +406,25 @@ bool FLASH_vRead(uint32_t addr, uint8_t *buf, uint16_t len)
     };
     if (!FLASH_bWaitReady())
     {
+        FLASH_vRecordReadFail(FLASH_RDFAIL_WAITREADY, addr, 0U);
         FLASH_vUnlock();
         return false;
     }
 
+    /* Command and payload transfers kept separate rather than &&-chained, so
+     * the tally can say which half failed: a command failure means the bus
+     * refused a 4-byte write, a payload failure means it died partway through
+     * a read the device had already accepted. Different faults. */
     FLASH_DRIVER_vSelect();
-    bool bOk = (FLASH_DRIVER_vWrite(cmd, 4) == HAL_OK) &&
-               (FLASH_DRIVER_vRead(buf, len) == HAL_OK);
+    HAL_StatusTypeDef tCmd  = FLASH_DRIVER_vWrite(cmd, 4);
+    HAL_StatusTypeDef tData = (tCmd == HAL_OK) ? FLASH_DRIVER_vRead(buf, len) : HAL_OK;
     FLASH_DRIVER_vDeselect();
+
+    bool bOk = (tCmd == HAL_OK) && (tData == HAL_OK);
+    if (!bOk)
+        FLASH_vRecordReadFail((tCmd != HAL_OK) ? FLASH_RDFAIL_CMD : FLASH_RDFAIL_DATA,
+                              addr,
+                              (uint8_t)((tCmd != HAL_OK) ? tCmd : tData));
     FLASH_vUnlock();
     return bOk;
 }

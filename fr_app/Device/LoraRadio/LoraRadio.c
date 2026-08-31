@@ -88,6 +88,20 @@ static volatile uint16_t u16TxStaleDropCount = 0;
 /* Pending radio events captured during carrier-sense / back-off */
 static volatile uint32_t gRadioPendingEvents = 0;
 
+/* Tick at which the PA was last actually fired — i.e. when the shared supply
+ * rail last took the SX126x TX current spike that OTA_LORA_CHUNK_GAP_MS
+ * exists to wait out.
+ *
+ * This is the one timestamp nothing in the codebase recorded. Every existing
+ * log line marks when a packet was *queued*, and queue time says nothing
+ * about PA time: MESHNETWORK_bSendPacket only stamps a ready-tick (jitter
+ * 20-1500 ms), and this task's carrier sense can then defer the real
+ * transmission by up to LORA_TX_CARRIER_WAIT_MS on top. So "was the radio
+ * transmitting while that flash read happened?" has never been answerable
+ * from a field log. Written here on the radio task, read by the FOTA verify
+ * path. */
+static volatile uint32_t u32LastTxDoneTick = 0U;
+
 static uint8_t u8DevEUI[8];
 
 /* -------------------------------------------------------------------------- */
@@ -332,6 +346,7 @@ void LORARADIO_vRadioTask(void *arg)
                 }
 
                 LORARADIO_DRIVER_bTransmitPayload(pkt.buffer, pkt.length);
+                u32LastTxDoneTick = osKernelGetTickCount();
                 LORARADIO_DRIVER_vEnterRxMode(0x00);
             }
         }
@@ -441,6 +456,17 @@ uint16_t LORARADIO_u16GetAndClearTxStaleDrops(void)
     uint16_t u16Count = u16TxStaleDropCount;
     u16TxStaleDropCount = 0U;
     return u16Count;
+}
+
+uint32_t LORARADIO_u32GetLastTxTick(void)
+{
+    return u32LastTxDoneTick;
+}
+
+bool LORARADIO_bTxQueueIdle(void)
+{
+    if (xLoRaTxQueue == NULL) return true;
+    return (osMessageQueueGetCount(xLoRaTxQueue) == 0U);
 }
 
 void LORARADIO_vFlushTxQueue(void)

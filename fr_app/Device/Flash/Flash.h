@@ -22,6 +22,36 @@ bool    FLASH_bVerifyDevice(void);          /* reads JEDEC ID; DBG-warns on mism
  * single read is not trustworthy enough to call a chip dead. */
 bool    FLASH_bVerifyDeviceEx(uint8_t *pu8Id, uint8_t *pu8Attempts);
 
+/* Why a FLASH_vRead() returned false. Callers used to get a bare bool, which
+ * is not enough to diagnose anything: FOTA_u8CalcImageXorRangeBuf collapsed
+ * every one of these into "the checksum is wrong", so a field log could not
+ * tell a failed SPI transfer from genuinely bad stored bytes — the exact
+ * ambiguity that left the 2026-08-31 "xor verify recovered on attempt 2/8"
+ * events undiagnosable. */
+typedef enum
+{
+    FLASH_RDFAIL_NONE = 0,   /* no failure recorded since the last read-out  */
+    FLASH_RDFAIL_ABSENT,     /* bDevicePresent false - JEDEC ID never matched */
+    FLASH_RDFAIL_WAITREADY,  /* still WIP after FLASH_WAIT_READY_TIMEOUT_MS   */
+    FLASH_RDFAIL_CMD,        /* SPI transmit of the 4-byte read command failed */
+    FLASH_RDFAIL_DATA,       /* SPI receive of the payload failed             */
+} Flash_ReadFailReason_t;
+
+/* Read-failure tally since the last call; reading clears it (same idiom as
+ * LORARADIO_u16GetAndClearCadTimeouts — a counter rather than a log line per
+ * occurrence, because FLASH_vRead is called ~1900 times per whole-image XOR
+ * pass and logging inside that would perturb the timing being measured).
+ *
+ * The details reported belong to the FIRST failure since the last read-out,
+ * not the most recent: what went wrong first is what explains the rest.
+ * All three out-params are optional (NULL to ignore). pu8HalStatus carries
+ * the HAL_StatusTypeDef of the failing transfer for the CMD/DATA reasons,
+ * which is what distinguishes a HAL_TIMEOUT (task starved across the 1000 ms
+ * SPI_TIMEOUT) from a HAL_ERROR (peripheral fault). */
+uint16_t FLASH_u16GetAndClearReadFails(Flash_ReadFailReason_t *ptReason,
+                                       uint32_t *pu32Addr,
+                                       uint8_t  *pu8HalStatus);
+
 /* All operations below wait for the device to go ready (bounded timeout)
  * before issuing their command, and return false without touching the
  * flash if the device is still busy or the SPI transaction failed -

@@ -78,6 +78,23 @@ uint16_t LORARADIO_u16GetAndClearCadTimeouts(void);
  * alongside the CAD count in the per-campaign mesh stats line. */
 uint16_t LORARADIO_u16GetAndClearTxStaleDrops(void);
 
+/* osKernelGetTickCount() at the moment the PA was last actually fired, or 0
+ * if it has not transmitted since boot. Does NOT clear on read.
+ *
+ * Diagnostic: this is the only way to correlate a flash-read fault with the
+ * TX current spike that OTA_LORA_CHUNK_GAP_MS was measured against, because
+ * queue time and PA time are decoupled by the mesh jitter (20-1500 ms) plus
+ * carrier sense (up to LORA_TX_CARRIER_WAIT_MS). Compare against a read
+ * window with signed tick arithmetic so wrap is handled. */
+uint32_t LORARADIO_u32GetLastTxTick(void);
+
+/* True when nothing is waiting in the TX queue. Note this is NOT "the radio
+ * is silent": a packet already dequeued can still be in carrier sense with
+ * its transmission yet to happen. Callers that need actual quiet must drain
+ * on this AND then wait out a settle window — see the pre-send verify in
+ * FOTA_vDistribute. */
+bool     LORARADIO_bTxQueueIdle(void);
+
 /* Discard everything still queued for TX. Call when the work that queued it
  * is over (campaign end / before sleep): otherwise the radio task keeps
  * carrier-sensing its way through a stale backlog for minutes afterwards,
