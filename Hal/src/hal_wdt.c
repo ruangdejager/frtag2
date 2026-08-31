@@ -3,9 +3,17 @@
  *
  * Independent Watchdog (IWDG) driver.
  *
- * Normal operation: ~1.6 s timeout (prescaler 64, reload 4095).
- * Sleep current test: prescaler extended to 256 (~6.5 s) while current
- * measurements are taken, then restored.
+ * Timeout = (Reload + 1) * Prescaler / LSI, with LSI = 32 kHz (LSI_VALUE, and
+ * RCC_CSR's LSIPRE /128 divider is never enabled in this project):
+ *
+ *   Normal operation:   (4095+1) *  64 / 32000 = 8.192 s
+ *   Sleep current test: (4095+1) * 256 / 32000 = 32.768 s
+ *
+ * Both figures in this header used to be wrong — it claimed ~1.6 s and ~6.5 s,
+ * which are the numbers for a reload of 800, not the 4095 actually programmed
+ * below. Worth stating explicitly because the real budget is what decides how
+ * long any single task may run without yielding to the 1 Hz heartbeat that
+ * calls HAL_WDT_vReset() (see PLATFORM_vHeartbeatDispatchTask).
  *
  * The IWDG cannot be stopped after it is started; period changes are
  * reflected by re-initialising with the new prescaler.

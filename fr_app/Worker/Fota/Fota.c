@@ -43,7 +43,6 @@
 #include "cmsis_os2.h"
 #include "stm32wlxx_hal.h"
 #include "dbg_log.h"
-#include "Log.h"          /* LOG_vSuspend — quiesce flash logging during OTA */
 
 #include <string.h>
 #include <stdio.h>
@@ -738,20 +737,20 @@ bool FOTA_bUartAcquire(void)
             (unsigned long)u32Version, (unsigned long)u32FileBytes);
 
     /* Own the flash for the whole acquire, exactly as vDistribute and
-     * vSecondaryReceive already do — this path was the odd one out. Two
-     * distinct reasons, both of which bit us:
-     *   - LOG_vSuspend: the DbgLog consumer writes this same chip from
-     *     another task, interleaving log pages with image pages for ~40 s.
-     *   - InhibitDeepPowerDown: that same consumer parks the chip in DPD
-     *     when it finishes a drain, and a park landing on top of an
-     *     in-flight image page program truncates that page.
-     * Every exit below must undo both. */
+     * vSecondaryReceive already do — this path was the odd one out. The
+     * DbgLog consumer parks this chip in deep power-down when it finishes a
+     * drain, and a park landing on top of an in-flight image page program
+     * truncates that page. Every exit below must undo the inhibit.
+     *
+     * There was a LOG_vSuspend(true) here too, to stop that consumer writing
+     * log pages between image pages. It was removed because it never did
+     * anything (LOG_vWrite never read the flag) and is not needed: the log
+     * writer is confined to the log partition, far above the OTA scratch, and
+     * the flash mutex serialises the transactions themselves. */
     FLASH_vInhibitDeepPowerDown(true);
-    LOG_vSuspend(true);
 
     if (!FOTA_bEraseScratch())
     {
-        LOG_vSuspend(false);
         FLASH_vInhibitDeepPowerDown(false);
         (void)FARMRANGER_bFwReportDone(false);
         return false;
@@ -768,7 +767,6 @@ bool FOTA_bUartAcquire(void)
         if (!FOTA_bFetchAndStoreBlock(u32Offset, u16Len))
         {
             DBG_LOG("Fota: acquire FAILED\r\n");
-            LOG_vSuspend(false);
             FLASH_vInhibitDeepPowerDown(false);
             (void)FARMRANGER_bFwReportDone(false);
             return false;
@@ -802,7 +800,6 @@ bool FOTA_bUartAcquire(void)
          * a state-consistency fix. */
         if (!FOTA_bEraseScratch())
             DBG_LOG("Fota: scratch erase after acquire xor mismatch FAILED\r\n");
-        LOG_vSuspend(false);
         FLASH_vInhibitDeepPowerDown(false);
         (void)FARMRANGER_bFwReportDone(false);
         return false;
@@ -810,7 +807,6 @@ bool FOTA_bUartAcquire(void)
 
     if (!FOTA_bCommitMetadata(u32Version, u32StopAddr, u8Xor))
     {
-        LOG_vSuspend(false);
         FLASH_vInhibitDeepPowerDown(false);
         DBG_LOG("Fota: metadata commit FAILED\r\n");
         (void)FARMRANGER_bFwReportDone(false);
@@ -819,7 +815,6 @@ bool FOTA_bUartAcquire(void)
 
     /* Image and metadata are both committed — hand the chip back to the
      * logger so the lines below are actually persisted. */
-    LOG_vSuspend(false);
     FLASH_vInhibitDeepPowerDown(false);
 
     DBG_LOG("Fota: image v%lu stored OK (size=%luB, xor=0x%02X, map 0x%08lX..0x%08lX)\r\n",
@@ -1425,7 +1420,6 @@ void FOTA_vDistribute(void)
      * is what made the primary transmit a differently-corrupted image every
      * session. Released at every exit below. */
     FLASH_vInhibitDeepPowerDown(true);
-    LOG_vSuspend(true);
     bDistributeActive = true;
 
     uint16_t u16Total = (uint16_t)((tMeta.u32SizeBytes + OTA_LORA_CHUNK_LEN - 1U)
@@ -1465,7 +1459,6 @@ void FOTA_vDistribute(void)
         {
             DBG_LOG("Fota: another primary distributing - deferring to next wake\r\n");
             bDistributeActive = false;
-            LOG_vSuspend(false);
             FLASH_vInhibitDeepPowerDown(false);
             return;
         }
@@ -1559,7 +1552,6 @@ void FOTA_vDistribute(void)
         }
 
         bDistributeActive = false;
-        LOG_vSuspend(false);
         FLASH_vInhibitDeepPowerDown(false);
         return;
     }
@@ -1589,7 +1581,6 @@ void FOTA_vDistribute(void)
     {
         DBG_LOG("Fota: no targets joined\r\n");
         bDistributeActive = false;
-        LOG_vSuspend(false);
         FLASH_vInhibitDeepPowerDown(false);
         return;
     }
@@ -1773,7 +1764,6 @@ void FOTA_vDistribute(void)
     }
 
     bDistributeActive = false;
-    LOG_vSuspend(false);
     FLASH_vInhibitDeepPowerDown(false);
 }
 
@@ -1864,11 +1854,9 @@ void FOTA_vSecondaryReceive(void)
     /* Keep the NOR flash awake for the whole receive+verify session — same
      * DPD-wake read-corruption reason as the primary's distribute path. */
     FLASH_vInhibitDeepPowerDown(true);
-    LOG_vSuspend(true);
 
     if (!FOTA_bEraseScratch())
     {
-        LOG_vSuspend(false);
         FLASH_vInhibitDeepPowerDown(false);
         return;
     }
@@ -1995,7 +1983,6 @@ void FOTA_vSecondaryReceive(void)
                 }
             }
             bRxSessionActive = false;
-            LOG_vSuspend(false);
             FLASH_vInhibitDeepPowerDown(false);
             return;
         }
@@ -2003,7 +1990,6 @@ void FOTA_vSecondaryReceive(void)
         {
             DBG_LOG("Fota: session hard cap - abort\r\n");
             bRxSessionActive = false;
-            LOG_vSuspend(false);
             FLASH_vInhibitDeepPowerDown(false);
             return;
         }
@@ -2072,7 +2058,6 @@ void FOTA_vSecondaryReceive(void)
 
         (void)MESHNETWORK_bSendOtaResponse(au8Rpt, sizeof(au8Rpt));
         bRxSessionActive = false;
-        LOG_vSuspend(false);
         FLASH_vInhibitDeepPowerDown(false);
         return;
     }
@@ -2082,7 +2067,6 @@ void FOTA_vSecondaryReceive(void)
                               u8Xor))
     {
         bRxSessionActive = false;
-        LOG_vSuspend(false);
         FLASH_vInhibitDeepPowerDown(false);
         return;
     }
@@ -2093,7 +2077,6 @@ void FOTA_vSecondaryReceive(void)
     osDelay(2000);   /* let the (jittered) report leave the radio */
 
     bRxSessionActive = false;
-    LOG_vSuspend(false);
     FLASH_vInhibitDeepPowerDown(false);
     FOTA_vArmBootloaderAndReset(tPrep.u32Version);
 }

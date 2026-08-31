@@ -37,17 +37,6 @@ static uint32_t u32WriteAddr;
 static uint32_t u32StartAddr;
 static bool     bWrapped;
 
-/* When true, LOG_vWrite() skips the flash entirely (UART logging is
- * unaffected — it runs on a separate path in the DbgLog consumer). Set for
- * the duration of an OTA session so logger flash writes never interleave
- * with the OTA image reads on the shared device. See LOG_vSuspend(). */
-static volatile bool bLogSuspended = false;
-
-void LOG_vSuspend(bool bSuspend)
-{
-    bLogSuspended = bSuspend;
-}
-
 /* -------------------------------------------------------------------------- */
 
 /*
@@ -166,11 +155,15 @@ void LOG_vInit(void)
  */
 void LOG_vWrite(const char *buf, uint16_t len)
 {
-    /* NOTE: bLogSuspended is currently NOT honored here — suspending flash
-     * logging during OTA was tried and did not fix the transfer corruption
-     * (the read-priming fix in FOTA_bSendChunk did), and it blinded the
-     * field-collected primary log for the whole OTA window. Kept the flag/
-     * API in place (harmless) in case a future change wants it. */
+    /* There is deliberately no "suspend flash logging during OTA" path here.
+     * A LOG_vSuspend()/bLogSuspended flag used to exist and was never read by
+     * this function, so its three OTA call sites implied a protection that did
+     * not exist. It has been removed rather than implemented: suspending was
+     * tried, did not fix the transfer corruption (the read-priming fix in
+     * FOTA_bSendChunk did), and it blinded the field-collected primary log for
+     * the whole OTA window. It also cannot corrupt an image — every write here
+     * is confined to the log partition by the range check below, which is far
+     * above the OTA scratch area. */
     uint16_t off = 0U;
 
     while (off < len)
