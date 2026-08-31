@@ -1444,12 +1444,49 @@ void FOTA_vDistribute(void)
         }
     }
 
+#ifdef OTA_DIAG_QUIESCE_BEFORE_PRESEND
+    /* CONTROL EXPERIMENT — temporary, remove once it has answered.
+     *
+     * Hypothesis under test: the occasional bad pre-send verify pass is the
+     * documented rail sag (OTA_LORA_CHUNK_GAP_MS) from an SX126x TX landing
+     * inside the pass. The structural case: DEVICE_DISCOVERY_vSendTS() runs
+     * ~20 ms before this function (DeviceDiscovery.c, "Sent BEFORE the OTA
+     * check"), MESHNETWORK_bSendPacket only ENQUEUES with 20-1500 ms of
+     * jitter, the backoff loop above yields in osDelay(100) so the radio task
+     * gets to fire the PA, and the verify below is then a ~1.5-2 s gap-free
+     * burst of 484 flash reads with no settle protection - the only
+     * whole-image read in this file without it.
+     *
+     * So: drain the TX queue and wait out a settle window 20x the ~65 ms that
+     * was measured as sufficient, making it impossible for that TimeSync's RF
+     * pulse to land inside the pass. Queue-idle alone is not enough - a packet
+     * already dequeued can still be in carrier sense - hence the fixed wait
+     * after it as well.
+     *
+     * Read the result off the "xor FAILPASS" / "recovered on attempt" lines
+     * over ~20 campaigns: gone => confirmed, and the real fix is ordering (do
+     * this verify before the TimeSync is queued at all, not by adding a
+     * sleep). Unchanged rate => hypothesis dead, look at the read path. */
+    {
+        uint32_t u32QStart = osKernelGetTickCount();
+        while (!LORARADIO_bTxQueueIdle() &&
+               ((osKernelGetTickCount() - u32QStart) < OTA_DIAG_QUIESCE_DRAIN_MAX_MS))
+            osDelay(50);
+
+        DBG_LOG("Fota: DIAG quiesce - txQueueIdle=%u after %lu ms, settling %u ms\r\n",
+                (unsigned)(LORARADIO_bTxQueueIdle() ? 1U : 0U),
+                (unsigned long)(osKernelGetTickCount() - u32QStart),
+                (unsigned)OTA_DIAG_QUIESCE_SETTLE_MS);
+
+        osDelay(OTA_DIAG_QUIESCE_SETTLE_MS);
+    }
+#endif
+
     /* Re-verify our OWN stored copy immediately before every send, not just
      * once at acquire time: a single scan can occasionally return a wrong
-     * value while the stored bytes are fine (a transient SPI/flash read
-     * glitch), and an immediate re-read recovers the correct value — see
-     * FOTA_bVerifyImageXorRetry. Only a mismatch that survives every retry
-     * means the primary's own copy has actually drifted. */
+     * value while the stored bytes are fine, and an immediate re-read recovers
+     * the correct value — see FOTA_bVerifyImageXorRetry. Only a mismatch that
+     * survives every retry means the primary's own copy has actually drifted. */
     uint8_t u8PreSendXor;
     bool bPreSendOk = FOTA_bVerifyImageXorRetry(0U, tMeta.u32SizeBytes, tMeta.u8Xor8, &u8PreSendXor);
 

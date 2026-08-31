@@ -222,4 +222,24 @@ typedef struct
                                                      recently (~one PREP burst:
                                                      REPEATS 5 * GAP 1000 ms)       */
 
+/* ---- Control experiment: is the bad pre-send verify pass a LoRa rail sag? --
+ *
+ * TEMPORARY. Define OTA_DIAG_QUIESCE_BEFORE_PRESEND to make FOTA_vDistribute
+ * drain the LoRa TX queue and wait out a long settle window before the
+ * pre-send whole-image verify, so no TX can fire inside the pass. See the
+ * block at that site for the hypothesis and how to read the result.
+ *
+ * Commented out by default: leaving it on hides the fault being investigated,
+ * and the permanent fix (if it confirms) is to reorder the verify ahead of the
+ * TimeSync rather than to sleep here. */
+/* #define OTA_DIAG_QUIESCE_BEFORE_PRESEND */
+
+#define OTA_DIAG_QUIESCE_DRAIN_MAX_MS     3000U   /* cap on waiting for the TX
+                                                     queue to empty, so a stuck
+                                                     backlog cannot stall the
+                                                     campaign indefinitely      */
+#define OTA_DIAG_QUIESCE_SETTLE_MS        2000U   /* ~30x the ~65 ms measured as
+                                                     sufficient in
+                                                     OTA_LORA_CHUNK_GAP_MS      */
+
 #endif /* WORKER_FOTA_FOTA_CONFIG_H_ */
