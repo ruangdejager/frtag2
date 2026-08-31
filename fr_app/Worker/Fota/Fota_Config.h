@@ -222,24 +222,38 @@ typedef struct
                                                      recently (~one PREP burst:
                                                      REPEATS 5 * GAP 1000 ms)       */
 
-/* ---- Control experiment: is the bad pre-send verify pass a LoRa rail sag? --
+/* ---- Radio quiet window before a whole-image XOR verify pass ---------------
  *
- * TEMPORARY. Define OTA_DIAG_QUIESCE_BEFORE_PRESEND to make FOTA_vDistribute
- * drain the LoRa TX queue and wait out a long settle window before the
- * pre-send whole-image verify, so no TX can fire inside the pass. See the
- * block at that site for the hypothesis and how to read the result.
+ * The SX126x PA's current spike sags the shared supply rail, and a flash read
+ * issued too soon after a TX reads back corrupted bytes while the stored bytes
+ * are fine - hardware-confirmed, see OTA_LORA_CHUNK_GAP_MS above (15 ms of
+ * settle was not enough, ~65 ms was, 100 ms was called comfortable). A
+ * whole-image XOR pass is ~1.5 s of gap-free reads at the SPI2 rate this
+ * device runs at, so a single TX landing anywhere inside it spoils the pass.
  *
- * Commented out by default: leaving it on hides the fault being investigated,
- * and the permanent fix (if it confirms) is to reorder the verify ahead of the
- * TimeSync rather than to sleep here. */
-/* #define OTA_DIAG_QUIESCE_BEFORE_PRESEND */
-
-#define OTA_DIAG_QUIESCE_DRAIN_MAX_MS     3000U   /* cap on waiting for the TX
-                                                     queue to empty, so a stuck
-                                                     backlog cannot stall the
-                                                     campaign indefinitely      */
-#define OTA_DIAG_QUIESCE_SETTLE_MS        2000U   /* ~30x the ~65 ms measured as
-                                                     sufficient in
-                                                     OTA_LORA_CHUNK_GAP_MS      */
+ * CONFIRMED IN THE FIELD, 2026-08-31: two bad pre-send passes, both with every
+ * chunk read reporting success (readOk=1 rdFails=0 hal=0 - so corrupted bytes,
+ * not a transport failure) and the PA firing 270 ms and 336 ms into a ~1550 ms
+ * pass. The one campaign in the same run whose random backoff happened to let
+ * the TimeSync transmit before the pass started verified first time.
+ *
+ * Note this cannot be fixed by reordering. The offending TX is not one the
+ * FOTA code issues: DeviceDiscovery queues a TimeSync ~20 ms before calling
+ * FOTA_vDistribute, MESHNETWORK_bSendPacket only stamps it with 20-1500 ms of
+ * jitter, and the radio task fires the PA whenever carrier sense lets it. The
+ * packet is already in flight before any FOTA code runs, so the verify has to
+ * wait it out - the same thing every other whole-image read here already does. */
+#define OTA_VERIFY_TX_SETTLE_MS            150U   /* quiet time required before
+                                                     starting a pass; 1.5x the
+                                                     100 ms already judged
+                                                     comfortable margin for
+                                                     OTA_LORA_CHUNK_GAP_MS     */
+#define OTA_VERIFY_TX_QUIET_MAX_MS        1500U   /* stop waiting and verify
+                                                     anyway past this - just
+                                                     over MESH_TX_JITTER_MAX_MS.
+                                                     A busy radio must never
+                                                     stall a campaign; the
+                                                     retry budget still covers
+                                                     a spoiled pass.           */
 
 #endif /* WORKER_FOTA_FOTA_CONFIG_H_ */

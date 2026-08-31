@@ -88,12 +88,16 @@ uint16_t LORARADIO_u16GetAndClearTxStaleDrops(void);
  * window with signed tick arithmetic so wrap is handled. */
 uint32_t LORARADIO_u32GetLastTxTick(void);
 
-/* True when nothing is waiting in the TX queue. Note this is NOT "the radio
- * is silent": a packet already dequeued can still be in carrier sense with
- * its transmission yet to happen. Callers that need actual quiet must drain
- * on this AND then wait out a settle window — see the pre-send verify in
- * FOTA_vDistribute. */
-bool     LORARADIO_bTxQueueIdle(void);
+/* True when no PA pulse is pending or recent: nothing queued, nothing already
+ * dequeued and awaiting carrier sense, and at least u32SettleMs has passed
+ * since the last transmission actually fired.
+ *
+ * Exists for callers whose work is disturbed by the TX current spike rather
+ * than by radio airtime — specifically the whole-image flash verify passes in
+ * Fota.c, where a TX landing mid-pass corrupts the bytes read back (see
+ * OTA_VERIFY_TX_SETTLE_MS and OTA_LORA_CHUNK_GAP_MS). Cheap: three reads of
+ * volatile state, no locking, safe to poll. */
+bool     LORARADIO_bTxQuiet(uint32_t u32SettleMs);
 
 /* Discard everything still queued for TX. Call when the work that queued it
  * is over (campaign end / before sleep): otherwise the radio task keeps

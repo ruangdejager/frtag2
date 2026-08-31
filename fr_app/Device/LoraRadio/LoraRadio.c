@@ -102,6 +102,16 @@ static volatile uint32_t gRadioPendingEvents = 0;
  * path. */
 static volatile uint32_t u32LastTxDoneTick = 0U;
 
+/* True from the moment a packet is committed to transmission until its PA
+ * pulse has actually fired (or the attempt was abandoned).
+ *
+ * The TX queue going empty is NOT sufficient to conclude the radio is about to
+ * stay quiet: carrier sense can hold an already-dequeued packet for up to
+ * LORA_TX_CARRIER_WAIT_MS before the PA fires, during which the queue reads as
+ * idle. Anything timing a quiet window off the queue alone would sail straight
+ * into that TX. */
+static volatile bool bTxInFlight = false;
+
 static uint8_t u8DevEUI[8];
 
 /* -------------------------------------------------------------------------- */
@@ -327,11 +337,17 @@ void LORARADIO_vRadioTask(void *arg)
 
                 u8Sent++;
 
+                /* Committed to sending this one: from here until the PA has
+                 * fired (or we give up below) the radio is not quiet, even
+                 * though the queue may now read as empty. */
+                bTxInFlight = true;
+
                 uint8_t crc = LORARADIO_u8CRC8_Calculate(pkt.buffer, pkt.length);
                 pkt.buffer[pkt.length++] = crc;
 
                 if (!LORARADIO_bCarrierSenseAndWait(LORA_TX_CARRIER_WAIT_MS))
                 {
+                    bTxInFlight = false;   /* abandoned - no PA pulse happened */
                     uint32_t stashed = LORARADIO_u32ConsumePendingEvents();
                     if (stashed)
                     {
@@ -347,6 +363,7 @@ void LORARADIO_vRadioTask(void *arg)
 
                 LORARADIO_DRIVER_bTransmitPayload(pkt.buffer, pkt.length);
                 u32LastTxDoneTick = osKernelGetTickCount();
+                bTxInFlight       = false;
                 LORARADIO_DRIVER_vEnterRxMode(0x00);
             }
         }
@@ -463,10 +480,23 @@ uint32_t LORARADIO_u32GetLastTxTick(void)
     return u32LastTxDoneTick;
 }
 
-bool LORARADIO_bTxQueueIdle(void)
+bool LORARADIO_bTxQuiet(uint32_t u32SettleMs)
 {
-    if (xLoRaTxQueue == NULL) return true;
-    return (osMessageQueueGetCount(xLoRaTxQueue) == 0U);
+    /* Ordered cheapest-first, and all three conditions are needed:
+     *  - in-flight covers a packet already dequeued and sitting in carrier
+     *    sense, which the queue count cannot see;
+     *  - queue count covers packets not yet picked up;
+     *  - the settle age covers a PA pulse that has just happened, which is the
+     *    whole point - the rail needs time to recover before a flash read. */
+    if (bTxInFlight) return false;
+
+    if ((xLoRaTxQueue != NULL) && (osMessageQueueGetCount(xLoRaTxQueue) != 0U))
+        return false;
+
+    if (u32LastTxDoneTick == 0U) return true;   /* nothing transmitted yet */
+
+    /* Unsigned difference, so tick wrap is handled. */
+    return ((osKernelGetTickCount() - u32LastTxDoneTick) >= u32SettleMs);
 }
 
 void LORARADIO_vFlushTxQueue(void)

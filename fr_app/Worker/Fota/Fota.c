@@ -345,20 +345,17 @@ static void FOTA_vDumpImageHead(void)
             acHex, (unsigned)u8Printable, (unsigned)sizeof(au8Head));
 }
 
-/* The full staged-image probe, run on every distribute/receive check rather
- * than only on a mismatch.
+/* Re-read the whole image twice more, at the two different chunk sizes, when a
+ * verify has already failed. Disagreement between the 64-byte and 224-byte
+ * passes points at the read path; agreement on a value that is not the
+ * expected one points at the stored bytes.
  *
- * Everything here used to be failure-gated, which is exactly why the
- * 2026-08-31 field run — five clean cycles and two recovered-on-attempt-2
- * events — produced no BLANKSCAN line and no view of offset 0 at all. A
- * diagnostic that only speaks when the check fails cannot establish what
- * "normal" looks like, so there is nothing to compare an eventual failure
- * against.
- *
- * Costs roughly three whole-image read passes (~1.5-2 s each at the SPI2
- * 750 kHz used for this device), on top of the verify's own. That is a
- * deliberate diagnostic-build tradeoff, not something to keep once the
- * transient is understood.
+ * Failure path only. It ran on every check while the 2026-08-31 transient was
+ * being characterised — which is what produced the evidence that identified it
+ * — but that question is answered, and two extra whole-image passes (~1.5 s
+ * each at the SPI2 rate this device runs at) is not worth paying on every
+ * campaign forever. FOTA_vDumpImageHead is the part cheap enough to keep
+ * unconditional, and the call sites invoke it directly for that reason.
  *
  * FOTA_vScanBlankRuns is deliberately NOT called from here — call sites
  * invoke the two as siblings. Nesting them would stack a 296-byte frame on
@@ -380,8 +377,32 @@ static void FOTA_vProbeImage(uint32_t u32Len, uint8_t u8ExpectedXor)
     if (!bOk64 || !bOk224)
         DBG_LOG("Fota: PROBE read failure at 0x%lX / 0x%lX\r\n",
                 (unsigned long)u32Fail64, (unsigned long)u32Fail224);
+}
 
-    FOTA_vDumpImageHead();
+/* Hold off a whole-image verify pass until the radio has been quiet for
+ * OTA_VERIFY_TX_SETTLE_MS - see that constant for the confirmed mechanism and
+ * the field evidence. Bounded by OTA_VERIFY_TX_QUIET_MAX_MS: a busy radio must
+ * never stall a campaign, and a pass spoiled anyway is still covered by the
+ * retry budget above.
+ *
+ * Costs nothing in the common case - if the radio is already quiet
+ * LORARADIO_bTxQuiet() returns true on the first test and this returns
+ * immediately without a single osDelay. */
+static void FOTA_vWaitRadioQuiet(void)
+{
+    uint32_t u32Start = osKernelGetTickCount();
+
+    while (!LORARADIO_bTxQuiet(OTA_VERIFY_TX_SETTLE_MS) &&
+           ((osKernelGetTickCount() - u32Start) < OTA_VERIFY_TX_QUIET_MAX_MS))
+        osDelay(20);
+
+    uint32_t u32Waited = osKernelGetTickCount() - u32Start;
+
+    /* Only worth a line when it actually gave up - a normal short wait is
+     * uninteresting and this runs on every verify attempt. */
+    if (!LORARADIO_bTxQuiet(OTA_VERIFY_TX_SETTLE_MS))
+        DBG_LOG("Fota: radio still busy after %lu ms - verifying anyway\r\n",
+                (unsigned long)u32Waited);
 }
 
 /* A full-image XOR pass can occasionally return a wrong value while the
@@ -395,19 +416,22 @@ static void FOTA_vProbeImage(uint32_t u32Len, uint8_t u8ExpectedXor)
  * need to agree with each other — any single match is proof the bytes are
  * correct and this pass's read was the fluke).
  *
- * WHAT CAUSES THE BAD PASS IS NOT YET ESTABLISHED. The previous wording here
- * asserted "a transient SPI/flash read glitch confirmed on hardware"; the
- * code could not actually tell that apart from a failed transfer, because
- * FOTA_u8CalcImageXorRangeBuf laundered read failures into a wrong checksum
- * byte and this function discarded the failing pass's value on the recovery
- * path. The leading theory is the documented rail sag from an SX126x TX
- * landing inside the pass (see OTA_LORA_CHUNK_GAP_MS: hardware-confirmed
- * that a flash read too soon after TX returns corrupt bytes, and this
- * pre-send verify is the one whole-image read in this file with no settle
- * protection). The instrumentation below exists to settle that: on any
- * failing pass it records what was computed, whether a chunk read actually
- * failed and where, how long the pass took, and when the PA last fired
- * relative to the pass window. */
+ * THE CAUSE IS NOW KNOWN: an SX126x TX firing inside the pass sags the shared
+ * rail and the flash reads back corrupted bytes. Confirmed in the field on
+ * 2026-08-31 — see OTA_VERIFY_TX_SETTLE_MS for the evidence. Each attempt
+ * therefore waits for the radio to go quiet first, which removes the cause
+ * rather than just retrying past it; the retry budget stays as the backstop
+ * for a TX that slips in anyway (the wait is bounded, and carrier sense means
+ * the radio is never guaranteed quiet).
+ *
+ * Earlier wording here asserted "a transient SPI/flash read glitch confirmed
+ * on hardware". That was never established, and could not be: the old code
+ * laundered read failures into a wrong checksum byte and discarded the failing
+ * pass's value on the recovery path, so a transport failure and corrupted
+ * bytes were indistinguishable. The FAILPASS line below is what separated
+ * them — readOk=1/rdFails=0 proved every read succeeded and the bytes were
+ * simply wrong, while txIntoPass put the PA inside the failing pass. Keep it:
+ * it is cheap (failure path only) and it is what would identify a regression. */
 #define FOTA_XOR_VERIFY_MAX_ATTEMPTS  8U
 
 static bool FOTA_bVerifyImageXorRetry(uint32_t u32Start, uint32_t u32Len,
@@ -442,6 +466,9 @@ static bool FOTA_bVerifyImageXorRetry(uint32_t u32Start, uint32_t u32Len,
 
     for (uint8_t u8Attempt = 0U; u8Attempt < FOTA_XOR_VERIFY_MAX_ATTEMPTS; u8Attempt++)
     {
+        /* Remove the known cause before reading, not after failing on it. */
+        FOTA_vWaitRadioQuiet();
+
         /* The continuous 224-byte read, matching the gap-free pattern the
          * bootloader and the clean PROBE use. */
         bool     bReadOk      = true;
@@ -1444,44 +1471,6 @@ void FOTA_vDistribute(void)
         }
     }
 
-#ifdef OTA_DIAG_QUIESCE_BEFORE_PRESEND
-    /* CONTROL EXPERIMENT — temporary, remove once it has answered.
-     *
-     * Hypothesis under test: the occasional bad pre-send verify pass is the
-     * documented rail sag (OTA_LORA_CHUNK_GAP_MS) from an SX126x TX landing
-     * inside the pass. The structural case: DEVICE_DISCOVERY_vSendTS() runs
-     * ~20 ms before this function (DeviceDiscovery.c, "Sent BEFORE the OTA
-     * check"), MESHNETWORK_bSendPacket only ENQUEUES with 20-1500 ms of
-     * jitter, the backoff loop above yields in osDelay(100) so the radio task
-     * gets to fire the PA, and the verify below is then a ~1.5-2 s gap-free
-     * burst of 484 flash reads with no settle protection - the only
-     * whole-image read in this file without it.
-     *
-     * So: drain the TX queue and wait out a settle window 20x the ~65 ms that
-     * was measured as sufficient, making it impossible for that TimeSync's RF
-     * pulse to land inside the pass. Queue-idle alone is not enough - a packet
-     * already dequeued can still be in carrier sense - hence the fixed wait
-     * after it as well.
-     *
-     * Read the result off the "xor FAILPASS" / "recovered on attempt" lines
-     * over ~20 campaigns: gone => confirmed, and the real fix is ordering (do
-     * this verify before the TimeSync is queued at all, not by adding a
-     * sleep). Unchanged rate => hypothesis dead, look at the read path. */
-    {
-        uint32_t u32QStart = osKernelGetTickCount();
-        while (!LORARADIO_bTxQueueIdle() &&
-               ((osKernelGetTickCount() - u32QStart) < OTA_DIAG_QUIESCE_DRAIN_MAX_MS))
-            osDelay(50);
-
-        DBG_LOG("Fota: DIAG quiesce - txQueueIdle=%u after %lu ms, settling %u ms\r\n",
-                (unsigned)(LORARADIO_bTxQueueIdle() ? 1U : 0U),
-                (unsigned long)(osKernelGetTickCount() - u32QStart),
-                (unsigned)OTA_DIAG_QUIESCE_SETTLE_MS);
-
-        osDelay(OTA_DIAG_QUIESCE_SETTLE_MS);
-    }
-#endif
-
     /* Re-verify our OWN stored copy immediately before every send, not just
      * once at acquire time: a single scan can occasionally return a wrong
      * value while the stored bytes are fine, and an immediate re-read recovers
@@ -1490,12 +1479,10 @@ void FOTA_vDistribute(void)
     uint8_t u8PreSendXor;
     bool bPreSendOk = FOTA_bVerifyImageXorRetry(0U, tMeta.u32SizeBytes, tMeta.u8Xor8, &u8PreSendXor);
 
-    /* Diagnostic: same probe as the secondary's receive-side check — see
-     * FOTA_vProbeImage. Runs on every check, not just on failure, so a field
-     * log always has it whether or not this particular pass mismatched.
-     * Sibling calls, not nested — see FOTA_vProbeImage on stack depth. */
-    FOTA_vProbeImage(tMeta.u32SizeBytes, tMeta.u8Xor8);
-    FOTA_vScanBlankRuns(tMeta.u32SizeBytes);
+    /* One 16-byte read, cheap enough to run on every campaign, and the
+     * permanent canary against the boot-log-over-image class of bug the
+     * LOG_vWrite range guard was added for. */
+    FOTA_vDumpImageHead();
 
     if (!bPreSendOk)
     {
@@ -1506,6 +1493,11 @@ void FOTA_vDistribute(void)
                 (unsigned)u8PreSendXor, (unsigned)tMeta.u8Xor8,
                 (unsigned)u8PreSendFailStreak,
                 (unsigned)OTA_PRESEND_FAIL_ERASE_THRESHOLD);
+
+        /* Two more whole-image passes at different chunk sizes. Only worth the
+         * ~3 s here, on the path that is about to start counting towards
+         * erasing a staged image. */
+        FOTA_vProbeImage(tMeta.u32SizeBytes, tMeta.u8Xor8);
 
         /* Bisect into quarters to localize which part of the image disagrees
          * — same technique as the secondary's receive-side mismatch. Turns
@@ -1528,13 +1520,14 @@ void FOTA_vDistribute(void)
             }
         }
 
-        /* The aborted-page-program test (FOTA_vScanBlankRuns) and the
-         * offset-0 dump used to be here, on the failure path only. They now
-         * run unconditionally in FOTA_vProbeImage above, so the BLANKSCAN and
-         * HEAD lines for this very campaign are already in the log a few
-         * lines up — no need to re-read the whole image to repeat them.
-         *
-         * Do NOT erase on the first failures. The in-function retry budget
+        /* Direct test of the aborted-page-program theory — see
+         * FOTA_vScanBlankRuns. Sibling call to FOTA_vProbeImage above, not
+         * nested inside it, on stack-depth grounds. Field runs so far report
+         * blankPages=0 partialTail=0 every time, i.e. storage is fully written
+         * and faults are read-time; a nonzero count here would overturn that. */
+        FOTA_vScanBlankRuns(tMeta.u32SizeBytes);
+
+        /* Do NOT erase on the first failures. The in-function retry budget
          * only defends against a glitch WITHIN one verify pass; a supply-rail
          * transient can just as easily spoil every attempt of a single pass
          * while the stored bytes are perfectly fine — and this board has a
@@ -2016,17 +2009,16 @@ void FOTA_vSecondaryReceive(void)
         }
     }
 
-    /* Diagnostic: same probe as the primary's pre-send check — see
-     * FOTA_vProbeImage. Sibling calls, not nested, on stack-depth grounds. */
-    FOTA_vProbeImage(tPrep.u32ImageSize, tPrep.u8ImageXor);
-    FOTA_vScanBlankRuns(tPrep.u32ImageSize);
-
-    /* Retried: confirmed on hardware that a single scan can occasionally
-     * return a wrong value while the stored bytes are fine (a transient
-     * SPI/flash read glitch — see FOTA_bVerifyImageXorRetry). Only a
-     * mismatch that survives every retry is treated as a real failure. */
+    /* Retried, and each attempt waits for the radio to go quiet first: a TX
+     * firing inside a pass sags the rail and corrupts the bytes read back
+     * while the stored image is fine (see OTA_VERIFY_TX_SETTLE_MS and
+     * FOTA_bVerifyImageXorRetry). Only a mismatch that survives every attempt
+     * is treated as a real failure. */
     uint8_t u8Xor;
     bool bValid = FOTA_bVerifyImageXorRetry(0U, tPrep.u32ImageSize, tPrep.u8ImageXor, &u8Xor);
+
+    /* Cheap permanent canary — see the matching call in FOTA_vDistribute. */
+    FOTA_vDumpImageHead();
 
     uint8_t au8Rpt[OTA_PKT_REPORT_LEN];
     au8Rpt[0] = (uint8_t)MeshPktType_OtaReport;
@@ -2037,8 +2029,14 @@ void FOTA_vSecondaryReceive(void)
 
     if (!bValid)
     {
-        DBG_LOG("Fota: image XOR mismatch (0x%02X != 0x%02X) after 3 attempts\r\n",
-                u8Xor, tPrep.u8ImageXor);
+        DBG_LOG("Fota: image XOR mismatch (0x%02X != 0x%02X) after %u attempts\r\n",
+                u8Xor, tPrep.u8ImageXor, (unsigned)FOTA_XOR_VERIFY_MAX_ATTEMPTS);
+
+        /* Two more whole-image passes at different chunk sizes, plus the
+         * blank-run scan. Failure path only — see FOTA_vProbeImage. Sibling
+         * calls, not nested, on stack-depth grounds. */
+        FOTA_vProbeImage(tPrep.u32ImageSize, tPrep.u8ImageXor);
+        FOTA_vScanBlankRuns(tPrep.u32ImageSize);
 
         /* Every chunk passed its own LoRa packet CRC and the receive
          * bitmap says complete, yet the whole-image XOR disagrees — either
