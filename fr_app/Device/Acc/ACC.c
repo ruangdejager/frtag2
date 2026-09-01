@@ -181,7 +181,41 @@ uint8_t ACC_u8GetDeviceId(void)
  * -------------------------------------------------------------------------- */
 bool ACC_bDeviceIdOk(void)
 {
-    return (ACC_u8GetDeviceId() == ACC_WHO_AM_I_VALUE);
+    return ACC_bDeviceIdOkEx(NULL, NULL);
+}
+
+bool ACC_bDeviceIdOkEx(uint8_t *pu8Id, uint8_t *pu8Attempts)
+{
+    uint8_t u8Id  = 0U;
+    bool    bOk   = false;
+    uint8_t u8Try = 0U;
+
+    /* Retried, not single-shot — same reasoning as FLASH_bVerifyDeviceEx.
+     * A lone WHO_AM_I read is not trustworthy on this board: a supply-rail
+     * sag from a concurrent radio/GPS current spike corrupts one read of a
+     * perfectly healthy part, and the first read after HAL_SPI_ACC_vSelect()
+     * re-inits a parked bus is the most exposed of all. Calling that "ACC
+     * FAIL" is the same false negative the flash test used to produce.
+     *
+     * The raw byte goes back to the caller so a real failure is diagnosable:
+     *   0x00 -> no clock/data (AF, wiring, bus not restored)
+     *   0xFF -> MISO idle / CS never asserted
+     *   else -> CPOL/CPHA, timing, or genuinely the wrong part */
+    for (u8Try = 1U; u8Try <= ACC_WHO_AM_I_READ_ATTEMPTS; u8Try++)
+    {
+        u8Id = ACC_u8GetDeviceId();
+        if (u8Id == ACC_WHO_AM_I_VALUE) { bOk = true; break; }
+
+        osDelay(2);   /* let the rail settle before re-reading */
+    }
+
+    if (pu8Id != NULL)
+        *pu8Id = u8Id;
+    if (pu8Attempts != NULL)
+        *pu8Attempts = (u8Try > ACC_WHO_AM_I_READ_ATTEMPTS)
+                     ? ACC_WHO_AM_I_READ_ATTEMPTS : u8Try;
+
+    return bOk;
 }
 
 /* --------------------------------------------------------------------------

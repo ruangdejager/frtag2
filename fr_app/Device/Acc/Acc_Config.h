@@ -10,6 +10,11 @@
 
 #define ACC_WHO_AM_I_VALUE          LIS2DH_WHO_AM_I_VALUE
 
+/* WHO_AM_I read attempts before declaring the part absent/faulty. Mirrors
+ * FLASH_JEDEC_READ_ATTEMPTS and for the same reason: one bad read on this
+ * board is a rail transient, not a dead accelerometer. */
+#define ACC_WHO_AM_I_READ_ATTEMPTS  5U
+
 #define ACC_WHO_AM_I                LIS2DH_WHO_AM_I
 #define ACC_CTRL_REG0               LIS2DH_CTRL_REG0
 #define ACC_TEMP_CFG_REG            LIS2DH_TEMP_CFG_REG

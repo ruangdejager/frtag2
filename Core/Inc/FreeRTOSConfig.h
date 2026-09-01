@@ -79,7 +79,17 @@
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0
 #define configUSE_MUTEXES                        1
-#define configQUEUE_REGISTRY_SIZE                8
+/* 8 -> 0: this registry exists purely for an RTOS-aware debugger to show
+ * queue/mutex/semaphore names. Every osMutexNew/osMessageQueueNew/
+ * osSemaphoreNew call in this codebase passes a NULL attr (grep confirms
+ * it - none ever assign a name), so vQueueAddToRegistry is never actually
+ * invoked and the array queue.c allocates for it
+ * (xQueueRegistry[configQUEUE_REGISTRY_SIZE]) sat there fully unused,
+ * costing 8 B/slot. queue.c wraps the whole array in
+ * "#if (configQUEUE_REGISTRY_SIZE > 0)", so 0 removes it entirely rather
+ * than just zeroing its length - reclaims the full 64 B with no behavior
+ * change (there was never anything TO see in a debugger's queue view). */
+#define configQUEUE_REGISTRY_SIZE                0
 #define configUSE_RECURSIVE_MUTEXES              1
 #define configUSE_COUNTING_SEMAPHORES            1
 #define configUSE_PORT_OPTIMISED_TASK_SELECTION  0

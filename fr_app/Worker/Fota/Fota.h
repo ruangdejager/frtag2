@@ -152,6 +152,19 @@ void FOTA_vDropStalePrep(void);
  * every secondary arms for firmware that never arrives. The image itself is
  * kept (see OTA_PRESEND_FAIL_ERASE_THRESHOLD) — this is only about what we
  * advertise. */
+/* Does the staged image's own fw_info record agree with the version it is being
+ * staged, distributed or installed under? Every other version the tag sees is
+ * an assertion BY something (an fr9 manifest, an AT+FWREQ answer, a LoRa Prep
+ * header); this is the only one that travels inside the payload and so cannot
+ * be wrong while the payload is right.
+ *
+ * Returns false if the versions differ, if the scratch read fails, or if the
+ * record is blank — all of which mean "identity not established", which callers
+ * must treat as a rejection. pu32Actual (optional) receives the version the
+ * image declares, or 0 when it could not be read, purely so the caller can log
+ * what it actually found. */
+bool FOTA_bStagedImageIsVersion(uint32_t u32Claimed, uint32_t *pu32Actual);
+
 bool FOTA_bStagedImageTrusted(void);
 
 /* --------------------------------------------------------------------------

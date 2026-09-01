@@ -27,6 +27,7 @@
 #include "flashLog.h"
 #include "str.h"
 #include "version_config.h"   /* VERSION_u32Get() — primary's own running version */
+#include "LoraRadio.h"        /* LORA_NOISE_FLOOR_INVALID — AT+RTLOG rows */
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -780,6 +781,165 @@ bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
 
     DBG_LOG("LogData: all %u attempts failed\r\n", FR_LOG_ATTEMPTS);
     return false;
+}
+
+/* --------------------------------------------------------------------------
+ * R&D radio-test upload (AT+RTLOG)
+ *
+ * A deliberate copy of the AT+LOG shape rather than a reuse of it. The
+ * discovery upload is the primary's core job; giving the radio test its own
+ * command and its own attempt function means no edit to bLogAttempt, no new
+ * branch inside it, and nothing about a normal campaign that can change
+ * because this R&D feature exists. The cost is ~60 duplicated lines, which is
+ * the right trade here.
+ * -------------------------------------------------------------------------- */
+
+/* "DeviceId,Seq,RSSI,SNR,NoiseFloor,Margin,Missed<tab>" — worst case ~48 chars. */
+#define FR_RT_ROW_MAX 64
+
+/* NoiseFloor value meaning "no sample taken yet". Must match
+ * FRTAG_RTLOG_NF_NONE in the fr9's frtag.c, which prints it as "nf=n/a".
+ * INT16_MIN, chosen because it can never be a real dBm reading. */
+#define FR_RT_NF_NONE (-32768)
+
+/* Format one measured beacon. Field order must match FRTAG_vRtLogEmitRow on
+ * the fr9 — the two are a wire contract and neither can change alone.
+ *
+ * Carries only what the fr9 prints. Margin is rssi - noiseFloor, derivable by
+ * whoever reads the log; missed beacons are visible as gaps in Seq, which is
+ * what Seq is for. Sending either would be sending a number that has to stay
+ * consistent with two others across a wire, to save an arithmetic operation
+ * on the reader's side. */
+static int FARMRANGER_iFormatRtRow(char *row, const FarmrangerRtBeacon_t *b)
+{
+    int iNf = (b->i16NoiseFloor != LORA_NOISE_FLOOR_INVALID)
+              ? (int)b->i16NoiseFloor
+              : FR_RT_NF_NONE;
+
+    return snprintf(row, FR_RT_ROW_MAX,
+                    "%X,%lu,%d,%d,%d\t",
+                    (unsigned int)b->u32DeviceId,
+                    (unsigned long)b->u32Seq,
+                    b->i16Rssi,
+                    b->i8Snr,
+                    iNf);
+}
+
+/* One AT+RTLOG upload attempt: handshake, paced row stream, verdict — the
+ * same three steps as FARMRANGER_bLogAttempt. */
+static bool FARMRANGER_bRtLogAttempt(const FarmrangerRtBeacon_t *pBeacons,
+                                     uint16_t u16Count, size_t pos)
+{
+    char row[FR_RT_ROW_MAX];
+    char cmd[40];
+    char respBuf[32] = {0};
+
+    snprintf(cmd, sizeof(cmd), "AT+RTLOG=%u,%lu\r\n",
+             (unsigned)pos, (unsigned long)VERSION_u32Get());
+
+    /* Step 1. No count==0 case to special-case, unlike AT+LOG: the caller
+     * never flushes an empty batch (see the RadioTest task's flush). */
+    if (!FARMRANGER_bATSend(cmd,
+                            FARMRANGER_bParseLoggerReady,
+                            respBuf,
+                            sizeof(respBuf),
+                            respBuf,
+                            1000))
+    {
+        DBG_LOG("RtLog: no 'Logger ready' (Step 1 fail)\r\n");
+        return false;
+    }
+
+    /* Step 2: paced row stream, bounding in-flight data to one row so the
+     * fr9's 128-byte RX ring cannot overflow. Same reasoning as AT+LOG. */
+    for (uint16_t i = 0U; i < u16Count; i++)
+    {
+        int n = FARMRANGER_iFormatRtRow(row, &pBeacons[i]);
+        if (n <= 0 || n >= (int)sizeof(row))
+            return false;
+
+        HAL_UART_vTxPutBuffer(&farmranger.UartHandle, (uint8_t *)row, (uint16_t)n);
+
+        uint32_t u32TxStart = osKernelGetTickCount();
+        while (!HAL_UART_bTxIdle(&farmranger.UartHandle))
+        {
+            if ((osKernelGetTickCount() - u32TxStart) >= 3500U)
+            {
+                DBG_LOG("RtLog: UART TX timeout\r\n");
+                return false;
+            }
+            osDelay(1);
+        }
+
+        osDelay(FR_LOG_ROW_GAP_MS);
+    }
+
+    /* Step 3: verdict, read inline off xLineQueue rather than via bATSend,
+     * which would reset the queue. Same rationale as the AT+LOG path. */
+    char       cVerdict    = 0;
+    uint32_t   u32Start    = osKernelGetTickCount();
+    bool       bGotVerdict = false;
+    FrRxLine_t line;
+
+    while ((osKernelGetTickCount() - u32Start) < FR_LOG_VERDICT_MS)
+    {
+        if (osMessageQueueGet(xLineQueue, &line, NULL, 50U) == osOK)
+        {
+            if (FARMRANGER_bParseLogVerdict(line.data, &cVerdict))
+            {
+                bGotVerdict = true;
+                break;
+            }
+        }
+    }
+
+    if (!bGotVerdict)
+    {
+        DBG_LOG("RtLog: no verdict (Step 3 timeout)\r\n");
+        return false;
+    }
+    if (cVerdict != 'O')
+    {
+        DBG_LOG("RtLog: fr9 reported ERR (bytes lost)\r\n");
+        return false;
+    }
+    return true;
+}
+
+bool FARMRANGER_bLogRadioTestData(const FarmrangerRtBeacon_t *pBeacons,
+                                  uint16_t u16Count)
+{
+    char   row[FR_RT_ROW_MAX];
+    size_t pos = 0;
+
+    if (pBeacons == NULL || u16Count == 0U)
+        return false;
+
+    /* Pass 1: total payload length, which AT+RTLOG needs up front. */
+    for (uint16_t i = 0U; i < u16Count; i++)
+    {
+        int n = FARMRANGER_iFormatRtRow(row, &pBeacons[i]);
+        if (n <= 0 || n >= (int)sizeof(row))
+            return false;
+        pos += (size_t)n;
+    }
+
+    /* One attempt only, unlike the discovery upload's three.
+     *
+     * This is called once per beacon, in line with a 5 s beacon cadence. A
+     * failed attempt already costs FR_LOG_VERDICT_MS (6.5 s) — that wait is
+     * not negotiable, because it has to outlast the fr9's own 5 s silence
+     * timeout before the next AT+RTLOG can safely go out, or the fr9 would
+     * still be in its payload state and would swallow the command text as
+     * payload. Retrying inside here would stack another 6.5 s on top and put
+     * us two or three beacons behind the live stream, to recover one row.
+     *
+     * Falling behind is the worse failure: the terminal log still holds every
+     * beacon, and a gap in the fr9 copy is visible in the Seq column anyway.
+     * The caller recycles the fr9 session and retries once — see the radio
+     * test's per-beacon logging — which covers the failure that is actually
+     * worth recovering, a session that has timed out. */
+    return FARMRANGER_bRtLogAttempt(pBeacons, u16Count, pos);
 }
 
 /* --------------------------------------------------------------------------

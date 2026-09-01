@@ -78,12 +78,14 @@
 #include "version_config.h"
 #include "DbgLog.h"
 #include "SelfTest.h"
+#include "RadioTestMode.h"     /* R&D radio link/range test (tag radiotest) */
 #include "stm32wlxx_hal.h"     /* TAMP->BKP2R for the bootloader version    */
 #ifdef STORAGE_BACKEND_MICROSD
 #  include "AccLog.h"
 #endif
 #ifdef STORAGE_BACKEND_FLASH
 #  include "Fota.h"
+#  include "Flash.h"          /* flash health query / on-demand recovery   */
 #endif
 
 #if defined(FRKERNEL_INTERFACE_UART) || defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
@@ -226,7 +228,7 @@ static bool FRKERNEL_bQueryOnlyCmd(const char *p)
 {
     static const char *const apacQueries[] = {
         "-help", "juice", "fwver", "discovery schedule",
-        "flash stream", "sd log stream",
+        "flash stream", "sd log stream", "flash",
         "selftest", "selftest gps", "selftest acc", "selftest flash",
     };
     for (size_t i = 0U; i < (sizeof(apacQueries) / sizeof(apacQueries[0])); i++)
@@ -389,12 +391,19 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                 "  tag -help                   list commands\r\n"
                 "  tag fwver                   app + bootloader version\r\n"
                 "  tag juice                   battery + solar panel voltage (mV)\r\n"
-                "  tag selftest                boot-time gps/acc/flash results\r\n"
-                "  tag selftest gps|acc|flash  single boot-time result\r\n"
+                "  tag selftest                gps/acc results + live flash state\r\n"
+                "  tag selftest gps|acc|flash  single result\r\n"
+#ifdef STORAGE_BACKEND_FLASH
+                "  tag flash                   ext-flash health (gate, ids, faults)\r\n"
+                "  tag flash recover           force a flash re-probe + bring-up\r\n"
+#endif
                 "  tag discovery schedule      wakeup interval (min)\r\n"
                 "  tag discovery schedule <N>  set wakeup interval (15/30/60/120/240 min)\r\n"
                 "  tag prodsleep               enter production sleep (secondary only)\r\n"
                 "  tag solarsleep              as prodsleep, shake-to-wake only\r\n"
+                "  tag radiotest               R&D range test (2nd: beacon+shake to exit,\r\n"
+                "                              1st: listen+log to fr9)\r\n"
+                "  tag radio stop              end the range test (primary)\r\n"
                 "  tag release                 release device for sleep\r\n"
             );
         }
@@ -407,12 +416,19 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                 "  tag <ID> -help              list commands\r\n"
                 "  tag <ID> fwver              app + bootloader version\r\n"
                 "  tag <ID> juice              battery + solar panel voltage (mV)\r\n"
-                "  tag <ID> selftest           boot-time gps/acc/flash results\r\n"
-                "  tag <ID> selftest gps|acc|flash  single boot-time result\r\n"
+                "  tag <ID> selftest           gps/acc results + live flash state\r\n"
+                "  tag <ID> selftest gps|acc|flash  single result\r\n"
+#ifdef STORAGE_BACKEND_FLASH
+                "  tag <ID> flash              ext-flash health (gate, ids, faults)\r\n"
+                "  tag <ID> flash recover      force a flash re-probe + bring-up\r\n"
+#endif
                 "  tag <ID> discovery schedule wakeup interval (min)\r\n"
                 "  tag <ID> discovery schedule <N>  set wakeup interval (15/30/60/120/240)\r\n"
                 "  tag <ID> prodsleep          enter production sleep (secondary only)\r\n"
                 "  tag <ID> solarsleep         as prodsleep, shake-to-wake only\r\n"
+                "  tag <ID> radiotest          R&D range test (2nd: beacon+shake to exit,\r\n"
+                "                              1st: listen+log to fr9)\r\n"
+                "  tag <ID> radio stop         end the range test (primary)\r\n"
                 "  tag <ID> release            release device for sleep\r\n"
                 "  tag * <cmd>                 bulk: every device runs <cmd> silently\r\n"
                 "                              (DBG_LOG only, no reply; action cmds only)\r\n"
@@ -477,16 +493,57 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
     }
     else if (strcmp(p, "selftest") == 0)
     {
-        /* Answers from the memoized boot-time run (see SELFTEST_vRunAndReport
-         * called from INIT_vInitialization). "n/a" is reported for tests
-         * that don't apply on this build/role (GPS on primary, flash under
-         * MicroSD backend) — no re-run happens here. */
+        /* GPS and ACC answer from the memoized boot-time run (see
+         * SELFTEST_vRunAndReport called from INIT_vInitialization); flash is
+         * answered live from the driver gate, because that gate can close and
+         * re-open after boot. "n/a" is reported for tests that don't apply on
+         * this build/role (GPS on primary, flash under MicroSD backend). */
         snprintf(resp, sizeof(resp), "selftest: gps=%s acc=%s flash=%s\r\n",
                  SELFTEST_bGpsApplicable()   ? (SELFTEST_bGpsOk()   ? "OK" : "FAIL") : "n/a",
                  SELFTEST_bAccOk()           ? "OK" : "FAIL",
                  SELFTEST_bFlashApplicable() ? (SELFTEST_bFlashOk() ? "OK" : "FAIL") : "n/a");
         FRKERNEL_vRespond(eXport, resp);
     }
+#ifdef STORAGE_BACKEND_FLASH
+    else if (strcmp(p, "flash") == 0)
+    {
+        /* Full flash health over the air. A tag whose flash has gated off has
+         * lost its log — the one place this would otherwise be recorded — and
+         * cannot be reached with a UART in the field, so being able to ASK it
+         * is the difference between diagnosing the fault and guessing at it.
+         * Reads state only; use "flash recover" to act. */
+        Flash_Health_t tHealth;
+        FLASH_vGetHealth(&tHealth);
+        snprintf(resp, sizeof(resp),
+                 "flash: %s id=%02X%02X%02X tries=%u absent=%u recov=%u "
+                 "probeFail=%u wprot=%u unprotFail=%u eraseVfy=%u\r\n",
+                 tHealth.bPresent ? "USABLE" : "GATED-OFF",
+                 tHealth.au8LastId[0], tHealth.au8LastId[1], tHealth.au8LastId[2],
+                 (unsigned)tHealth.u8LastAttempts,
+                 (unsigned)tHealth.bEverAbsent,
+                 (unsigned)tHealth.u16Recoveries,
+                 (unsigned)tHealth.u16ProbeFailures,
+                 (unsigned)tHealth.bWriteProtected,
+                 (unsigned)tHealth.bUnprotectFailed,
+                 (unsigned)tHealth.u16EraseVerifyFails);
+        FRKERNEL_vRespond(eXport, resp);
+    }
+    else if (strcmp(p, "flash recover") == 0)
+    {
+        /* Force a probe + bring-up now, ignoring the re-probe cooldown. The
+         * automatic path in FLASH_bEnsurePresent already does this off ordinary
+         * traffic; this exists so an operator watching a stuck unit does not
+         * have to wait for the next write to trigger it. */
+        uint8_t au8Id[3]   = {0};
+        uint8_t u8Attempts = 0U;
+        bool    bOk        = FLASH_bRecoverDevice(au8Id, &u8Attempts);
+        snprintf(resp, sizeof(resp),
+                 "flash recover: %s id=%02X%02X%02X after %u attempt(s)\r\n",
+                 bOk ? "USABLE" : "STILL GATED-OFF",
+                 au8Id[0], au8Id[1], au8Id[2], (unsigned)u8Attempts);
+        FRKERNEL_vRespond(eXport, resp);
+    }
+#endif
     else if (strcmp(p, "selftest gps") == 0)
     {
         snprintf(resp, sizeof(resp), "selftest gps: %s\r\n",
@@ -578,6 +635,76 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
          * instead of holding an open kernel window. */
         osDelay(100);
         s_bConnected = false;
+    }
+    else if (strcmp(p, "radiotest") == 0)
+    {
+        /* R&D radio link/range test. Role decides what the unit does:
+         *   secondary -> beacons every 5 s and goes deaf to all radio traffic,
+         *                including this kernel. Shake-to-wake is the only way
+         *                back, exactly as for solarsleep.
+         *   primary   -> listens, logs RSSI/SNR/noise floor per beacon and
+         *                forwards them to the fr9. Stays reachable, so
+         *                "tag <ID> radio stop" can end it over the air.
+         *
+         * Entered BEFORE the ack so the reply reflects what actually happened:
+         * the entry flushes the radio TX queue, which would otherwise discard
+         * an ack queued ahead of it. TX still works once the mode is up — it
+         * is only the receive path a secondary closes. */
+
+        /* Never over a broadcast. This is an action command, so without this
+         * check "tag * radiotest" would put EVERY secondary in earshot into
+         * beacon mode at once — each one deaf to the radio from that moment,
+         * including to this kernel, and recoverable only by physically
+         * shaking it. On a deployed herd that means finding and handling
+         * every animal. A range test is a two-unit bench/field procedure and
+         * has no broadcast form worth having; refuse rather than offer one.
+         *
+         * Guarded here rather than by listing it in apacQueries[]: that would
+         * make bulk drop it silently, and silence is the wrong answer to a
+         * command that would have been this destructive. */
+        if (bBulk)
+        {
+            DBG_LOG("FrKernel: refusing bulk 'radiotest' — address a single device\r\n");
+        }
+        else if (RADIOTESTMODE_bEnter())
+        {
+            FRKERNEL_vAck(eXport, bBulk,
+                          RADIOTESTMODE_bIsListener()
+                          ? "RadioTest: listening — end with 'radio stop'\r\n"
+                          : "RadioTest: beaconing every 5 s — shake to exit\r\n");
+        }
+        else
+        {
+            /* Include the reason: this ack is very likely the ONLY thing a
+             * remote operator ever sees of this failure (the detail behind it
+             * goes to DBG_LOG on the unit itself, over UART nobody out here
+             * can read). A bare "could not enter" gives a field failure
+             * nothing to act on. */
+            snprintf(resp, sizeof(resp), "RadioTest: could not enter (%s)\r\n",
+                    RADIOTESTMODE_pcLastEnterError());
+            FRKERNEL_vAck(eXport, bBulk, resp);
+        }
+
+        /* Terminal, same reasoning as prodsleep: drain the reply, then drop
+         * the session rather than hold a kernel window open for a mode that
+         * manages its own sleep lock. */
+        osDelay(100);
+        s_bConnected = false;
+    }
+    else if (strcmp(p, "radio stop") == 0)
+    {
+        /* The listening primary's way out. A beaconing secondary never gets
+         * here over LoRa (it drops all inbound packets by design), but the
+         * command still works on it over the debug UART. */
+        if (RADIOTESTMODE_bActive())
+        {
+            RADIOTESTMODE_vExit("radio stop");
+            FRKERNEL_vAck(eXport, bBulk, "RadioTest: stopped\r\n");
+        }
+        else
+        {
+            FRKERNEL_vAck(eXport, bBulk, "RadioTest: not running\r\n");
+        }
     }
 #ifdef STORAGE_BACKEND_FLASH
     else if (strcmp(p, "fwaccept") == 0)

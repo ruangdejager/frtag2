@@ -116,6 +116,47 @@
  * treats that as "no app installed" (version 0), not as a huge version. */
 #define OTA_FW_INFO_ADDR         (OTA_APP_BASE_ADDR + 0x200UL)
 
+/* Same record's offset WITHIN an image, i.e. into the OTA scratch copy. The
+ * scratch is byte-mapped onto the app region (scratch 0 == OTA_APP_BASE_ADDR),
+ * so a staged image carries its own version at this offset and can be asked
+ * what it actually is - as opposed to what a manifest, an fr9 or a LoRa Prep
+ * packet CLAIMS it is. Those are the only sources of version identity the tag
+ * had until now, and on 2026-09-01 they were all wrong together: fr9 adopted a
+ * byte-identical 2.1.8 file as v20109 (its staleness check is size+xor8, and
+ * 2.1.7/2.1.8/2.1.9 all built to 109068 B with xor8 0xC5), served it under the
+ * new version number, and every layer downstream agreed because every layer
+ * was checking integrity, not identity. The image itself was the one witness
+ * that could not be fooled. */
+#define OTA_FW_INFO_OFFSET       0x200UL
+
+/* An image whose fw_info does not match the version it is being staged,
+ * distributed or installed under is REJECTED. Fail-closed is safe here: every
+ * published artifact from 2.0.1 onward carries a correct fw_info record (the
+ * linker KEEPs the .fw_info section), so a mismatch means the bytes are not
+ * the firmware they are labelled as - which is exactly the condition that
+ * cost a fleet-wide FOTA window. */
+
+/* Consecutive boots where the bootloader was handed a newer staged image and
+ * did NOT install it, before the app erases that image and re-acquires.
+ *
+ * This exists because the bootloader is frozen in the field and re-evaluates
+ * the metadata record on EVERY boot: while meta.version > installed version it
+ * will keep trying, so an image it cannot or will not install loops forever
+ * with no backoff, burning battery and every FOTA window. The app is the only
+ * layer left that can break that loop, and it can only do so by invalidating
+ * the record the bootloader keeps acting on. 3 gives a genuine transient (one
+ * bad SPI read during the bootloader's verify pass) room to recover on its
+ * own before the image is thrown away. */
+#define OTA_INSTALL_FAIL_MAX     3U
+
+/* Backup register holding that counter across the resets it is counting.
+ * BKP0R/1R = app->bootloader handoff, BKP2R = bootloader version,
+ * BKP4R = flash health word. BKP5R is free. Magic in the top bits so an
+ * uninitialised or unrelated value is not read as a count. */
+#define OTA_INSTALL_FAIL_BKP_MAGIC      0xF0A70000UL
+#define OTA_INSTALL_FAIL_BKP_MASK       0xFFFF0000UL
+#define OTA_INSTALL_FAIL_COUNT_MASK     0x000000FFUL
+
 typedef struct
 {
     uint16_t major;
@@ -221,5 +262,39 @@ typedef struct
                                                      primary active" if heard this
                                                      recently (~one PREP burst:
                                                      REPEATS 5 * GAP 1000 ms)       */
+
+/* ---- Radio quiet window before a whole-image XOR verify pass ---------------
+ *
+ * The SX126x PA's current spike sags the shared supply rail, and a flash read
+ * issued too soon after a TX reads back corrupted bytes while the stored bytes
+ * are fine - hardware-confirmed, see OTA_LORA_CHUNK_GAP_MS above (15 ms of
+ * settle was not enough, ~65 ms was, 100 ms was called comfortable). A
+ * whole-image XOR pass is ~1.5 s of gap-free reads at the SPI2 rate this
+ * device runs at, so a single TX landing anywhere inside it spoils the pass.
+ *
+ * CONFIRMED IN THE FIELD, 2026-08-31: two bad pre-send passes, both with every
+ * chunk read reporting success (readOk=1 rdFails=0 hal=0 - so corrupted bytes,
+ * not a transport failure) and the PA firing 270 ms and 336 ms into a ~1550 ms
+ * pass. The one campaign in the same run whose random backoff happened to let
+ * the TimeSync transmit before the pass started verified first time.
+ *
+ * Note this cannot be fixed by reordering. The offending TX is not one the
+ * FOTA code issues: DeviceDiscovery queues a TimeSync ~20 ms before calling
+ * FOTA_vDistribute, MESHNETWORK_bSendPacket only stamps it with 20-1500 ms of
+ * jitter, and the radio task fires the PA whenever carrier sense lets it. The
+ * packet is already in flight before any FOTA code runs, so the verify has to
+ * wait it out - the same thing every other whole-image read here already does. */
+#define OTA_VERIFY_TX_SETTLE_MS            150U   /* quiet time required before
+                                                     starting a pass; 1.5x the
+                                                     100 ms already judged
+                                                     comfortable margin for
+                                                     OTA_LORA_CHUNK_GAP_MS     */
+#define OTA_VERIFY_TX_QUIET_MAX_MS        1500U   /* stop waiting and verify
+                                                     anyway past this - just
+                                                     over MESH_TX_JITTER_MAX_MS.
+                                                     A busy radio must never
+                                                     stall a campaign; the
+                                                     retry budget still covers
+                                                     a spoiled pass.           */
 
 #endif /* WORKER_FOTA_FOTA_CONFIG_H_ */

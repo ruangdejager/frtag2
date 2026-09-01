@@ -88,6 +88,52 @@ static volatile uint16_t u16TxStaleDropCount = 0;
 /* Pending radio events captured during carrier-sense / back-off */
 static volatile uint32_t gRadioPendingEvents = 0;
 
+/* Most recent channel noise-floor sample, dBm. Written only by the radio task
+ * on its idle pass and stamped into each received packet — see the sampling
+ * site in LORARADIO_vRadioTask for why that timing is the meaningful one.
+ * Only sampled while bNoiseFloorSampling is set, which the radio-test paths
+ * turn on and normal operation leaves off. */
+static int16_t          i16NoiseFloor      = LORA_NOISE_FLOOR_INVALID;
+static volatile bool    bNoiseFloorSampling = false;
+
+/* True from the moment a packet is pulled off xLoRaTxQueue until this task is
+ * done with it (sent, or dropped after carrier-sense failed) — the window in
+ * which the queue itself reads empty even though a TX is still in flight,
+ * because osMessageQueueGet() dequeues before carrier-sense runs. Queue depth
+ * alone cannot tell a caller "wait, something is still being tried"; this can.
+ * See LORARADIO_u16GetTxQueueDepth()'s header comment for the caller that
+ * needs it. */
+static volatile bool    bTxInProgress      = false;
+
+/* While set, LORARADIO_vEnterDeepSleep() is a no-op — see the comment there.
+ * Held by the runtime radio range test for its duration, because the chip has
+ * other owners whose normal teardown would otherwise sleep it mid-test. */
+static volatile bool    bKeepAwake         = false;
+
+/* Tick at which the PA was last actually fired — i.e. when the shared supply
+ * rail last took the SX126x TX current spike that OTA_LORA_CHUNK_GAP_MS
+ * exists to wait out.
+ *
+ * This is the one timestamp nothing in the codebase recorded. Every existing
+ * log line marks when a packet was *queued*, and queue time says nothing
+ * about PA time: MESHNETWORK_bSendPacket only stamps a ready-tick (jitter
+ * 20-1500 ms), and this task's carrier sense can then defer the real
+ * transmission by up to LORA_TX_CARRIER_WAIT_MS on top. So "was the radio
+ * transmitting while that flash read happened?" has never been answerable
+ * from a field log. Written here on the radio task, read by the FOTA verify
+ * path. */
+static volatile uint32_t u32LastTxDoneTick = 0U;
+
+/* True from the moment a packet is committed to transmission until its PA
+ * pulse has actually fired (or the attempt was abandoned).
+ *
+ * The TX queue going empty is NOT sufficient to conclude the radio is about to
+ * stay quiet: carrier sense can hold an already-dequeued packet for up to
+ * LORA_TX_CARRIER_WAIT_MS before the PA fires, during which the queue reads as
+ * idle. Anything timing a quiet window off the queue alone would sail straight
+ * into that TX. */
+static volatile bool bTxInFlight = false;
+
 static uint8_t u8DevEUI[8];
 
 /* -------------------------------------------------------------------------- */
@@ -219,11 +265,34 @@ void LORARADIO_vRadioTask(void *arg)
         /* Merge any stashed events from a carrier-sense interruption */
         events |= LORARADIO_u32ConsumePendingEvents();
 
+        /* ---------- NOISE FLOOR ----------
+         * A bare 50 ms timeout with nothing queued: no IRQ fired, no TX is
+         * waiting, and every path out of this loop leaves the chip in
+         * continuous RX — so the receiver is live and the channel is quiet,
+         * which is exactly the condition an instantaneous RSSI reading needs
+         * to mean "noise floor" rather than "some other signal".
+         *
+         * Sampled here rather than from the RadioTest task because this task
+         * is the sole owner of the chip; a second task issuing SUBGRF
+         * commands would race this one on the SPI.
+         *
+         * Sampling *before* the packet rather than after it is the point: the
+         * reading taken while the channel was last idle is the right
+         * reference for the beacon that lands next, and it costs no blocking
+         * delay waiting for the receiver to settle after an RX.
+         *
+         * Off unless a radio test switched it on, so normal builds issue no
+         * extra SPI traffic here. */
+        if (bNoiseFloorSampling &&
+            events == 0U && osMessageQueueGetCount(xLoRaTxQueue) == 0U)
+            i16NoiseFloor = (int16_t)SUBGRF_GetRssiInst();
+
         /* ---------- RX DONE ---------- */
         if (events & RADIO_EVT_RX_DONE)
         {
             memset(&pkt, 0, sizeof(pkt));
             LORARADIO_DRIVER_bReceivePayload(&pkt);
+            pkt.i16NoiseFloor = i16NoiseFloor;
 
             /* Shortest valid frame is type byte + CRC byte. A 0/1-byte frame
              * (corrupt header that passed the radio CRC) would otherwise
@@ -312,33 +381,65 @@ void LORARADIO_vRadioTask(void *arg)
                 }
 
                 u8Sent++;
+                bTxInProgress = true;
+
+                /* Committed to sending this one: from here until the PA has
+                 * fired (or we give up below) the radio is not quiet, even
+                 * though the queue may now read as empty. */
+                bTxInFlight = true;
 
                 uint8_t crc = LORARADIO_u8CRC8_Calculate(pkt.buffer, pkt.length);
                 pkt.buffer[pkt.length++] = crc;
 
                 if (!LORARADIO_bCarrierSenseAndWait(LORA_TX_CARRIER_WAIT_MS))
                 {
+                    bTxInFlight = false;   /* abandoned - no PA pulse happened */
                     uint32_t stashed = LORARADIO_u32ConsumePendingEvents();
                     if (stashed)
                     {
                         events |= stashed;
                         DBG_LOG("Loraradio: TX REQ interrupted by events 0x%08lX\r\n", stashed);
                         LORARADIO_DRIVER_vEnterRxMode(0);
+                        bTxInProgress = false;
                         continue;
                     }
                     DBG_LOG("Loraradio: TX REQ abort — carrier busy\r\n");
                     LORARADIO_DRIVER_vEnterRxMode(0);
+                    bTxInProgress = false;
                     continue;
                 }
 
                 LORARADIO_DRIVER_bTransmitPayload(pkt.buffer, pkt.length);
+                u32LastTxDoneTick = osKernelGetTickCount();
+                bTxInFlight       = false;
                 LORARADIO_DRIVER_vEnterRxMode(0x00);
+                bTxInProgress = false;
             }
         }
     }
 }
 
 /* -------------------------------------------------------------------------- */
+
+void LORARADIO_vSetNoiseFloorSampling(bool bEnable)
+{
+    /* Drop the stale reading when switching off, so a later run cannot report
+     * a noise floor measured minutes ago in a different place. */
+    if (!bEnable)
+        i16NoiseFloor = LORA_NOISE_FLOOR_INVALID;
+
+    bNoiseFloorSampling = bEnable;
+}
+
+uint16_t LORARADIO_u16GetTxQueueDepth(void)
+{
+    return (uint16_t)osMessageQueueGetCount(xLoRaTxQueue);
+}
+
+bool LORARADIO_bTxInProgress(void)
+{
+    return bTxInProgress;
+}
 
 uint32_t LORARADIO_u32GetUniqueId(void)
 {
@@ -443,6 +544,30 @@ uint16_t LORARADIO_u16GetAndClearTxStaleDrops(void)
     return u16Count;
 }
 
+uint32_t LORARADIO_u32GetLastTxTick(void)
+{
+    return u32LastTxDoneTick;
+}
+
+bool LORARADIO_bTxQuiet(uint32_t u32SettleMs)
+{
+    /* Ordered cheapest-first, and all three conditions are needed:
+     *  - in-flight covers a packet already dequeued and sitting in carrier
+     *    sense, which the queue count cannot see;
+     *  - queue count covers packets not yet picked up;
+     *  - the settle age covers a PA pulse that has just happened, which is the
+     *    whole point - the rail needs time to recover before a flash read. */
+    if (bTxInFlight) return false;
+
+    if ((xLoRaTxQueue != NULL) && (osMessageQueueGetCount(xLoRaTxQueue) != 0U))
+        return false;
+
+    if (u32LastTxDoneTick == 0U) return true;   /* nothing transmitted yet */
+
+    /* Unsigned difference, so tick wrap is handled. */
+    return ((osKernelGetTickCount() - u32LastTxDoneTick) >= u32SettleMs);
+}
+
 void LORARADIO_vFlushTxQueue(void)
 {
     LoraRadio_Packet_t tDiscard;
@@ -511,8 +636,34 @@ bool LORARADIO_bCarrierSenseAndWait(uint32_t maxWaitMs)
     return false;
 }
 
-void LORARADIO_vEnterDeepSleep(void) { LORARADIO_DRIVER_vEnterDeepSleep(); }
+void LORARADIO_vEnterDeepSleep(void)
+{
+    /* Refuse while someone holds the radio awake. The chip is a shared
+     * resource with several owners on different tasks — DeviceDiscovery's
+     * campaign tail, its basic-beacon path and its sleep-mode entry all call
+     * this — and a caller finishing ITS work is not evidence that the radio is
+     * idle. The radio range test found this the hard way: entering it from a
+     * FrKernel session released the AppTask's "waiting for release" hold, and
+     * the campaign tail that followed deep-slept the chip out from under a
+     * test that had just started. Every CAD after that timed out at 300 ms
+     * with no IRQ, which reads on the terminal as an endlessly busy channel
+     * rather than as a sleeping radio.
+     *
+     * Gated here rather than at each call site: this is the layer that owns
+     * the chip's power state, it is one place instead of four, and a call site
+     * added later cannot silently reintroduce the same failure. */
+    if (bKeepAwake)
+        return;
+
+    LORARADIO_DRIVER_vEnterDeepSleep();
+}
+
 void LORARADIO_vWakeUp(void)         { LORARADIO_DRIVER_vWakeUp(); }
+
+void LORARADIO_vSetKeepAwake(bool bEnable)
+{
+    bKeepAwake = bEnable;
+}
 
 /* --------------------------------------------------------------------------
  * LORARADIO_vNotifyFromISR — set thread flags from ISR context

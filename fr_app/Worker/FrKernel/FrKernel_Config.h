@@ -26,7 +26,15 @@
 #include "build_config.h"
 
 #define FRKERNEL_CMD_PREFIX             "tag"
-#define FRKERNEL_LINE_BUF_LEN          128U    /* max command line length (bytes)        */
+/* 128 -> 64: the longest recognized command is "discovery schedule " (19
+ * chars) plus a numeric arg and the "tag " / "tag <ID> " prefix - under 32
+ * chars even addressed over LoRa. 64 keeps 2x headroom over that while
+ * freeing RAM on a part that is byte-exact full (see FRKERNEL_INTERFACE_UART
+ * in build_config.h - it was the straw that overflowed it). Safe on the LoRa
+ * side too: MESHNETWORK_vOnFrKernelPacket already clamps an over-length
+ * packet to sizeof(pkt.data)-1 rather than overflowing, so shrinking this
+ * only tightens that existing truncation bound, it doesn't introduce one. */
+#define FRKERNEL_LINE_BUF_LEN           64U    /* max command line length (bytes)        */
 #define FRKERNEL_RESP_BUF_LEN          256U    /* max response string (bytes)            */
 #define FRKERNEL_LORA_QUEUE_LEN          4U    /* LoRa path: inbound queue depth         */
 #define FRKERNEL_INACTIVITY_TIMEOUT_MS  (5U * 60U * 1000U)   /* auto-release after 5 min */

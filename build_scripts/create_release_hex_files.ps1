@@ -17,18 +17,36 @@
 #   Also removes CubeIDE's stock frtag2.hex / frtag2.bin from $mode\ so the
 #   folder only ever holds the versioned deliverables.
 #
-#   In C:\Code\farmranger-firmware\frtag2-firmware\ (the public OTA host
-#   repo) — exactly two files:
+#   In each repo listed in $publish_dirs below (the public OTA host repo,
+#   plus the in-house mirror) — exactly two files per repo:
 #
 #     frtag2_<M>_<m>_<p>.bin           the versioned app image (raw binary)
 #                                      the OTA flow fetches over HTTP
 #     version.json                     manifest naming the .bin above
 #                                      {"version","file","size","crc32","xor"}
 #
+#   The host repos are:
+#
+#     C:\Code\farmranger-firmware\frtag2-firmware\      field units
+#     C:\Code\frtag-firmware-inhouse\frtag2-firmware\   in-house bench units
+#
+#   Both get byte-identical artefacts. Which host a unit actually fetches
+#   from is decided at fr9 build time by SWITCH_TAGFOTA_INHOUSE_HOST
+#   (fr9_application, fr_app/inc/tag_fota.h). Publishing here is only a copy
+#   into a local working tree - nothing reaches a device until that repo is
+#   committed and pushed, so the field host stays under exactly the manual
+#   control it always had.
+#
 #   NO latest*.bin/hex, NO _ota.* variants, NO combined _bl_* copies of the
-#   BIN in the public repo — the OTA path only ever fetches the app-only
+#   BIN in either publish repo — the OTA path only ever fetches the app-only
 #   BIN, and its filename comes from version.json's "file" field (fr9's
 #   TAGFOTA_pacManifestFile returns whatever the manifest names).
+#
+#   This script only ever writes files into those repos' working trees. It
+#   never runs git add/commit/push there, and never will — committing and
+#   pushing C:\Code\farmranger-firmware and C:\Code\frtag-firmware-inhouse
+#   is a manual, deliberate step for a human, not something a build step
+#   does on every compile.
 #
 # For a first-time programming of a fresh MCU: flash frtag2_<M>_<m>_<p>_bl_<b>.hex
 # — contains bootloader + application. After that every OTA update ships
@@ -81,12 +99,23 @@ $version_str = "${Major}.${Minor}.${Patch}"
 
 Write-Host "frtag2 release: v${version_str} + bootloader v${bl_version} (mode=$mode)"
 
-# Destination: the public OTA host repo (may not exist yet on first run).
-$publish_dir = "C:\Code\farmranger-firmware\frtag2-firmware"
-if (-Not (Test-Path $publish_dir)) {
-    Write-Host "Publish dir $publish_dir does not exist - creating it (repo not initialised locally?)"
-    New-Item -ItemType Directory -Path $publish_dir -Force | Out-Null
+# Destinations: every repo that mirrors the app-only .bin + version.json.
+# Both are separate local git repos this script only ever writes files
+# into - see the file-header note on why nothing here ever commits or
+# pushes them.
+$publish_dirs = @(
+    "C:\Code\farmranger-firmware\frtag2-firmware",
+    "C:\Code\frtag-firmware-inhouse\frtag2-firmware"
+)
+foreach ($publish_dir in $publish_dirs) {
+    if (-Not (Test-Path $publish_dir)) {
+        Write-Host "Publish dir $publish_dir does not exist - creating it (repo not initialised locally?)"
+        New-Item -ItemType Directory -Path $publish_dir -Force | Out-Null
+    }
 }
+# Checksums below are read back off the first copy; the others are
+# byte-identical copies of the same source bin.
+$publish_dir = $publish_dirs[0]
 
 # ---- Versioned app-only HEX in Debug\ (Intel HEX for manual programming) ----
 $app_hex_versioned = "$modeDir\frtag2_${Major}_${Minor}_${Patch}.hex"
@@ -105,18 +134,42 @@ if ($has_bootloader) {
     Set-Content -Path $bl_hex_versioned -Value $combined_hex
 }
 
-# ---- Publish to farmranger-firmware\frtag2-firmware\ ------------------------
-# ONE file: the versioned app-only .bin the OTA flow actually fetches.
-# version.json below names it explicitly so fr9's manifest parser
-# (TAGFOTA_pacManifestFile) picks it up as-is — no "latest.bin" fallback.
-$app_bin_published = "$publish_dir\frtag2_${Major}_${Minor}_${Patch}.bin"
-Copy-Item $bin_file_path -Destination $app_bin_published -Force
+# ---- Checksums, computed once against the bin CubeIDE just built ------------
+# Same bytes get published to every repo in $publish_dirs, so the CRC/XOR are
+# computed once here rather than once per destination.
+$app_bin_bytes = [System.IO.File]::ReadAllBytes($bin_file_path)
 
-# Read the just-published bin for checksums (identical bytes to the source
-# bin, but read from the destination in case anything went wrong in the copy).
-$app_bin_bytes = [System.IO.File]::ReadAllBytes($app_bin_published)
+# ---- Identity gate: does the image agree with the version we are labelling it?
+# The linker KEEPs a .fw_info record (major/minor/patch, uint16 LE) at image
+# offset 0x200. The tag bootloader reads it to decide what is installed, and
+# both fr9 and the tag app now check it before adopting or installing an image.
+# Verifying it HERE means a mislabelled artifact cannot be published at all.
+#
+# Worth the six bytes: on 2026-09-01, 2.1.7/2.1.8/2.1.9 all built to exactly
+# 109068 B with an identical xor8 of 0xC5, fr9's "already on the filesystem"
+# check is (size, xor8), so it adopted the previous release and served it under
+# the new version number. Tags installed it, booted reporting the old version,
+# were offered the "new" one again, and looped until a human intervened. A
+# stale or wrongly-named bin reaching this script would do the same thing.
+$fw_info_offset = 0x200
+if ($app_bin_bytes.Length -lt ($fw_info_offset + 6)) {
+    Write-Host "ABORT: bin is only $($app_bin_bytes.Length) B - too small to hold fw_info at 0x200"
+    exit 1
+}
+$bin_major = [uint16]$app_bin_bytes[$fw_info_offset]     + ([uint16]$app_bin_bytes[$fw_info_offset + 1] -shl 8)
+$bin_minor = [uint16]$app_bin_bytes[$fw_info_offset + 2] + ([uint16]$app_bin_bytes[$fw_info_offset + 3] -shl 8)
+$bin_patch = [uint16]$app_bin_bytes[$fw_info_offset + 4] + ([uint16]$app_bin_bytes[$fw_info_offset + 5] -shl 8)
+$bin_version_str = "${bin_major}.${bin_minor}.${bin_patch}"
 
-# ---- version.json (OTA manifest) --------------------------------------------
+if ($bin_version_str -ne $version_str) {
+    Write-Host "ABORT: version mismatch - version_config.h says $version_str but the built"
+    Write-Host "       bin's fw_info record says $bin_version_str."
+    Write-Host "       $bin_file_path is stale or is not the image for this version."
+    Write-Host "       Rebuild in CubeIDE before publishing; nothing has been written."
+    exit 1
+}
+Write-Host "fw_info check OK: bin declares v$bin_version_str, matching version_config.h"
+
 # CRC32 (IEEE 802.3, poly 0xEDB88320) computed manually to avoid PowerShell
 # hex-literal quirks (>= 0x80000000 parses as negative Int32; use ToUInt32).
 $CRC32_POLY = [Convert]::ToUInt32("EDB88320", 16)
@@ -152,7 +205,58 @@ $manifest = [ordered]@{
     xor     = $xor8_hex
 }
 $manifest_json = ($manifest | ConvertTo-Json)
-Set-Content -Path "$publish_dir\version.json" -Value $manifest_json
+
+# ---- Publish to every repo in $publish_dirs ----------------------------------
+# ONE file each: the versioned app-only .bin the OTA flow actually fetches,
+# plus the version.json naming it. version.json's "file" field is what fr9's
+# manifest parser (TAGFOTA_pacManifestFile) goes by — no "latest.bin"
+# fallback, and both repos get byte-identical bin + manifest.
+# ---- Collision warning against the manifest currently live -----------------
+# fr9's "is this already on my filesystem?" check is (size, xor8). Two releases
+# that agree on both are indistinguishable to it, and the older bytes get
+# re-served under the newer version number - the 2026-09-01 install loop.
+#
+# fr9 and the tag now check the image's fw_info record as well, so a collision
+# is harmless once BOTH are deployed. Until then it is still live ammunition,
+# and this is the last point where a human can see it coming.
+foreach ($publish_dir in $publish_dirs) {
+    $live_manifest_path = "$publish_dir\version.json"
+    if (Test-Path $live_manifest_path) {
+        try {
+            $live = Get-Content $live_manifest_path -Raw | ConvertFrom-Json
+            if (($live.version -ne $version_str) -and
+                ([uint32]$live.size -eq [uint32]$app_bin_bytes.Length) -and
+                ($live.xor -eq $xor8_hex)) {
+                Write-Host ""
+                Write-Host "*** WARNING: (size, xor8) COLLISION with the live manifest ***"
+                Write-Host "    $publish_dir"
+                Write-Host "    live: v$($live.version)  size=$($live.size)  xor=$($live.xor)"
+                Write-Host "    new:  v$version_str  size=$($app_bin_bytes.Length)  xor=$xor8_hex"
+                Write-Host "    An fr9 that predates the fw_info identity check will treat the"
+                Write-Host "    file it already has as this release and never download the new"
+                Write-Host "    bytes. Confirm every fr9 in the fleet is updated before relying"
+                Write-Host "    on this release reaching tags."
+                Write-Host ""
+            }
+        } catch {
+            Write-Host "Note: could not parse existing $live_manifest_path - skipping collision check"
+        }
+    }
+}
+
+foreach ($publish_dir in $publish_dirs) {
+    $app_bin_published = "$publish_dir\frtag2_${Major}_${Minor}_${Patch}.bin"
+    Copy-Item $bin_file_path -Destination $app_bin_published -Force
+
+    # Verify the copy landed intact before trusting it as a deliverable.
+    $published_len = (Get-Item $app_bin_published).Length
+    if ($published_len -ne $app_bin_bytes.Length) {
+        Write-Host "Publish to $publish_dir FAILED - size mismatch ($published_len vs $($app_bin_bytes.Length))"
+        exit 1
+    }
+
+    Set-Content -Path "$publish_dir\version.json" -Value $manifest_json
+}
 
 # ---- Cleanup CubeIDE's stock output from Debug\ -----------------------------
 # Only the two versioned HEX files are the deliverables. Leaving the stock
@@ -165,7 +269,10 @@ Write-Host "  frtag2_${Major}_${Minor}_${Patch}.hex"
 if ($has_bootloader) {
     Write-Host "  frtag2_${Major}_${Minor}_${Patch}_bl_${bl_version}.hex"
 }
-Write-Host "Published to $publish_dir :"
-Write-Host "  frtag2_${Major}_${Minor}_${Patch}.bin  ($($app_bin_bytes.Length) B, CRC32=$crc_hex, XOR8=$xor8_hex)"
-Write-Host "  version.json (v${version_str})"
+Write-Host "Published ($($app_bin_bytes.Length) B, CRC32=$crc_hex, XOR8=$xor8_hex):"
+foreach ($publish_dir in $publish_dirs) {
+    Write-Host "  $publish_dir\frtag2_${Major}_${Minor}_${Patch}.bin"
+    Write-Host "  $publish_dir\version.json (v${version_str})"
+}
+Write-Host "Neither host repo is committed or pushed by this script - do that by hand."
 Write-Host "OK"
