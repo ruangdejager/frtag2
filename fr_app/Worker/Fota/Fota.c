@@ -69,6 +69,11 @@ static void FOTA_vPutU32(uint8_t *p, uint32_t v)
 /* --------------------------------------------------------------------------
  * FOTA_vInit — one-time layout migration
  * -------------------------------------------------------------------------- */
+/* Defined just below FOTA_vInit, its only caller — see the block comment there
+ * for why a boot-time check is the only lever left once the bootloader is
+ * frozen in the field. */
+static void FOTA_vCheckInstallProgress(void);
+
 void FOTA_vInit(void)
 {
     /* The "installed version" the bootloader compares against comes from
@@ -94,6 +99,89 @@ void FOTA_vInit(void)
         DBG_LOG("Fota: migrating metadata sector (stale layout)\r\n");
         (void)FOTA_DRIVER_bSectorErase(OTA_META_SECTOR_ADDR);
     }
+
+    FOTA_vCheckInstallProgress();
+}
+
+/* --------------------------------------------------------------------------
+ * Boot-time install-loop breaker
+ *
+ * The bootloader is frozen in the field and re-evaluates the metadata record on
+ * EVERY boot: while meta.version > the installed version it keeps trying to
+ * install, with no backoff and no memory of having failed. So if it cannot or
+ * will not install a staged image, the unit reboots into the same decision
+ * forever — which is exactly what happened on 2026-09-01, roughly every 90 s,
+ * until someone read the logs.
+ *
+ * Reaching this function at all means the bootloader has already had its turn
+ * this boot and we are still running the older firmware. That is unambiguous:
+ * the install did not happen. The app is the only layer left that can act, and
+ * the only lever it has is the record the bootloader keeps acting on.
+ *
+ * Deliberately tolerant for the first few attempts — a single bad SPI read
+ * during the bootloader's own verify pass is a real and recoverable event on
+ * this hardware, and throwing away a good image because of one is worse than
+ * waiting three boots.
+ * -------------------------------------------------------------------------- */
+static void FOTA_vCheckInstallProgress(void)
+{
+    FotaMeta_t tMeta;
+
+    uint32_t u32Bkp   = TAMP->BKP5R;
+    uint8_t  u8Fails  = ((u32Bkp & OTA_INSTALL_FAIL_BKP_MASK) == OTA_INSTALL_FAIL_BKP_MAGIC)
+                      ? (uint8_t)(u32Bkp & OTA_INSTALL_FAIL_COUNT_MASK)
+                      : 0U;
+
+    /* No staged image, or nothing newer than what is running: the bootloader
+     * has nothing to do, so there is no failed install to count. This is also
+     * the path a successful install lands on (running == staged version), which
+     * is what clears the counter. */
+    if (!FOTA_bGetMeta(&tMeta) || (tMeta.u32Version <= VERSION_u32Get()))
+    {
+        if (u8Fails != 0U)
+        {
+            HAL_PWR_EnableBkUpAccess();
+            TAMP->BKP5R = OTA_INSTALL_FAIL_BKP_MAGIC;
+        }
+        return;
+    }
+
+    u8Fails = (u8Fails < 0xFFU) ? (uint8_t)(u8Fails + 1U) : 0xFFU;
+    HAL_PWR_EnableBkUpAccess();
+    TAMP->BKP5R = OTA_INSTALL_FAIL_BKP_MAGIC | (uint32_t)u8Fails;
+
+    /* Name the likely reason while the evidence is still in scratch. An
+     * identity mismatch here is the mislabelled-upstream case and will NEVER
+     * install no matter how many times it is retried; anything else points at
+     * the bootloader's read/verify path. */
+    uint32_t u32ImageVer = 0U;
+    bool     bIdentityOk = FOTA_bStagedImageIsVersion(tMeta.u32Version, &u32ImageVer);
+
+    DBG_LOG("Fota: bootloader did NOT install staged v%lu (running v%lu) - "
+            "attempt %u/%u, image declares v%lu (%s)\r\n",
+            (unsigned long)tMeta.u32Version, (unsigned long)VERSION_u32Get(),
+            (unsigned)u8Fails, (unsigned)OTA_INSTALL_FAIL_MAX,
+            (unsigned long)u32ImageVer,
+            bIdentityOk ? "identity OK - suspect bootloader read/verify"
+                        : "IDENTITY MISMATCH - mislabelled, will never install");
+
+    if (u8Fails < OTA_INSTALL_FAIL_MAX)
+        return;
+
+    /* Out of patience. Erasing the scratch takes the metadata record with it,
+     * which is what actually breaks the loop: with no valid record the
+     * bootloader stops trying on the next boot, and the normal acquire path is
+     * free to fetch a fresh copy. Keeping a staged image we have proven cannot
+     * be installed has no upside and costs every wake. */
+    DBG_LOG("Fota: %u failed install attempts - erasing staged image to break the "
+            "loop; will re-acquire on the next campaign\r\n", (unsigned)u8Fails);
+
+    if (!FOTA_bEraseScratch())
+        DBG_LOG("Fota: scratch erase FAILED - loop-break did not take, unit will "
+                "keep retrying the install\r\n");
+
+    HAL_PWR_EnableBkUpAccess();
+    TAMP->BKP5R = OTA_INSTALL_FAIL_BKP_MAGIC;
 }
 
 /* --------------------------------------------------------------------------
@@ -107,8 +195,29 @@ bool FOTA_bEraseScratch(void)
     {
         if (!FOTA_DRIVER_bSectorErase(u32Addr))
         {
+            /* Say WHY, not just "failed". This is the first flash operation of
+             * every campaign, so it is where a gated-off or write-protected
+             * chip surfaces — and until now it surfaced as a bare address,
+             * indistinguishable from a one-off SPI glitch. On 2026-08-31 that
+             * ambiguity is what made 18 h of "FWDONE=ERROR (delivered 0 B)"
+             * unreadable from the fr9 side: the tag knew its flash gate was
+             * shut and never said so. */
+#ifdef STORAGE_BACKEND_FLASH
+            Flash_Health_t tHealth;
+            FLASH_vGetHealth(&tHealth);
+            DBG_LOG("Fota: scratch erase FAILED @0x%05lX - flash %s "
+                    "(id=%02X%02X%02X wprot=%u unprotFail=%u eraseVfyFails=%u) "
+                    "- no image can be staged\r\n",
+                    (unsigned long)u32Addr,
+                    tHealth.bPresent ? "usable" : "GATED OFF",
+                    tHealth.au8LastId[0], tHealth.au8LastId[1], tHealth.au8LastId[2],
+                    (unsigned)tHealth.bWriteProtected,
+                    (unsigned)tHealth.bUnprotectFailed,
+                    (unsigned)tHealth.u16EraseVerifyFails);
+#else
             DBG_LOG("Fota: scratch erase FAILED @0x%05lX\r\n",
                     (unsigned long)u32Addr);
+#endif
             return false;
         }
         osDelay(1);   /* yield between sectors (~45 ms each, ~3 s total) */
@@ -561,6 +670,68 @@ uint8_t FOTA_u8CalcImageXor(uint32_t u32SizeBytes)
     return FOTA_u8CalcImageXorRange(0U, u32SizeBytes);
 }
 
+/* ==========================================================================
+ * Image identity — what the staged bytes say they are
+ *
+ * Every version number the tag acted on used to come from something ABOUT the
+ * image rather than from the image: an fr9 manifest, an AT+FWREQ answer, a
+ * LoRa OtaPrep header. Those are all assertions by a third party, and on
+ * 2026-09-01 they were unanimously wrong — fr9's "already on the filesystem"
+ * check is (size, xor8), 2.1.7/2.1.8/2.1.9 all built to 109068 B with xor8
+ * 0xC5, so it adopted the 2.1.8 file it already had and re-served those bytes
+ * as v20109. The tag verified the XOR (correct), committed metadata saying
+ * v20109 (wrong), and the bootloader dutifully programmed 2.1.8. The app came
+ * back reporting v20108, fr9 offered v20109 again, and that loop ran until it
+ * was noticed.
+ *
+ * Nothing in that chain was broken: every layer checked INTEGRITY (are these
+ * the bytes I was promised) and no layer checked IDENTITY (are these bytes the
+ * firmware version I am about to install). The fw_info record the linker
+ * places at OTA_FW_INFO_OFFSET is the one witness that cannot be fooled by a
+ * mislabelling upstream, because it travels inside the payload.
+ * ========================================================================== */
+
+/* Read the version a staged image declares about itself. Returns false only if
+ * the scratch read fails or the record is blank (0xFFFF x3, i.e. erased) —
+ * both mean "cannot establish identity", which callers must treat as a
+ * rejection, not as a pass. */
+static bool FOTA_bReadStagedFwInfo(uint32_t *pu32Version)
+{
+    uint8_t au8Info[6];
+
+    if (!FOTA_DRIVER_bRead(OTA_SCRATCH_START_ADDR + OTA_FW_INFO_OFFSET,
+                           au8Info, sizeof(au8Info)))
+        return false;
+
+    uint16_t u16Major = (uint16_t)((uint16_t)au8Info[0] | ((uint16_t)au8Info[1] << 8));
+    uint16_t u16Minor = (uint16_t)((uint16_t)au8Info[2] | ((uint16_t)au8Info[3] << 8));
+    uint16_t u16Patch = (uint16_t)((uint16_t)au8Info[4] | ((uint16_t)au8Info[5] << 8));
+
+    if ((u16Major == 0xFFFFU) && (u16Minor == 0xFFFFU) && (u16Patch == 0xFFFFU))
+        return false;   /* erased region — no image, or no fw_info record */
+
+    /* Same MMmmpp encoding the bootloader and VERSION_u32Get() use, so the
+     * three can be compared directly. */
+    if (pu32Version != NULL)
+        *pu32Version = (uint32_t)u16Major * 10000UL
+                     + (uint32_t)u16Minor * 100UL
+                     + (uint32_t)u16Patch;
+    return true;
+}
+
+bool FOTA_bStagedImageIsVersion(uint32_t u32Claimed, uint32_t *pu32Actual)
+{
+    uint32_t u32Actual = 0U;
+
+    if (pu32Actual != NULL) *pu32Actual = 0U;
+
+    if (!FOTA_bReadStagedFwInfo(&u32Actual))
+        return false;
+
+    if (pu32Actual != NULL) *pu32Actual = u32Actual;
+    return (u32Actual == u32Claimed);
+}
+
 bool FOTA_bCommitMetadata(uint32_t u32Version, uint32_t u32StopAddr, uint8_t u8Xor8)
 {
     /* Write the record first, VALID last, so a reset in between never
@@ -805,6 +976,34 @@ bool FOTA_bUartAcquire(void)
         return false;
     }
 
+    /* Identity, not just integrity. The XOR above proves we stored the bytes
+     * fr9 sent; it says nothing about whether those bytes are v%u32Version.
+     * This is the check that would have stopped the 2026-09-01 install loop at
+     * its source: fr9 served the 2.1.8 file labelled v20109, the XOR matched
+     * because 2.1.8 and 2.1.9 share size and xor8, and without this the tag
+     * committed metadata claiming a version the image simply was not.
+     *
+     * Rejecting costs one FOTA window. Accepting costs every window until a
+     * human notices — the bootloader is frozen in the field and will re-attempt
+     * the install on every boot for as long as the record says newer. */
+    uint32_t u32ImageVer = 0U;
+    if (!FOTA_bStagedImageIsVersion(u32Version, &u32ImageVer))
+    {
+        DBG_LOG("Fota: staged image identity MISMATCH - fr9 offered v%lu, image "
+                "declares v%lu - discarding (mislabelled upstream, NOT corruption)\r\n",
+                (unsigned long)u32Version, (unsigned long)u32ImageVer);
+
+        /* Same cleanup as the XOR-mismatch path above: metadata has not been
+         * committed, so nothing else treats this scratch as valid yet, and
+         * leaving known-wrong bytes there only gives the next acquire something
+         * to partially overwrite. */
+        if (!FOTA_bEraseScratch())
+            DBG_LOG("Fota: scratch erase after identity mismatch FAILED\r\n");
+        FLASH_vInhibitDeepPowerDown(false);
+        (void)FARMRANGER_bFwReportDone(false);
+        return false;
+    }
+
     if (!FOTA_bCommitMetadata(u32Version, u32StopAddr, u8Xor))
     {
         FLASH_vInhibitDeepPowerDown(false);
@@ -883,6 +1082,15 @@ static volatile bool bDistributeReq;
  * for an update that won't arrive. Only a sustained streak justifies erasing
  * — see the PRE-SEND block in FOTA_vDistribute. Cleared by any good verify. */
 static volatile uint8_t u8PreSendFailStreak = 0U;
+
+/* Set when the staged image's own fw_info disagrees with the version the
+ * metadata claims. Deliberately separate from u8PreSendFailStreak because the
+ * two mean opposite things: a failed XOR pass is "these bytes may be damaged,
+ * retry", while an identity mismatch is "these bytes are intact and are the
+ * WRONG FIRMWARE". Retrying cannot fix the latter, so it is latched, it
+ * suppresses the TimeSync advertisement outright, and it clears only when a
+ * staged image proves it is what it claims to be. */
+static volatile bool bStagedIdentityBad = false;
 
 /* Multi-primary listen-before-distribute: RTC tick of the last Ota* packet
  * heard whose session id was not our own (i.e. another primary's live
@@ -1556,6 +1764,30 @@ void FOTA_vDistribute(void)
         return;
     }
 
+    /* Integrity is settled; now identity. A primary is about to tell every
+     * secondary in range that these bytes are v%tMeta.u32Version, and each of
+     * them will commit metadata and hand it to a bootloader that cannot be
+     * updated. Distributing a mislabelled image does not cost one unit a FOTA
+     * window — it puts the whole fleet into the same permanent install loop,
+     * reachable only by wire.
+     *
+     * Refused rather than erased: a wrong label is an upstream fault, so
+     * re-acquiring would fetch the same wrong bytes and spin. Holding the image
+     * and staying quiet is stable, diagnosable, and leaves the unit fully
+     * functional on its current firmware. */
+    uint32_t u32StagedVer = 0U;
+    if (!FOTA_bStagedImageIsVersion(tMeta.u32Version, &u32StagedVer))
+    {
+        bStagedIdentityBad = true;
+        DBG_LOG("Fota: REFUSING to distribute - metadata says v%lu, image declares "
+                "v%lu. Mislabelled upstream; not advertising to secondaries\r\n",
+                (unsigned long)tMeta.u32Version, (unsigned long)u32StagedVer);
+        bDistributeActive = false;
+        FLASH_vInhibitDeepPowerDown(false);
+        return;
+    }
+    bStagedIdentityBad = false;
+
     /* Verified clean: the staged copy is deliverable, so clear any suspicion
      * raised by earlier failed passes and let it be advertised again. */
     u8PreSendFailStreak = 0U;
@@ -1778,7 +2010,11 @@ bool FOTA_bPrepPending(void)
 
 bool FOTA_bStagedImageTrusted(void)
 {
-    return (u8PreSendFailStreak == 0U);
+    /* Both gates, for opposite reasons: the streak means "we could not confirm
+     * this copy is deliverable", the identity flag means "this copy is
+     * deliverable and is the wrong firmware". Either must stop secondaries
+     * arming for an update they should not be offered. */
+    return (u8PreSendFailStreak == 0U) && !bStagedIdentityBad;
 }
 
 void FOTA_vDropStalePrep(void)
@@ -2057,6 +2293,36 @@ void FOTA_vSecondaryReceive(void)
             DBG_LOG("Fota: scratch erase after receive xor mismatch FAILED\r\n");
 
         (void)MESHNETWORK_bSendOtaResponse(au8Rpt, sizeof(au8Rpt));
+        bRxSessionActive = false;
+        FLASH_vInhibitDeepPowerDown(false);
+        return;
+    }
+
+    /* Last gate before this secondary commits metadata and hands the image to
+     * a bootloader it cannot update. The version here came off the air in an
+     * OtaPrep header — another assertion about the image rather than from it —
+     * so a primary that was itself mislabelled upstream would otherwise
+     * propagate the fault into every unit that received cleanly. A secondary
+     * has no fr9 and no UART in the field: if it installs the wrong firmware it
+     * loops on the next boot with nothing able to intervene. */
+    uint32_t u32RxImageVer = 0U;
+    if (!FOTA_bStagedImageIsVersion(tPrep.u32Version, &u32RxImageVer))
+    {
+        DBG_LOG("Fota: received image identity MISMATCH - Prep says v%lu, image "
+                "declares v%lu - rejecting, NOT installing\r\n",
+                (unsigned long)tPrep.u32Version, (unsigned long)u32RxImageVer);
+
+        /* Status byte is index 9 (see where au8Rpt is built above) — the image
+         * verified fine, so it is still OTA_RPT_VALID at this point and has to
+         * be corrected, or the primary would record this unit as UPDATED. */
+        au8Rpt[9] = (uint8_t)OTA_RPT_ERROR;
+        (void)MESHNETWORK_bSendOtaResponse(au8Rpt, sizeof(au8Rpt));
+
+        /* Drop the bytes: no metadata was committed, so nothing treats this
+         * scratch as valid, and a later distribute must not find it. */
+        if (!FOTA_bEraseScratch())
+            DBG_LOG("Fota: scratch erase after identity mismatch FAILED\r\n");
+
         bRxSessionActive = false;
         FLASH_vInhibitDeepPowerDown(false);
         return;

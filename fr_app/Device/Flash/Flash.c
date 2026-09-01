@@ -215,13 +215,39 @@ static bool FLASH_bGlobalUnprotect(void)
     return (FLASH_u8ReadStatusReg() & FLASH_STATUS_PROTECTED) == 0U;
 }
 
-/* Set once at init from the JEDEC ID read. When false (no chip fitted, or
- * SPI2 floating with nothing attached), every operation below returns
- * immediately without touching SPI - avoiding the bounded-but-still-3s
- * FLASH_bWaitReady() wait on every single call (LOG_vInit alone probes
- * every sector, so that wait multiplied by FLASH_NUM_SECTORS would turn
- * boot into a multi-minute stall). */
+/* The driver's usability gate. When false (no chip fitted, or SPI2 floating
+ * with nothing attached), every operation below returns immediately without
+ * touching SPI - avoiding the bounded-but-still-3s FLASH_bWaitReady() wait on
+ * every single call (LOG_vInit alone probes every sector, so that wait
+ * multiplied by FLASH_NUM_SECTORS would turn boot into a multi-minute stall).
+ *
+ * NOT latched for the life of the boot. It used to be: assigned once, from one
+ * unretried JEDEC read in FLASH_vInit, and never revisited. A single transient
+ * bad read therefore disabled logging and every FOTA erase/write until the unit
+ * was physically power-cycled - which is what happened on 2026-08-31 (log
+ * frozen mid-campaign for 18 h, FWDONE=ERR with 0 B delivered on every
+ * subsequent session, while SelfTest kept printing flash=OK). Recovery now runs
+ * from FLASH_bEnsurePresent() below, off ordinary traffic. */
 static bool bDevicePresent = false;
+
+/* Health/telemetry - see Flash_Health_t in Flash.h. Deliberately RAM + backup
+ * register only: when the flash is the thing that is broken, the flash log is
+ * not available to record why. */
+static bool     bEverAbsent         = false;
+static bool     bWriteProtectedSeen = false;
+static bool     bUnprotectFailed    = false;
+static bool     bEraseVerifyFail    = false;
+static uint8_t  au8LastId[3]        = {0};
+static uint8_t  u8LastAttempts      = 0U;
+static uint16_t u16ProbeFailures    = 0U;
+static uint16_t u16Recoveries       = 0U;
+static uint16_t u16EraseVerifyFails = 0U;
+
+/* Cooldown bookkeeping for the automatic re-probe. bProbedOnce distinguishes
+ * "never probed" from "probed at tick 0", so the first recovery attempt is not
+ * gated behind a full interval. */
+static uint32_t u32LastProbeTick    = 0U;
+static bool     bProbedOnce         = false;
 
 /* Read Status Register 2 (35h) - SRP1 / QE / CMP. Diagnostic only. */
 static uint8_t FLASH_u8ReadStatusReg2(void)
@@ -235,48 +261,88 @@ static uint8_t FLASH_u8ReadStatusReg2(void)
     return sr2;
 }
 
-/* --------------------------------------------------------------------------
- * Public API
- * -------------------------------------------------------------------------- */
-
-void FLASH_vInit(void)
+/* Mirror the fault state into a TAMP backup register. Survives reset and
+ * brownout, needs no external flash, and is readable by the next boot - the
+ * only durable record available when the log device itself is the casualty.
+ * The magic in the top bits keeps an uninitialised or unrelated value from
+ * being mistaken for health data. */
+static void FLASH_vPersistHealth(void)
 {
-    FLASH_vLock();
+    uint32_t u32Word = FLASH_HEALTH_BKP_MAGIC
+                     | (bDevicePresent      ? FLASH_HEALTH_BIT_PRESENT     : 0UL)
+                     | (bEverAbsent         ? FLASH_HEALTH_BIT_EVERABSENT  : 0UL)
+                     | (bWriteProtectedSeen ? FLASH_HEALTH_BIT_PROTECTED   : 0UL)
+                     | (bUnprotectFailed    ? FLASH_HEALTH_BIT_UNPROT_FAIL : 0UL)
+                     | (bEraseVerifyFail    ? FLASH_HEALTH_BIT_ERASEVFAIL  : 0UL)
+                     | ((uint32_t)au8LastId[0] << 8);
 
-    FLASH_vReleaseDeepPowerDown();
-    osDelay(1);
+    HAL_PWR_EnableBkUpAccess();
+    TAMP->BKP4R = u32Word;
+}
 
-    /* Read and report the raw JEDEC ID so a mismatch shows what came back:
-     * 00s => no clock/data (AF or wiring), FFs => MISO idle / CS not asserting,
-     * other => CPOL/CPHA or wrong part. */
-    uint8_t cmd   = FLASH_CMD_JEDEC_ID;
+/* Retried JEDEC-ID probe. Call with the flash mutex held and the device awake.
+ * Single source of truth for "is the right part answering" - FLASH_vInit,
+ * FLASH_bVerifyDeviceEx and the recovery path all route through this, so none
+ * of them can drift back to a one-shot read. */
+static bool FLASH_bProbeLocked(uint8_t *pu8Id, uint8_t *pu8Attempts)
+{
     uint8_t id[3] = {0};
-    FLASH_DRIVER_vSelect();
-    FLASH_DRIVER_vWrite(&cmd, 1);
-    FLASH_DRIVER_vRead(id, 3);
-    FLASH_DRIVER_vDeselect();
+    bool    bOk   = false;
+    uint8_t u8Try = 0U;
 
-
-
-    bDevicePresent = (id[0] == FLASH_MANUFACTURER_ID);
-
-    if (!bDevicePresent)
+    /* A single JEDEC read can come back wrong while the part is perfectly
+     * healthy - the same transient this codebase already documents elsewhere
+     * (see OTA_LORA_CHUNK_GAP_MS: a supply-rail sag makes a too-soon flash read
+     * return corrupt bytes). Reporting FAIL off one bad read was declaring
+     * every unit's flash dead while it was demonstrably reading, writing and
+     * holding the log fine.
+     *
+     * The raw bytes are handed back so the caller can log what actually came
+     * off the wire, which is what distinguishes the cases:
+     *   00 00 00 -> no clock/data (AF, wiring, bus not restored)
+     *   FF FF FF -> MISO idle / CS never asserted
+     *   other    -> CPOL/CPHA, timing, or genuinely the wrong part */
+    for (u8Try = 1U; u8Try <= FLASH_JEDEC_READ_ATTEMPTS; u8Try++)
     {
-        DBG("FLASH: JEDEC ID mismatch - got %02X %02X %02X (expected mfr %02X) - "
-            "no flash fitted, flash logging disabled\r\n",
-            id[0], id[1], id[2], FLASH_MANUFACTURER_ID);
-        FLASH_vUnlock();
-        return;
+        uint8_t cmd = FLASH_CMD_JEDEC_ID;
+
+        id[0] = id[1] = id[2] = 0U;
+        FLASH_DRIVER_vSelect();
+        FLASH_DRIVER_vWrite(&cmd, 1);
+        FLASH_DRIVER_vRead(id, 3);
+        FLASH_DRIVER_vDeselect();
+
+        if (id[0] == FLASH_MANUFACTURER_ID) { bOk = true; break; }
+
+        osDelay(2);   /* let the rail settle before re-reading */
     }
 
-    DBG("FLASH: JEDEC ID %02X %02X %02X OK\r\n", id[0], id[1], id[2]);
+    if (u8Try > FLASH_JEDEC_READ_ATTEMPTS) u8Try = FLASH_JEDEC_READ_ATTEMPTS;
 
-    /* Report protection state and self-heal a chip stuck write-protected.
-     * Block protection (BP0..BP4) and SRP0 are non-volatile and block
-     * program/erase while leaving reads working, so a device that got into
-     * this state would otherwise freeze its log and ignore chip-erase forever.
-     * SR2 (SRP1/CMP) distinguishes the recoverable Hardware-Protected case
-     * from the permanent OTP case, and is needed to interpret BP. */
+    au8LastId[0]   = id[0];
+    au8LastId[1]   = id[1];
+    au8LastId[2]   = id[2];
+    u8LastAttempts = u8Try;
+    if (!bOk && (u16ProbeFailures < UINT16_MAX)) u16ProbeFailures++;
+
+    if (pu8Id != NULL) { pu8Id[0] = id[0]; pu8Id[1] = id[1]; pu8Id[2] = id[2]; }
+    if (pu8Attempts != NULL) *pu8Attempts = u8Try;
+
+    return bOk;
+}
+
+/* Post-identification bring-up: report protection state, self-heal a chip stuck
+ * write-protected, and leave the device disarmed. Call with the mutex held,
+ * only once the part has answered. Factored out of FLASH_vInit so the recovery
+ * path gets it too - a device whose gate re-opens mid-run has not been through
+ * init and may never have had its protection bits cleared. */
+static void FLASH_vBringUpLocked(void)
+{
+    /* Block protection (BP0..BP4) and SRP0 are non-volatile and block
+     * program/erase while leaving reads working, so a device that got into this
+     * state would otherwise freeze its log and ignore chip-erase forever.
+     * SR2 (SRP1/CMP) distinguishes the recoverable Hardware-Protected case from
+     * the permanent OTP case, and is needed to interpret BP. */
     uint8_t sr1 = FLASH_u8ReadStatusReg();
     uint8_t sr2 = FLASH_u8ReadStatusReg2();
 
@@ -291,18 +357,298 @@ void FLASH_vInit(void)
 
     if (sr1 & FLASH_STATUS_PROTECTED)
     {
+        bWriteProtectedSeen = true;
         DBG("FLASH: write-protected - performing global unprotect\r\n");
         if (FLASH_bGlobalUnprotect())
+        {
+            bUnprotectFailed = false;
             DBG("FLASH: unprotected, SR1=%02X\r\n", FLASH_u8ReadStatusReg());
+        }
         else
+        {
+            bUnprotectFailed = true;
             DBG("FLASH: unprotect FAILED, SR1=%02X - SR hardware-locked, "
                 "drive WP# pin HIGH and retry\r\n", FLASH_u8ReadStatusReg());
+        }
     }
 
     /* Start from a known-safe, disarmed state: with WP# grounded the only thing
      * standing between us and a permanent write-lock is never accepting a stray
      * WRSR, which requires WEL=0 at idle. */
     FLASH_vWriteDisable();
+}
+
+/* The gate, with self-recovery. Call with the mutex held. Cheap in the normal
+ * case (one bool test); when the gate is shut it re-probes at most once per
+ * FLASH_REPROBE_INTERVAL_MS and, on success, brings the device back up and
+ * re-opens the gate.
+ *
+ * This is what makes a transient survivable without a power cycle - the whole
+ * point, given a field unit cannot be reprogrammed by wire and depends on FOTA
+ * to ever be fixed again. A genuinely absent chip still costs only one
+ * throttled probe per interval, which is what the gate was protecting against
+ * in the first place. */
+static bool FLASH_bEnsurePresent(void)
+{
+    if (bDevicePresent)
+        return true;
+
+    uint32_t u32Now = osKernelGetTickCount();
+    if (bProbedOnce && ((u32Now - u32LastProbeTick) < FLASH_REPROBE_INTERVAL_MS))
+        return false;
+
+    u32LastProbeTick = u32Now;
+    bProbedOnce      = true;
+
+    FLASH_vEnsureAwake();
+    if (!FLASH_bProbeLocked(NULL, NULL))
+    {
+        FLASH_vPersistHealth();
+        return false;
+    }
+
+    bDevicePresent = true;
+    if (u16Recoveries < UINT16_MAX) u16Recoveries++;
+    DBG("FLASH: device recovered - JEDEC %02X %02X %02X, gate re-opened "
+        "(%u failed probes since boot)\r\n",
+        au8LastId[0], au8LastId[1], au8LastId[2], (unsigned)u16ProbeFailures);
+
+    FLASH_vBringUpLocked();
+    FLASH_vPersistHealth();
+    return true;
+}
+
+/* Confirm an erase actually blanked the region. Call with the mutex held, after
+ * the erase has completed. Uses a raw read rather than FLASH_vRead so a verify
+ * failure does not pollute the read-failure telemetry with something that is
+ * not a read fault. Returns false if the bytes are not all-ones, or if the
+ * read-back itself could not be performed - in both cases the erase must not be
+ * reported as successful. */
+static bool FLASH_bVerifyErasedLocked(uint32_t u32Addr, uint32_t u32Len)
+{
+    uint8_t  au8Buf[FLASH_ERASE_VERIFY_BYTES];
+    uint16_t u16Chunk = (uint16_t)((u32Len < (uint32_t)FLASH_ERASE_VERIFY_BYTES)
+                                   ? u32Len : (uint32_t)FLASH_ERASE_VERIFY_BYTES);
+
+    /* Sample the first and last chunk of the region. A protected device fails
+     * uniformly so one sample would do, but a partially-completed erase (a
+     * power dip mid-operation) leaves the tail unerased - and the tail is
+     * exactly what a sequential writer fills last and would notice last. */
+    uint32_t au32Offsets[2];
+    au32Offsets[0] = 0UL;
+    au32Offsets[1] = (u32Len > (uint32_t)u16Chunk) ? (u32Len - (uint32_t)u16Chunk) : 0UL;
+
+    if (u16Chunk == 0U)
+        return true;
+
+    for (uint8_t i = 0U; i < 2U; i++)
+    {
+        uint32_t u32At = u32Addr + au32Offsets[i];
+        uint8_t  cmd[4] = {
+            FLASH_CMD_READ,
+            (uint8_t)((u32At >> 16) & 0xFFU),
+            (uint8_t)((u32At >>  8) & 0xFFU),
+            (uint8_t)((u32At      ) & 0xFFU),
+        };
+
+        FLASH_DRIVER_vSelect();
+        HAL_StatusTypeDef tCmd  = FLASH_DRIVER_vWrite(cmd, 4);
+        HAL_StatusTypeDef tData = (tCmd == HAL_OK)
+                                ? FLASH_DRIVER_vRead(au8Buf, u16Chunk) : HAL_OK;
+        FLASH_DRIVER_vDeselect();
+
+        if ((tCmd != HAL_OK) || (tData != HAL_OK))
+            return false;
+
+        for (uint16_t j = 0U; j < u16Chunk; j++)
+        {
+            if (au8Buf[j] != FLASH_ERASED_BYTE)
+                return false;
+        }
+
+        if (au32Offsets[1] == au32Offsets[0])
+            break;   /* region smaller than one chunk - one sample covers it */
+    }
+
+    return true;
+}
+
+/* Issue one erase command and wait for it to complete. Call with the mutex held
+ * and the device known present. Shared by all three erase entry points so the
+ * WREN / command / disarm-on-failure / wait sequence exists in exactly one
+ * place - and so the retry below re-issues an identical operation. */
+static bool FLASH_bIssueEraseLocked(const uint8_t *pu8Cmd, uint8_t u8CmdLen,
+                                    uint32_t u32TimeoutMs)
+{
+    if (!FLASH_bWaitReady())
+        return false;
+
+    FLASH_vWriteEnable();
+    FLASH_DRIVER_vSelect();
+    bool bOk = (FLASH_DRIVER_vWrite((uint8_t *)pu8Cmd, u8CmdLen) == HAL_OK);
+    FLASH_DRIVER_vDeselect();
+
+    if (!bOk)
+    {
+        FLASH_vWriteDisable();   /* never leave the device armed (WEL=1) */
+        return false;
+    }
+
+    /* Commit before returning - see FLASH_vPageWrite for why a self-contained
+     * write matters. */
+    return FLASH_bWaitReadyTimeout(u32TimeoutMs);
+}
+
+/* Erase a region and PROVE it happened, self-healing a protected chip.
+ *
+ * A block-protected device accepts the erase command, never raises WIP and
+ * returns to ready, so the command sequence above succeeds while the old
+ * contents survive untouched. Reporting that as a successful erase is how a
+ * stale FOTA scratch region gets written over and only fails much later at the
+ * whole-image XOR - or not at all.
+ *
+ * On a verify failure the prime suspect is latched block protection, so it is
+ * cleared and the erase retried once, here, rather than surfacing a failure the
+ * caller would only retry on the next campaign. A field unit cannot be
+ * reprogrammed by wire, so it is worth spending one extra erase to avoid
+ * needing another whole FOTA window. */
+static bool FLASH_bEraseRegionLocked(const uint8_t *pu8Cmd, uint8_t u8CmdLen,
+                                     uint32_t u32Base, uint32_t u32Len,
+                                     uint32_t u32TimeoutMs)
+{
+    if (!FLASH_bIssueEraseLocked(pu8Cmd, u8CmdLen, u32TimeoutMs))
+        return false;
+
+    if (FLASH_bVerifyErasedLocked(u32Base, u32Len))
+        return true;
+
+    uint8_t sr1 = FLASH_u8ReadStatusReg();
+    DBG("FLASH: erase @%06lX len %lu did NOT blank - SR1=%02X%s\r\n",
+        (unsigned long)u32Base, (unsigned long)u32Len, sr1,
+        (sr1 & FLASH_STATUS_PROTECTED) ? " (block-protected)" : "");
+
+    bool bRetryWorthwhile = false;
+    if (sr1 & FLASH_STATUS_PROTECTED)
+    {
+        bWriteProtectedSeen = true;
+        if (FLASH_bGlobalUnprotect())
+        {
+            bUnprotectFailed = false;
+            bRetryWorthwhile = true;
+            DBG("FLASH: protection cleared - retrying the erase once\r\n");
+        }
+        else
+        {
+            bUnprotectFailed = true;
+            DBG("FLASH: unprotect FAILED - SR hardware-locked, drive WP# HIGH\r\n");
+        }
+    }
+
+    if (bRetryWorthwhile &&
+        FLASH_bIssueEraseLocked(pu8Cmd, u8CmdLen, u32TimeoutMs) &&
+        FLASH_bVerifyErasedLocked(u32Base, u32Len))
+    {
+        DBG("FLASH: erase @%06lX succeeded after clearing protection\r\n",
+            (unsigned long)u32Base);
+        /* Still recorded: the chip needed rescuing, and a unit that keeps
+         * needing it is telling us something the success return hides. */
+        bEraseVerifyFail = true;
+        if (u16EraseVerifyFails < UINT16_MAX) u16EraseVerifyFails++;
+        FLASH_vPersistHealth();
+        return true;
+    }
+
+    bEraseVerifyFail = true;
+    if (u16EraseVerifyFails < UINT16_MAX) u16EraseVerifyFails++;
+    FLASH_vPersistHealth();
+    return false;
+}
+
+/* --------------------------------------------------------------------------
+ * Public API
+ * -------------------------------------------------------------------------- */
+
+void FLASH_vInit(void)
+{
+    FLASH_vLock();
+
+    /* Report what the PREVIOUS boot left behind before overwriting it. This is
+     * the only fault record that survives a reset when the flash itself is the
+     * casualty — the flash log obviously cannot hold "the flash stopped
+     * working", and the UART line that used to carry it is unavailable on a
+     * deployed unit. A watchdog reset or brownout otherwise erases all evidence
+     * that the tag had been running gated-off. */
+    uint32_t u32Prev = TAMP->BKP4R;
+    if ((u32Prev & FLASH_HEALTH_BKP_MAGIC_MASK) == FLASH_HEALTH_BKP_MAGIC)
+    {
+        if ((u32Prev & (FLASH_HEALTH_BIT_EVERABSENT |
+                        FLASH_HEALTH_BIT_PROTECTED  |
+                        FLASH_HEALTH_BIT_UNPROT_FAIL|
+                        FLASH_HEALTH_BIT_ERASEVFAIL)) != 0UL)
+        {
+            DBG("FLASH: previous boot health - present=%u everAbsent=%u wprot=%u "
+                "unprotFail=%u eraseVfyFail=%u lastMfr=%02X\r\n",
+                (unsigned)((u32Prev & FLASH_HEALTH_BIT_PRESENT)     ? 1U : 0U),
+                (unsigned)((u32Prev & FLASH_HEALTH_BIT_EVERABSENT)  ? 1U : 0U),
+                (unsigned)((u32Prev & FLASH_HEALTH_BIT_PROTECTED)   ? 1U : 0U),
+                (unsigned)((u32Prev & FLASH_HEALTH_BIT_UNPROT_FAIL) ? 1U : 0U),
+                (unsigned)((u32Prev & FLASH_HEALTH_BIT_ERASEVFAIL)  ? 1U : 0U),
+                (unsigned)((u32Prev >> 8) & 0xFFU));
+        }
+    }
+
+    FLASH_vReleaseDeepPowerDown();
+    osDelay(1);
+
+    /* RETRIED, never a single shot. This one assignment decides whether every
+     * write and erase in the driver is permitted, so it must not be decided by
+     * a read that this codebase already documents as untrustworthy in
+     * isolation. The unretried version here is what gated a healthy tag's flash
+     * off for 18 h on 2026-08-31: one bad read at boot, log frozen, and every
+     * FOTA erase failing instantly with FWDONE=ERR / 0 B delivered.
+     *
+     * The raw bytes are still reported on a mismatch so a genuine fault stays
+     * diagnosable: 00s => no clock/data (AF or wiring), FFs => MISO idle / CS
+     * not asserting, other => CPOL/CPHA or wrong part. */
+    uint8_t id[3]      = {0};
+    uint8_t u8Attempts = 0U;
+    uint8_t u8Round    = 0U;
+
+    for (u8Round = 1U; u8Round <= FLASH_BOOT_PROBE_ROUNDS; u8Round++)
+    {
+        bDevicePresent = FLASH_bProbeLocked(id, &u8Attempts);
+        if (bDevicePresent)
+            break;
+        if (u8Round < FLASH_BOOT_PROBE_ROUNDS)
+            osDelay(FLASH_BOOT_PROBE_SETTLE_MS);
+    }
+
+    bProbedOnce      = true;
+    u32LastProbeTick = osKernelGetTickCount();
+
+    if (!bDevicePresent)
+    {
+        bEverAbsent = true;
+        DBG("FLASH: JEDEC ID mismatch after %u rounds x %u attempts - got "
+            "%02X %02X %02X (expected mfr %02X) - flash logging and FOTA staging "
+            "disabled until a re-probe succeeds\r\n",
+            (unsigned)FLASH_BOOT_PROBE_ROUNDS, (unsigned)FLASH_JEDEC_READ_ATTEMPTS,
+            id[0], id[1], id[2], FLASH_MANUFACTURER_ID);
+        FLASH_vPersistHealth();
+        FLASH_vUnlock();
+        return;
+    }
+
+    if ((u8Attempts > 1U) || (u8Round > 1U))
+        DBG("FLASH: JEDEC ID %02X %02X %02X OK on round %u attempt %u "
+            "(earlier read(s) transient - the chip is fine, the first read was not)\r\n",
+            id[0], id[1], id[2], (unsigned)u8Round, (unsigned)u8Attempts);
+    else
+        DBG("FLASH: JEDEC ID %02X %02X %02X OK\r\n", id[0], id[1], id[2]);
+
+    /* Report protection state and self-heal a chip stuck write-protected. */
+    FLASH_vBringUpLocked();
+    FLASH_vPersistHealth();
 
 //    FLASH_vChipErase();
 
@@ -342,56 +688,99 @@ bool FLASH_bVerifyDevice(void)
 
 bool FLASH_bVerifyDeviceEx(uint8_t *pu8Id, uint8_t *pu8Attempts)
 {
-    uint8_t id[3] = {0};
-    bool    bOk   = false;
-    uint8_t u8Try = 0U;
+    FLASH_vLock();
+    FLASH_vEnsureAwake();
+    bool bOk = FLASH_bProbeLocked(pu8Id, pu8Attempts);
+    FLASH_vUnlock();
+    return bOk;
+}
 
+bool FLASH_bDevicePresent(void)
+{
+    FLASH_vLock();
+    bool bPresent = bDevicePresent;
+    FLASH_vUnlock();
+    return bPresent;
+}
+
+bool FLASH_bRecoverDevice(uint8_t *pu8Id, uint8_t *pu8Attempts)
+{
     FLASH_vLock();
     FLASH_vEnsureAwake();
 
-    /* Retried, not single-shot. A single JEDEC read can come back wrong while
-     * the part is perfectly healthy — the same transient this codebase already
-     * documents elsewhere (see OTA_LORA_CHUNK_GAP_MS: a supply-rail sag makes
-     * a too-soon flash read return corrupt bytes). Reporting FAIL off one bad
-     * read was declaring every unit's flash dead while it was demonstrably
-     * reading, writing and holding the log fine.
-     *
-     * The raw bytes are handed back so the caller can log what actually came
-     * off the wire, which is what distinguishes the cases:
-     *   00 00 00 -> no clock/data (AF, wiring, bus not restored)
-     *   FF FF FF -> MISO idle / CS never asserted
-     *   other    -> CPOL/CPHA, timing, or genuinely the wrong part */
-    for (u8Try = 1U; u8Try <= FLASH_JEDEC_READ_ATTEMPTS; u8Try++)
+    bProbedOnce      = true;
+    u32LastProbeTick = osKernelGetTickCount();
+
+    bool bWasPresent = bDevicePresent;
+    bool bNowPresent = FLASH_bProbeLocked(pu8Id, pu8Attempts);
+
+    if (bNowPresent)
     {
-        uint8_t cmd = FLASH_CMD_JEDEC_ID;
+        bDevicePresent = true;
+        if (!bWasPresent)
+        {
+            if (u16Recoveries < UINT16_MAX) u16Recoveries++;
+            DBG("FLASH: device recovered on demand - gate re-opened\r\n");
+        }
+        /* Re-run bring-up unconditionally: a chip that has just answered may
+         * never have been through init (recovered mid-run), and one that has
+         * may since have latched protection. Both cases need the SR checked and
+         * the device left disarmed. */
+        FLASH_vBringUpLocked();
+    }
+    else
+    {
+        bEverAbsent = true;
 
-        id[0] = id[1] = id[2] = 0U;
-        FLASH_DRIVER_vSelect();
-        FLASH_DRIVER_vWrite(&cmd, 1);
-        FLASH_DRIVER_vRead(id, 3);
-        FLASH_DRIVER_vDeselect();
-
-        if (id[0] == FLASH_MANUFACTURER_ID) { bOk = true; break; }
-
-        osDelay(2);   /* let the rail settle before re-reading */
+        /* Deliberately does NOT close an already-open gate.
+         *
+         * The two directions are not symmetric. Wrongly leaving the gate open
+         * costs nothing - the individual operations fail on their own, bounded
+         * and reported. Wrongly closing it disables logging and FOTA staging
+         * wholesale, on a unit that cannot be reprogrammed by wire, which is
+         * precisely the failure being fixed here. Since a probe can fail on a
+         * perfectly healthy chip (that is the whole premise of the retry
+         * logic), letting one failed probe shut a working driver would just
+         * reintroduce the bug through a different door.
+         *
+         * A chip that has genuinely stopped answering still surfaces: reads
+         * record FLASH_RDFAIL_* telemetry and erases fail their verify, both of
+         * which are visible in the health word. */
+        if (bWasPresent)
+            DBG("FLASH: probe failed but gate left OPEN - a single failed probe "
+                "is not evidence of a dead chip (id=%02X %02X %02X)\r\n",
+                au8LastId[0], au8LastId[1], au8LastId[2]);
     }
 
+    FLASH_vPersistHealth();
     FLASH_vUnlock();
+    return bDevicePresent;
+}
 
-    if (pu8Id != NULL)
-    {
-        pu8Id[0] = id[0]; pu8Id[1] = id[1]; pu8Id[2] = id[2];
-    }
-    if (pu8Attempts != NULL)
-        *pu8Attempts = u8Try > FLASH_JEDEC_READ_ATTEMPTS ? FLASH_JEDEC_READ_ATTEMPTS : u8Try;
+void FLASH_vGetHealth(Flash_Health_t *ptHealth)
+{
+    if (ptHealth == NULL) return;
 
-    return bOk;
+    FLASH_vLock();
+    ptHealth->bPresent            = bDevicePresent;
+    ptHealth->bEverAbsent         = bEverAbsent;
+    ptHealth->bWriteProtected     = bWriteProtectedSeen;
+    ptHealth->bUnprotectFailed    = bUnprotectFailed;
+    ptHealth->bEraseVerifyFail    = bEraseVerifyFail;
+    ptHealth->au8LastId[0]        = au8LastId[0];
+    ptHealth->au8LastId[1]        = au8LastId[1];
+    ptHealth->au8LastId[2]        = au8LastId[2];
+    ptHealth->u8LastAttempts      = u8LastAttempts;
+    ptHealth->u16ProbeFailures    = u16ProbeFailures;
+    ptHealth->u16Recoveries       = u16Recoveries;
+    ptHealth->u16EraseVerifyFails = u16EraseVerifyFails;
+    FLASH_vUnlock();
 }
 
 bool FLASH_vRead(uint32_t addr, uint8_t *buf, uint16_t len)
 {
     FLASH_vLock();
-    if (!bDevicePresent)
+    if (!FLASH_bEnsurePresent())
     {
         FLASH_vRecordReadFail(FLASH_RDFAIL_ABSENT, addr, 0U);
         FLASH_vUnlock();
@@ -432,7 +821,7 @@ bool FLASH_vRead(uint32_t addr, uint8_t *buf, uint16_t len)
 bool FLASH_vPageWrite(uint32_t addr, const uint8_t *buf, uint16_t len)
 {
     FLASH_vLock();
-    if (!bDevicePresent)
+    if (!FLASH_bEnsurePresent())
     {
         FLASH_vUnlock();
         return false;
@@ -473,7 +862,7 @@ bool FLASH_vPageWrite(uint32_t addr, const uint8_t *buf, uint16_t len)
 bool FLASH_vSectorErase(uint32_t addr)
 {
     FLASH_vLock();
-    if (!bDevicePresent)
+    if (!FLASH_bEnsurePresent())
     {
         FLASH_vUnlock();
         return false;
@@ -485,20 +874,15 @@ bool FLASH_vSectorErase(uint32_t addr)
         (uint8_t)((addr >>  8) & 0xFFU),
         (uint8_t)((addr      ) & 0xFFU),
     };
-    if (!FLASH_bWaitReady())
-    {
-        FLASH_vUnlock();
-        return false;
-    }
 
-    FLASH_vWriteEnable();
-    FLASH_DRIVER_vSelect();
-    bool bOk = (FLASH_DRIVER_vWrite(cmd, 4) == HAL_OK);
-    FLASH_DRIVER_vDeselect();
-    if (!bOk)
-        FLASH_vWriteDisable();   /* never leave the device armed (WEL=1) */
-    else
-        bOk = FLASH_bWaitReady();   /* commit before returning — see FLASH_vPageWrite */
+    /* Erased + verified, with a protection-clearing retry — see
+     * FLASH_bEraseRegionLocked. The region checked is the whole sector the
+     * address falls in, which is what the device actually erases. */
+    bool bOk = FLASH_bEraseRegionLocked(
+                   cmd, 4U,
+                   addr & ~((uint32_t)FLASH_SECTOR_SIZE_BYTES - 1UL),
+                   (uint32_t)FLASH_SECTOR_SIZE_BYTES,
+                   FLASH_WAIT_READY_TIMEOUT_MS);
     FLASH_vUnlock();
     return bOk;
 }
@@ -506,7 +890,7 @@ bool FLASH_vSectorErase(uint32_t addr)
 bool FLASH_vBlockErase(uint32_t addr)
 {
     FLASH_vLock();
-    if (!bDevicePresent)
+    if (!FLASH_bEnsurePresent())
     {
         FLASH_vUnlock();
         return false;
@@ -518,22 +902,15 @@ bool FLASH_vBlockErase(uint32_t addr)
         (uint8_t)((addr >>  8) & 0xFFU),
         (uint8_t)((addr      ) & 0xFFU),
     };
-    if (!FLASH_bWaitReady())
-    {
-        FLASH_vUnlock();
-        return false;
-    }
 
-    FLASH_vWriteEnable();
-    FLASH_DRIVER_vSelect();
-    bool bOk = (FLASH_DRIVER_vWrite(cmd, 4) == HAL_OK);
-    FLASH_DRIVER_vDeselect();
-    if (!bOk)
-        FLASH_vWriteDisable();   /* never leave the device armed (WEL=1) */
-    else
-        /* 64 KB erase is far slower than a sector erase, so it gets its own
-         * budget rather than the generic pre-command one. */
-        bOk = FLASH_bWaitReadyTimeout(FLASH_BLOCK_ERASE_TIMEOUT_MS);
+    /* A 64 KB erase is far slower than a sector erase, so it gets its own
+     * budget rather than the generic pre-command one. Verified and retried the
+     * same way — see FLASH_bEraseRegionLocked. */
+    bool bOk = FLASH_bEraseRegionLocked(
+                   cmd, 4U,
+                   addr & ~((uint32_t)FLASH_BLOCK_SIZE_BYTES - 1UL),
+                   (uint32_t)FLASH_BLOCK_SIZE_BYTES,
+                   FLASH_BLOCK_ERASE_TIMEOUT_MS);
     FLASH_vUnlock();
     return bOk;
 }
@@ -541,13 +918,14 @@ bool FLASH_vBlockErase(uint32_t addr)
 bool FLASH_vChipErase(void)
 {
     FLASH_vLock();
-    if (!bDevicePresent)
+    if (!FLASH_bEnsurePresent())
     {
         FLASH_vUnlock();
         return false;
     }
 
     uint8_t cmd = FLASH_CMD_CHIP_ERASE;
+
     if (!FLASH_bWaitReady())
     {
         FLASH_vUnlock();
@@ -561,18 +939,16 @@ bool FLASH_vChipErase(void)
     if (FLASH_u8ReadStatusReg() & FLASH_STATUS_PROTECTED)
         (void)FLASH_bGlobalUnprotect();
 
-    FLASH_vWriteEnable();
-    FLASH_DRIVER_vSelect();
-    bool bOk = (FLASH_DRIVER_vWrite(&cmd, 1) == HAL_OK);
-    FLASH_DRIVER_vDeselect();
-    if (!bOk)
-    {
-        FLASH_vWriteDisable();   /* never leave the device armed (WEL=1) */
-        FLASH_vUnlock();
-        return false;
-    }
+    /* Verified like the other two, and doubly worth it here: chip erase is the
+     * recovery operation, so silently "succeeding" while doing nothing is the
+     * worst failure mode this driver has. Reading back all 512 KB to prove it
+     * would be absurd, so FLASH_bVerifyErasedLocked samples the head and tail
+     * of the device - where a protected or interrupted erase shows up. */
+    bool bReady = FLASH_bEraseRegionLocked(
+                      &cmd, 1U, 0UL,
+                      (uint32_t)FLASH_NUM_SECTORS * (uint32_t)FLASH_SECTOR_SIZE_BYTES,
+                      FLASH_CHIP_ERASE_TIMEOUT_MS);
 
-    bool bReady = FLASH_bWaitReadyTimeout(FLASH_CHIP_ERASE_TIMEOUT_MS);
     FLASH_vUnlock();
     return bReady;
 }

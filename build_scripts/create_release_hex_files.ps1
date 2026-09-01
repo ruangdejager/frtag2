@@ -124,6 +124,37 @@ if ($has_bootloader) {
 # computed once here rather than once per destination.
 $app_bin_bytes = [System.IO.File]::ReadAllBytes($bin_file_path)
 
+# ---- Identity gate: does the image agree with the version we are labelling it?
+# The linker KEEPs a .fw_info record (major/minor/patch, uint16 LE) at image
+# offset 0x200. The tag bootloader reads it to decide what is installed, and
+# both fr9 and the tag app now check it before adopting or installing an image.
+# Verifying it HERE means a mislabelled artifact cannot be published at all.
+#
+# Worth the six bytes: on 2026-09-01, 2.1.7/2.1.8/2.1.9 all built to exactly
+# 109068 B with an identical xor8 of 0xC5, fr9's "already on the filesystem"
+# check is (size, xor8), so it adopted the previous release and served it under
+# the new version number. Tags installed it, booted reporting the old version,
+# were offered the "new" one again, and looped until a human intervened. A
+# stale or wrongly-named bin reaching this script would do the same thing.
+$fw_info_offset = 0x200
+if ($app_bin_bytes.Length -lt ($fw_info_offset + 6)) {
+    Write-Host "ABORT: bin is only $($app_bin_bytes.Length) B - too small to hold fw_info at 0x200"
+    exit 1
+}
+$bin_major = [uint16]$app_bin_bytes[$fw_info_offset]     + ([uint16]$app_bin_bytes[$fw_info_offset + 1] -shl 8)
+$bin_minor = [uint16]$app_bin_bytes[$fw_info_offset + 2] + ([uint16]$app_bin_bytes[$fw_info_offset + 3] -shl 8)
+$bin_patch = [uint16]$app_bin_bytes[$fw_info_offset + 4] + ([uint16]$app_bin_bytes[$fw_info_offset + 5] -shl 8)
+$bin_version_str = "${bin_major}.${bin_minor}.${bin_patch}"
+
+if ($bin_version_str -ne $version_str) {
+    Write-Host "ABORT: version mismatch - version_config.h says $version_str but the built"
+    Write-Host "       bin's fw_info record says $bin_version_str."
+    Write-Host "       $bin_file_path is stale or is not the image for this version."
+    Write-Host "       Rebuild in CubeIDE before publishing; nothing has been written."
+    exit 1
+}
+Write-Host "fw_info check OK: bin declares v$bin_version_str, matching version_config.h"
+
 # CRC32 (IEEE 802.3, poly 0xEDB88320) computed manually to avoid PowerShell
 # hex-literal quirks (>= 0x80000000 parses as negative Int32; use ToUInt32).
 $CRC32_POLY = [Convert]::ToUInt32("EDB88320", 16)
@@ -165,6 +196,39 @@ $manifest_json = ($manifest | ConvertTo-Json)
 # plus the version.json naming it. version.json's "file" field is what fr9's
 # manifest parser (TAGFOTA_pacManifestFile) goes by — no "latest.bin"
 # fallback, and both repos get byte-identical bin + manifest.
+# ---- Collision warning against the manifest currently live -----------------
+# fr9's "is this already on my filesystem?" check is (size, xor8). Two releases
+# that agree on both are indistinguishable to it, and the older bytes get
+# re-served under the newer version number - the 2026-09-01 install loop.
+#
+# fr9 and the tag now check the image's fw_info record as well, so a collision
+# is harmless once BOTH are deployed. Until then it is still live ammunition,
+# and this is the last point where a human can see it coming.
+foreach ($publish_dir in $publish_dirs) {
+    $live_manifest_path = "$publish_dir\version.json"
+    if (Test-Path $live_manifest_path) {
+        try {
+            $live = Get-Content $live_manifest_path -Raw | ConvertFrom-Json
+            if (($live.version -ne $version_str) -and
+                ([uint32]$live.size -eq [uint32]$app_bin_bytes.Length) -and
+                ($live.xor -eq $xor8_hex)) {
+                Write-Host ""
+                Write-Host "*** WARNING: (size, xor8) COLLISION with the live manifest ***"
+                Write-Host "    $publish_dir"
+                Write-Host "    live: v$($live.version)  size=$($live.size)  xor=$($live.xor)"
+                Write-Host "    new:  v$version_str  size=$($app_bin_bytes.Length)  xor=$xor8_hex"
+                Write-Host "    An fr9 that predates the fw_info identity check will treat the"
+                Write-Host "    file it already has as this release and never download the new"
+                Write-Host "    bytes. Confirm every fr9 in the fleet is updated before relying"
+                Write-Host "    on this release reaching tags."
+                Write-Host ""
+            }
+        } catch {
+            Write-Host "Note: could not parse existing $live_manifest_path - skipping collision check"
+        }
+    }
+}
+
 foreach ($publish_dir in $publish_dirs) {
     $app_bin_published = "$publish_dir\frtag2_${Major}_${Minor}_${Patch}.bin"
     Copy-Item $bin_file_path -Destination $app_bin_published -Force

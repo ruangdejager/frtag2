@@ -33,9 +33,13 @@ typedef enum {
  * Blocking; returns once the sequence is done. */
 void SELFTEST_vRunAndReport(void);
 
-/* Query API for FrKernel — read the memoized result. A "not applicable"
- * test (GPS on primary, flash on MicroSD build) counts as OK so callers
- * can decide with the *Applicable() pair. */
+/* Query API for FrKernel. GPS and ACC read the memoized boot-time result.
+ * FLASH is answered LIVE from the driver gate instead: that gate can close and
+ * re-open at run time, so a boot snapshot would keep reporting OK on a unit
+ * whose log and FOTA staging had since stopped working — the exact failure this
+ * check is meant to catch. A "not applicable" test (GPS on primary, flash on
+ * MicroSD build) counts as OK so callers can decide with the *Applicable()
+ * pair. */
 bool SELFTEST_bGpsOk(void);
 bool SELFTEST_bAccOk(void);
 bool SELFTEST_bFlashOk(void);

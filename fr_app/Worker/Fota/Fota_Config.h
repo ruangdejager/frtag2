@@ -116,6 +116,47 @@
  * treats that as "no app installed" (version 0), not as a huge version. */
 #define OTA_FW_INFO_ADDR         (OTA_APP_BASE_ADDR + 0x200UL)
 
+/* Same record's offset WITHIN an image, i.e. into the OTA scratch copy. The
+ * scratch is byte-mapped onto the app region (scratch 0 == OTA_APP_BASE_ADDR),
+ * so a staged image carries its own version at this offset and can be asked
+ * what it actually is - as opposed to what a manifest, an fr9 or a LoRa Prep
+ * packet CLAIMS it is. Those are the only sources of version identity the tag
+ * had until now, and on 2026-09-01 they were all wrong together: fr9 adopted a
+ * byte-identical 2.1.8 file as v20109 (its staleness check is size+xor8, and
+ * 2.1.7/2.1.8/2.1.9 all built to 109068 B with xor8 0xC5), served it under the
+ * new version number, and every layer downstream agreed because every layer
+ * was checking integrity, not identity. The image itself was the one witness
+ * that could not be fooled. */
+#define OTA_FW_INFO_OFFSET       0x200UL
+
+/* An image whose fw_info does not match the version it is being staged,
+ * distributed or installed under is REJECTED. Fail-closed is safe here: every
+ * published artifact from 2.0.1 onward carries a correct fw_info record (the
+ * linker KEEPs the .fw_info section), so a mismatch means the bytes are not
+ * the firmware they are labelled as - which is exactly the condition that
+ * cost a fleet-wide FOTA window. */
+
+/* Consecutive boots where the bootloader was handed a newer staged image and
+ * did NOT install it, before the app erases that image and re-acquires.
+ *
+ * This exists because the bootloader is frozen in the field and re-evaluates
+ * the metadata record on EVERY boot: while meta.version > installed version it
+ * will keep trying, so an image it cannot or will not install loops forever
+ * with no backoff, burning battery and every FOTA window. The app is the only
+ * layer left that can break that loop, and it can only do so by invalidating
+ * the record the bootloader keeps acting on. 3 gives a genuine transient (one
+ * bad SPI read during the bootloader's verify pass) room to recover on its
+ * own before the image is thrown away. */
+#define OTA_INSTALL_FAIL_MAX     3U
+
+/* Backup register holding that counter across the resets it is counting.
+ * BKP0R/1R = app->bootloader handoff, BKP2R = bootloader version,
+ * BKP4R = flash health word. BKP5R is free. Magic in the top bits so an
+ * uninitialised or unrelated value is not read as a count. */
+#define OTA_INSTALL_FAIL_BKP_MAGIC      0xF0A70000UL
+#define OTA_INSTALL_FAIL_BKP_MASK       0xFFFF0000UL
+#define OTA_INSTALL_FAIL_COUNT_MASK     0x000000FFUL
+
 typedef struct
 {
     uint16_t major;

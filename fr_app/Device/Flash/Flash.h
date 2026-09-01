@@ -22,6 +22,47 @@ bool    FLASH_bVerifyDevice(void);          /* reads JEDEC ID; DBG-warns on mism
  * single read is not trustworthy enough to call a chip dead. */
 bool    FLASH_bVerifyDeviceEx(uint8_t *pu8Id, uint8_t *pu8Attempts);
 
+/* The driver's actual usability gate, as opposed to "can a JEDEC read be
+ * coaxed through right now". Every read/write/erase entry point returns false
+ * immediately when this is false, so it - not FLASH_bVerifyDevice*() - is what
+ * a health check must report. Reporting the probe instead is what let a tag
+ * print "SelfTest: flash=OK" for 18 h while the driver was gated off and every
+ * FOTA erase was failing on the first call. */
+bool    FLASH_bDevicePresent(void);
+
+/* Force a probe now, ignoring the FLASH_REPROBE_INTERVAL_MS cooldown, and on
+ * success re-run bring-up (protection check + global unprotect + disarm) and
+ * re-open the gate. Returns the resulting gate state. Optional out-params as
+ * per FLASH_bVerifyDeviceEx. Use where a human or a health check is asking the
+ * question; ordinary traffic recovers on its own via the rate-limited path.
+ *
+ * Monotonic: this can only ever OPEN the gate, never close one already open. A
+ * probe can fail on a healthy chip - that is the whole premise of the retry
+ * logic - so letting one failed probe disable logging and FOTA staging would
+ * reintroduce, through a different door, the exact fault this exists to undo. */
+bool    FLASH_bRecoverDevice(uint8_t *pu8Id, uint8_t *pu8Attempts);
+
+/* Durable health summary. Everything here survives the flash being unusable
+ * (it is all in RAM plus a TAMP backup register), which is the point: when the
+ * flash is the casualty, the flash log cannot be the place the fault is
+ * recorded. Retrievable over FrKernel ("tag <ID> flash") so a field unit that
+ * cannot be reached with a UART can still be asked what is wrong. */
+typedef struct
+{
+    bool     bPresent;          /* the gate above - writes/erases permitted   */
+    bool     bEverAbsent;       /* gate has been closed at least once         */
+    bool     bWriteProtected;   /* last bring-up saw BP/SRP0 set in SR1       */
+    bool     bUnprotectFailed;  /* global unprotect ran and did not clear it  */
+    bool     bEraseVerifyFail;  /* an erase reported success but did not blank */
+    uint8_t  au8LastId[3];      /* JEDEC bytes from the most recent probe     */
+    uint8_t  u8LastAttempts;    /* tries the most recent probe needed         */
+    uint16_t u16ProbeFailures;  /* probes that never saw the right mfr ID     */
+    uint16_t u16Recoveries;     /* times the gate re-opened after being shut  */
+    uint16_t u16EraseVerifyFails;
+} Flash_Health_t;
+
+void    FLASH_vGetHealth(Flash_Health_t *ptHealth);
+
 /* Why a FLASH_vRead() returned false. Callers used to get a bare bool, which
  * is not enough to diagnose anything: FOTA_u8CalcImageXorRangeBuf collapsed
  * every one of these into "the checksum is wrong", so a field log could not
