@@ -83,4 +83,56 @@
  * anything acts on it. */
 #define FLASH_JEDEC_READ_ATTEMPTS   5U
 
+/* Cooldown between automatic re-probes once the device has been declared
+ * absent. The driver's bDevicePresent gate used to be latched once at boot and
+ * never revisited, so ONE bad JEDEC read disabled every write and erase for the
+ * whole power cycle - the log froze and FOTA_bEraseScratch failed instantly,
+ * reporting FWDONE=ERR with 0 B delivered on every campaign until the unit was
+ * power-cycled by hand. Field units cannot be reprogrammed by wire, so a
+ * boot-lifetime latch on a transient is not survivable: the gate has to be able
+ * to re-open by itself.
+ *
+ * Rate-limited because the gate exists to keep a genuinely absent chip cheap -
+ * LOG_vInit alone probes every sector, and an unthrottled retried probe
+ * (FLASH_JEDEC_READ_ATTEMPTS x the 2 ms settle delay) would put ~10 ms into
+ * every one of those calls. One probe per interval bounds that to nothing
+ * measurable while still recovering well inside a single FOTA session. */
+#define FLASH_REPROBE_INTERVAL_MS   5000U
+
+/* Extra probe rounds at boot only, each a full FLASH_JEDEC_READ_ATTEMPTS burst
+ * separated by a longer settle. Boot is the one moment where getting this wrong
+ * is most expensive and retrying is cheapest: FLASH_vInit runs a few
+ * milliseconds after power-up, in the worst part of the rail for a clean SPI
+ * read, and LOG_vInit immediately behind it scans every sector to find the log
+ * head. Entering that scan with the gate wrongly shut costs a whole boot's
+ * logging; spending ~150 ms up front to avoid it is free by comparison. */
+#define FLASH_BOOT_PROBE_ROUNDS     3U
+#define FLASH_BOOT_PROBE_SETTLE_MS  50U
+
+/* Bytes sampled per erased region to confirm an erase actually took effect.
+ * A block-protected device ACCEPTS the erase command, never sets WIP and
+ * returns to ready - so FLASH_bWaitReady() succeeds and the erase silently
+ * does nothing. Without a read-back the driver reports success and the old
+ * contents survive; FOTA would then stage an image over stale bytes and only
+ * discover it at the whole-image XOR check, or not at all. */
+#define FLASH_ERASE_VERIFY_BYTES    32U
+
+/* Erased NOR reads back all-ones. */
+#define FLASH_ERASED_BYTE           0xFFU
+
+/* ---- Durable flash-health word (TAMP->BKP4R) ----
+ * Backup registers survive reset and brownout and need no external flash,
+ * which is precisely why the health state lives here: when the log device is
+ * the casualty, the log cannot be where the fault is recorded. BKP0R..BKP2R
+ * belong to the bootloader handshake (see Fota_Config.h); BKP4R is free.
+ *
+ * Layout: [31:16] magic  [15:8] last JEDEC mfr byte  [7:0] status bits. */
+#define FLASH_HEALTH_BKP_MAGIC      0xF1A50000UL
+#define FLASH_HEALTH_BKP_MAGIC_MASK 0xFFFF0000UL
+#define FLASH_HEALTH_BIT_PRESENT     (1UL << 0)  /* gate open              */
+#define FLASH_HEALTH_BIT_EVERABSENT  (1UL << 1)  /* gate has been shut     */
+#define FLASH_HEALTH_BIT_PROTECTED   (1UL << 2)  /* BP/SRP0 seen set       */
+#define FLASH_HEALTH_BIT_UNPROT_FAIL (1UL << 3)  /* unprotect did not take */
+#define FLASH_HEALTH_BIT_ERASEVFAIL  (1UL << 4)  /* erase did not blank    */
+
 #endif /* DEVICE_FLASH_FLASH_CONFIG_H_ */

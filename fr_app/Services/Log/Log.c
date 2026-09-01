@@ -37,17 +37,6 @@ static uint32_t u32WriteAddr;
 static uint32_t u32StartAddr;
 static bool     bWrapped;
 
-/* When true, LOG_vWrite() skips the flash entirely (UART logging is
- * unaffected — it runs on a separate path in the DbgLog consumer). Set for
- * the duration of an OTA session so logger flash writes never interleave
- * with the OTA image reads on the shared device. See LOG_vSuspend(). */
-static volatile bool bLogSuspended = false;
-
-void LOG_vSuspend(bool bSuspend)
-{
-    bLogSuspended = bSuspend;
-}
-
 /* -------------------------------------------------------------------------- */
 
 /*
@@ -166,15 +155,43 @@ void LOG_vInit(void)
  */
 void LOG_vWrite(const char *buf, uint16_t len)
 {
-    /* NOTE: bLogSuspended is currently NOT honored here — suspending flash
-     * logging during OTA was tried and did not fix the transfer corruption
-     * (the read-priming fix in FOTA_bSendChunk did), and it blinded the
-     * field-collected primary log for the whole OTA window. Kept the flag/
-     * API in place (harmless) in case a future change wants it. */
+    /* There is deliberately no "suspend flash logging during OTA" path here.
+     * A LOG_vSuspend()/bLogSuspended flag used to exist and was never read by
+     * this function, so its three OTA call sites implied a protection that did
+     * not exist. It has been removed rather than implemented: suspending was
+     * tried, did not fix the transfer corruption (the read-priming fix in
+     * FOTA_bSendChunk did), and it blinded the field-collected primary log for
+     * the whole OTA window. It also cannot corrupt an image — every write here
+     * is confined to the log partition by the range check below, which is far
+     * above the OTA scratch area. */
     uint16_t off = 0U;
 
     while (off < len)
     {
+        /* Never touch storage outside the log partition.
+         *
+         * u32WriteAddr is a zero-initialised static, and 0 is
+         * OTA_SCRATCH_START_ADDR - the base of the staged firmware image. So
+         * a LOG_vWrite() that ran before LOG_vInit() had set the head would
+         * see 0 % FLASH_SECTOR_SIZE_BYTES == 0, sector-erase the image's
+         * first 4 KB, and then write log text over it. That is reachable:
+         * the DbgLog consumer runs at osPriorityAboveNormal and preempts the
+         * osPriorityNormal init task the instant a DBG_LOG is queued, and
+         * init.c had DBG_LOG calls ahead of LOG_vInit(). It only ever
+         * destroyed a staged image on a RESET (boot-only code), which is
+         * exactly the "image verifies fine until the tag is power-cycled"
+         * signature this was found from.
+         *
+         * init.c now runs LOG_vInit() before the first DBG_LOG, so the
+         * ordering hole is closed at the call site too - but this check is
+         * what makes it impossible rather than merely unlikely, and it costs
+         * one compare per chunk against a failure mode that silently
+         * corrupts firmware. Checked per iteration, not once on entry, so it
+         * holds for every erase/write no matter how this loop is edited. */
+        if ((u32WriteAddr < LOG_FLASH_START_ADDR) ||
+            (u32WriteAddr >= LOG_FLASH_END_ADDR))
+            return;
+
         /* Erase the sector when crossing into a new one */
         if ((u32WriteAddr % FLASH_SECTOR_SIZE_BYTES) == 0U)
         {

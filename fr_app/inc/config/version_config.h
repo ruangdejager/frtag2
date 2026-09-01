@@ -22,8 +22,8 @@
 #include "Fota_Config.h"   /* FwVersion_t, OTA_FW_INFO_ADDR */
 
 #define VERSION_SW_MAJOR    2
-#define VERSION_SW_MINOR    1
-#define VERSION_SW_PATCH    5
+#define VERSION_SW_MINOR    2
+#define VERSION_SW_PATCH    2
 
 #define VERSION_u32Get()   ((uint32_t)VERSION_SW_MAJOR * 10000UL + \
                             (uint32_t)VERSION_SW_MINOR * 100UL   + \

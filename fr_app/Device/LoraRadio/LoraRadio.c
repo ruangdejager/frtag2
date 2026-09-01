@@ -110,6 +110,30 @@ static volatile bool    bTxInProgress      = false;
  * other owners whose normal teardown would otherwise sleep it mid-test. */
 static volatile bool    bKeepAwake         = false;
 
+/* Tick at which the PA was last actually fired — i.e. when the shared supply
+ * rail last took the SX126x TX current spike that OTA_LORA_CHUNK_GAP_MS
+ * exists to wait out.
+ *
+ * This is the one timestamp nothing in the codebase recorded. Every existing
+ * log line marks when a packet was *queued*, and queue time says nothing
+ * about PA time: MESHNETWORK_bSendPacket only stamps a ready-tick (jitter
+ * 20-1500 ms), and this task's carrier sense can then defer the real
+ * transmission by up to LORA_TX_CARRIER_WAIT_MS on top. So "was the radio
+ * transmitting while that flash read happened?" has never been answerable
+ * from a field log. Written here on the radio task, read by the FOTA verify
+ * path. */
+static volatile uint32_t u32LastTxDoneTick = 0U;
+
+/* True from the moment a packet is committed to transmission until its PA
+ * pulse has actually fired (or the attempt was abandoned).
+ *
+ * The TX queue going empty is NOT sufficient to conclude the radio is about to
+ * stay quiet: carrier sense can hold an already-dequeued packet for up to
+ * LORA_TX_CARRIER_WAIT_MS before the PA fires, during which the queue reads as
+ * idle. Anything timing a quiet window off the queue alone would sail straight
+ * into that TX. */
+static volatile bool bTxInFlight = false;
+
 static uint8_t u8DevEUI[8];
 
 /* -------------------------------------------------------------------------- */
@@ -359,11 +383,17 @@ void LORARADIO_vRadioTask(void *arg)
                 u8Sent++;
                 bTxInProgress = true;
 
+                /* Committed to sending this one: from here until the PA has
+                 * fired (or we give up below) the radio is not quiet, even
+                 * though the queue may now read as empty. */
+                bTxInFlight = true;
+
                 uint8_t crc = LORARADIO_u8CRC8_Calculate(pkt.buffer, pkt.length);
                 pkt.buffer[pkt.length++] = crc;
 
                 if (!LORARADIO_bCarrierSenseAndWait(LORA_TX_CARRIER_WAIT_MS))
                 {
+                    bTxInFlight = false;   /* abandoned - no PA pulse happened */
                     uint32_t stashed = LORARADIO_u32ConsumePendingEvents();
                     if (stashed)
                     {
@@ -380,6 +410,8 @@ void LORARADIO_vRadioTask(void *arg)
                 }
 
                 LORARADIO_DRIVER_bTransmitPayload(pkt.buffer, pkt.length);
+                u32LastTxDoneTick = osKernelGetTickCount();
+                bTxInFlight       = false;
                 LORARADIO_DRIVER_vEnterRxMode(0x00);
                 bTxInProgress = false;
             }
@@ -510,6 +542,30 @@ uint16_t LORARADIO_u16GetAndClearTxStaleDrops(void)
     uint16_t u16Count = u16TxStaleDropCount;
     u16TxStaleDropCount = 0U;
     return u16Count;
+}
+
+uint32_t LORARADIO_u32GetLastTxTick(void)
+{
+    return u32LastTxDoneTick;
+}
+
+bool LORARADIO_bTxQuiet(uint32_t u32SettleMs)
+{
+    /* Ordered cheapest-first, and all three conditions are needed:
+     *  - in-flight covers a packet already dequeued and sitting in carrier
+     *    sense, which the queue count cannot see;
+     *  - queue count covers packets not yet picked up;
+     *  - the settle age covers a PA pulse that has just happened, which is the
+     *    whole point - the rail needs time to recover before a flash read. */
+    if (bTxInFlight) return false;
+
+    if ((xLoRaTxQueue != NULL) && (osMessageQueueGetCount(xLoRaTxQueue) != 0U))
+        return false;
+
+    if (u32LastTxDoneTick == 0U) return true;   /* nothing transmitted yet */
+
+    /* Unsigned difference, so tick wrap is handled. */
+    return ((osKernelGetTickCount() - u32LastTxDoneTick) >= u32SettleMs);
 }
 
 void LORARADIO_vFlushTxQueue(void)

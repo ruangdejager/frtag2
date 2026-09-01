@@ -91,12 +91,44 @@ void INIT_vInitialization(void *parameters)
 
     DBGLOG_vInit();
 
+    /* Storage backend + log-FIFO recovery BEFORE the first DBG_LOG.
+     *
+     * Ordering is load-bearing, not cosmetic. DBG_LOG publishes to the DbgLog
+     * ring and wakes its consumer task, which runs at osPriorityAboveNormal
+     * and so preempts this osPriorityNormal init task immediately. The
+     * consumer's flash sink is LOG_vWrite(), whose head pointer is a
+     * zero-initialised static - and 0 is OTA_SCRATCH_START_ADDR, the base of
+     * the staged firmware image. Logging before LOG_vInit() therefore aimed
+     * the log's own sector-erase at the image. Because it is boot-only code
+     * the damage only ever appeared after a power cycle, with the image
+     * verifying clean right up until the reset.
+     *
+     * FOTA_vInit() is deliberately after LOG_vInit() too: it DBG_LOGs on its
+     * metadata-migration path, which sat squarely in the same window.
+     * (LOG_vWrite() now range-checks as well - see the guard there - so this
+     * ordering is the belt and that check is the braces.) */
+#ifdef STORAGE_BACKEND_MICROSD
+    MICROSD_vInit();
+    LOG_vInit();
+#else
+    FLASH_vInit();
+    LOG_vInit();
+    /* One-time OTA partition migration + latch installed-version into
+     * TAMP->BKP3R for the bootloader to compare against (see Fota_Config.h). */
+    FOTA_vInit();
+#endif
+
     /* Record the active build_config.h feature set at the top of every boot
      * log, so "what did I actually flash" is recoverable from the terminal
      * (or, once persisted, the flash/SD log) instead of only from whatever
      * .cproject or build_config.h happened to say at build time. Only lists
      * options this TU actually saw defined -- the string is assembled by the
-     * preprocessor, not read back at runtime. */
+     * preprocessor, not read back at runtime.
+     *
+     * Now that this runs after LOG_vInit(), the banner actually reaches the
+     * persisted log - previously it was queued while bDevicePresent was still
+     * false and silently dropped, which is why "Build config:" never appeared
+     * in any field-pulled flash log. */
     DBG_LOG("\r\n\r\nBuild config:\r\n"
         " FW v%u.%u.%u\r\n",
         (unsigned)VERSION_SW_MAJOR,
@@ -134,18 +166,6 @@ void INIT_vInitialization(void *parameters)
         " ENABLE_LOW_POWER_RECOVERY\r\n"
 #endif
         "\r\n");
-
-    /* Bring up the selected storage backend (mutually exclusive HW, same SPI2
-     * bus). LOG_vInit() then recovers the text-log FIFO on whichever is fitted. */
-#ifdef STORAGE_BACKEND_MICROSD
-    MICROSD_vInit();
-#else
-    FLASH_vInit();
-    /* One-time OTA partition migration + latch installed-version into
-     * TAMP->BKP3R for the bootloader to compare against (see Fota_Config.h). */
-    FOTA_vInit();
-#endif
-    LOG_vInit();
 
     FLASHLOG_vDump();     /* no-op unless ENABLE_FLASH_LOG + DEBUG_OUTPUT_UART both defined */
 
@@ -240,7 +260,17 @@ void INIT_vInitialization(void *parameters)
          * primary doesn't track movement. Left in its undefined power-on state
          * its I/O drew ~115 uA; configured-but-active (25 Hz, un-drained FIFO)
          * ~45 uA; full power-down was worse (floating SPI inputs crowbar). So
-         * use a low-power, no-FIFO idle config - I/O active, nothing to overrun. */
+         * use a low-power, no-FIFO idle config - I/O active, nothing to overrun.
+         *
+         * Full AN3308 bring-up runs first, then the idle profile on top. The
+         * idle table only writes 6 registers and assumes power-on defaults for
+         * every other one — true after a cold boot, but not after a warm reset
+         * (an OTA install resets into a running device whose ACC keeps its
+         * previous configuration). Establishing the known-good baseline first
+         * makes the primary's ACC state identical to the secondary's before
+         * the idle profile is applied, so the boot self-test reads a device in
+         * a defined state on both roles. */
+        ACC_vInit();
         ACC_vConfigIdle();
         /* Primary: bring up the Farmranger UART link to the fr9 logger board.
          * (Debug UART is a separate peripheral, so the two no longer conflict.) */

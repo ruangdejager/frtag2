@@ -43,7 +43,6 @@
 #include "cmsis_os2.h"
 #include "stm32wlxx_hal.h"
 #include "dbg_log.h"
-#include "Log.h"          /* LOG_vSuspend — quiesce flash logging during OTA */
 
 #include <string.h>
 #include <stdio.h>
@@ -70,6 +69,11 @@ static void FOTA_vPutU32(uint8_t *p, uint32_t v)
 /* --------------------------------------------------------------------------
  * FOTA_vInit — one-time layout migration
  * -------------------------------------------------------------------------- */
+/* Defined just below FOTA_vInit, its only caller — see the block comment there
+ * for why a boot-time check is the only lever left once the bootloader is
+ * frozen in the field. */
+static void FOTA_vCheckInstallProgress(void);
+
 void FOTA_vInit(void)
 {
     /* The "installed version" the bootloader compares against comes from
@@ -95,6 +99,89 @@ void FOTA_vInit(void)
         DBG_LOG("Fota: migrating metadata sector (stale layout)\r\n");
         (void)FOTA_DRIVER_bSectorErase(OTA_META_SECTOR_ADDR);
     }
+
+    FOTA_vCheckInstallProgress();
+}
+
+/* --------------------------------------------------------------------------
+ * Boot-time install-loop breaker
+ *
+ * The bootloader is frozen in the field and re-evaluates the metadata record on
+ * EVERY boot: while meta.version > the installed version it keeps trying to
+ * install, with no backoff and no memory of having failed. So if it cannot or
+ * will not install a staged image, the unit reboots into the same decision
+ * forever — which is exactly what happened on 2026-09-01, roughly every 90 s,
+ * until someone read the logs.
+ *
+ * Reaching this function at all means the bootloader has already had its turn
+ * this boot and we are still running the older firmware. That is unambiguous:
+ * the install did not happen. The app is the only layer left that can act, and
+ * the only lever it has is the record the bootloader keeps acting on.
+ *
+ * Deliberately tolerant for the first few attempts — a single bad SPI read
+ * during the bootloader's own verify pass is a real and recoverable event on
+ * this hardware, and throwing away a good image because of one is worse than
+ * waiting three boots.
+ * -------------------------------------------------------------------------- */
+static void FOTA_vCheckInstallProgress(void)
+{
+    FotaMeta_t tMeta;
+
+    uint32_t u32Bkp   = TAMP->BKP5R;
+    uint8_t  u8Fails  = ((u32Bkp & OTA_INSTALL_FAIL_BKP_MASK) == OTA_INSTALL_FAIL_BKP_MAGIC)
+                      ? (uint8_t)(u32Bkp & OTA_INSTALL_FAIL_COUNT_MASK)
+                      : 0U;
+
+    /* No staged image, or nothing newer than what is running: the bootloader
+     * has nothing to do, so there is no failed install to count. This is also
+     * the path a successful install lands on (running == staged version), which
+     * is what clears the counter. */
+    if (!FOTA_bGetMeta(&tMeta) || (tMeta.u32Version <= VERSION_u32Get()))
+    {
+        if (u8Fails != 0U)
+        {
+            HAL_PWR_EnableBkUpAccess();
+            TAMP->BKP5R = OTA_INSTALL_FAIL_BKP_MAGIC;
+        }
+        return;
+    }
+
+    u8Fails = (u8Fails < 0xFFU) ? (uint8_t)(u8Fails + 1U) : 0xFFU;
+    HAL_PWR_EnableBkUpAccess();
+    TAMP->BKP5R = OTA_INSTALL_FAIL_BKP_MAGIC | (uint32_t)u8Fails;
+
+    /* Name the likely reason while the evidence is still in scratch. An
+     * identity mismatch here is the mislabelled-upstream case and will NEVER
+     * install no matter how many times it is retried; anything else points at
+     * the bootloader's read/verify path. */
+    uint32_t u32ImageVer = 0U;
+    bool     bIdentityOk = FOTA_bStagedImageIsVersion(tMeta.u32Version, &u32ImageVer);
+
+    DBG_LOG("Fota: bootloader did NOT install staged v%lu (running v%lu) - "
+            "attempt %u/%u, image declares v%lu (%s)\r\n",
+            (unsigned long)tMeta.u32Version, (unsigned long)VERSION_u32Get(),
+            (unsigned)u8Fails, (unsigned)OTA_INSTALL_FAIL_MAX,
+            (unsigned long)u32ImageVer,
+            bIdentityOk ? "identity OK - suspect bootloader read/verify"
+                        : "IDENTITY MISMATCH - mislabelled, will never install");
+
+    if (u8Fails < OTA_INSTALL_FAIL_MAX)
+        return;
+
+    /* Out of patience. Erasing the scratch takes the metadata record with it,
+     * which is what actually breaks the loop: with no valid record the
+     * bootloader stops trying on the next boot, and the normal acquire path is
+     * free to fetch a fresh copy. Keeping a staged image we have proven cannot
+     * be installed has no upside and costs every wake. */
+    DBG_LOG("Fota: %u failed install attempts - erasing staged image to break the "
+            "loop; will re-acquire on the next campaign\r\n", (unsigned)u8Fails);
+
+    if (!FOTA_bEraseScratch())
+        DBG_LOG("Fota: scratch erase FAILED - loop-break did not take, unit will "
+                "keep retrying the install\r\n");
+
+    HAL_PWR_EnableBkUpAccess();
+    TAMP->BKP5R = OTA_INSTALL_FAIL_BKP_MAGIC;
 }
 
 /* --------------------------------------------------------------------------
@@ -108,8 +195,29 @@ bool FOTA_bEraseScratch(void)
     {
         if (!FOTA_DRIVER_bSectorErase(u32Addr))
         {
+            /* Say WHY, not just "failed". This is the first flash operation of
+             * every campaign, so it is where a gated-off or write-protected
+             * chip surfaces — and until now it surfaced as a bare address,
+             * indistinguishable from a one-off SPI glitch. On 2026-08-31 that
+             * ambiguity is what made 18 h of "FWDONE=ERROR (delivered 0 B)"
+             * unreadable from the fr9 side: the tag knew its flash gate was
+             * shut and never said so. */
+#ifdef STORAGE_BACKEND_FLASH
+            Flash_Health_t tHealth;
+            FLASH_vGetHealth(&tHealth);
+            DBG_LOG("Fota: scratch erase FAILED @0x%05lX - flash %s "
+                    "(id=%02X%02X%02X wprot=%u unprotFail=%u eraseVfyFails=%u) "
+                    "- no image can be staged\r\n",
+                    (unsigned long)u32Addr,
+                    tHealth.bPresent ? "usable" : "GATED OFF",
+                    tHealth.au8LastId[0], tHealth.au8LastId[1], tHealth.au8LastId[2],
+                    (unsigned)tHealth.bWriteProtected,
+                    (unsigned)tHealth.bUnprotectFailed,
+                    (unsigned)tHealth.u16EraseVerifyFails);
+#else
             DBG_LOG("Fota: scratch erase FAILED @0x%05lX\r\n",
                     (unsigned long)u32Addr);
+#endif
             return false;
         }
         osDelay(1);   /* yield between sectors (~45 ms each, ~3 s total) */
@@ -154,13 +262,32 @@ bool FOTA_bReadImage(uint32_t u32Offset, uint8_t *pu8Buf, uint16_t u16Len)
  * FOTA_u8CalcImageXorRangeBuf both share one implementation while reading
  * in different-sized chunks — used to test whether the read chunk size
  * itself affects the result (more, smaller SPI transactions = more
- * preemption windows against the concurrent DbgLog consumer task). */
+ * preemption windows against the concurrent DbgLog consumer task).
+ *
+ * A failed chunk read is reported OUT of band, via pbReadOk. It used to be
+ * in band: the function returned ~u8Xor to "guarantee a mismatch". That does
+ * not guarantee a mismatch — ~prefix equals the expected value whenever
+ * prefix == ~expected, so roughly one read failure in 256 was laundered into
+ * a PASS and an image that had never actually been verified was distributed.
+ * For the v2.1.5 image, whose expected XOR is 0x00, that is any failure at a
+ * chunk boundary where the running XOR happens to be 0xFF: about two of the
+ * 484 boundaries. It also made a transport failure indistinguishable from
+ * genuinely wrong stored bytes in the log, which is what left the
+ * 2026-08-31 "recovered on attempt 2/8" events undiagnosable.
+ *
+ * The partial XOR is still returned on failure, purely so a diagnostic line
+ * has something to print. It is NOT a checksum: every caller that makes an
+ * accept/reject decision must consult pbReadOk. Both out-params optional. */
 static uint8_t FOTA_u8CalcImageXorRangeBuf(uint32_t u32Start, uint32_t u32Len,
-                                            uint8_t *pu8Buf, uint16_t u16BufLen)
+                                            uint8_t *pu8Buf, uint16_t u16BufLen,
+                                            bool *pbReadOk, uint32_t *pu32FailAddr)
 {
     uint8_t  u8Xor     = 0U;
     uint32_t u32Addr   = OTA_SCRATCH_START_ADDR + u32Start;
     uint32_t u32Remain = u32Len;
+
+    if (pbReadOk     != NULL) *pbReadOk     = true;
+    if (pu32FailAddr != NULL) *pu32FailAddr = 0U;
 
     while (u32Remain > 0U)
     {
@@ -169,7 +296,11 @@ static uint8_t FOTA_u8CalcImageXorRangeBuf(uint32_t u32Start, uint32_t u32Len,
                           : (uint16_t)u32Remain;
 
         if (!FOTA_DRIVER_bRead(u32Addr, pu8Buf, u16Chunk))
-            return (uint8_t)~u8Xor;   /* read failure: guarantee a mismatch */
+        {
+            if (pbReadOk     != NULL) *pbReadOk     = false;
+            if (pu32FailAddr != NULL) *pu32FailAddr = u32Addr;
+            return u8Xor;   /* partial - see the header comment */
+        }
 
         for (uint16_t i = 0U; i < u16Chunk; i++)
             u8Xor ^= pu8Buf[i];
@@ -183,34 +314,232 @@ static uint8_t FOTA_u8CalcImageXorRangeBuf(uint32_t u32Start, uint32_t u32Len,
     return u8Xor;
 }
 
-uint8_t FOTA_u8CalcImageXorRange(uint32_t u32Start, uint32_t u32Len)
+/* Ex variants carry the read-failure flag; the plain ones keep the old
+ * signature for the quarter-bisection call sites, which only ever print
+ * what they got and make no accept/reject decision on it. */
+static uint8_t FOTA_u8CalcImageXorRangeEx(uint32_t u32Start, uint32_t u32Len,
+                                           bool *pbReadOk, uint32_t *pu32FailAddr)
 {
     uint8_t au8Buf[OTA_XOR_BUF_LEN];
-    return FOTA_u8CalcImageXorRangeBuf(u32Start, u32Len, au8Buf, sizeof(au8Buf));
+    return FOTA_u8CalcImageXorRangeBuf(u32Start, u32Len, au8Buf, sizeof(au8Buf),
+                                       pbReadOk, pu32FailAddr);
+}
+
+uint8_t FOTA_u8CalcImageXorRange(uint32_t u32Start, uint32_t u32Len)
+{
+    return FOTA_u8CalcImageXorRangeEx(u32Start, u32Len, NULL, NULL);
 }
 
 /* Diagnostic only: re-scan the same range with a 224-byte buffer (matching
  * OTA_LORA_CHUNK_LEN — the granularity every proven-reliable read in this
  * file uses) instead of the normal 64-byte OTA_XOR_BUF_LEN, to test
  * whether the whole-image scan's read chunk size is itself the source of
- * the mismatches. */
-static uint8_t FOTA_u8CalcImageXor224(uint32_t u32Start, uint32_t u32Len)
+ * the mismatches.
+ *
+ * Note the 224-byte path never reaches the 32 KB yield in
+ * FOTA_u8CalcImageXorRangeBuf for any image under 224 KB: the address
+ * advances in 224-byte steps and gcd(224, 0x8000) = 32, so the first
+ * multiple of 0x8000 it can land on is 0x38000. That is accidental, not
+ * designed, and it is not the reason this path reads reliably — never
+ * yielding leaves the whole pass exposed to the 1000 ms SPI_TIMEOUT if a
+ * higher-priority task starves it mid-transfer. */
+static uint8_t FOTA_u8CalcImageXor224(uint32_t u32Start, uint32_t u32Len,
+                                       bool *pbReadOk, uint32_t *pu32FailAddr)
 {
     uint8_t au8Buf[224];
-    return FOTA_u8CalcImageXorRangeBuf(u32Start, u32Len, au8Buf, sizeof(au8Buf));
+    return FOTA_u8CalcImageXorRangeBuf(u32Start, u32Len, au8Buf, sizeof(au8Buf),
+                                       pbReadOk, pu32FailAddr);
 }
 
-/* A transient SPI/flash read glitch was confirmed on hardware: a fresh
- * full-image XOR pass can occasionally return a wrong value while the
- * stored bytes are actually fine, and a plain immediate re-read recovers
- * the correct one (matching known-good metadata/manifest). Tearing down a
- * valid image over a single flaky read was the actual root cause behind
- * the "corrupted every time, differently every time" symptom seen in the
- * field — not a real storage or LoRa-transfer bug. Retry the scan a
- * bounded number of times and accept the first pass that agrees with the
- * expected value; only report a genuine mismatch if every attempt fails to
- * match (they don't need to agree with each other — any single match is
- * proof the bytes are correct and this pass's read was the fluke). */
+/* Direct test for "a page program was aborted part-way": an interrupted
+ * NOR page program leaves the bytes it already burned in place and the rest
+ * of the page at 0xFF, so a truncated page shows up as a run of trailing
+ * 0xFF inside an image that should have none of any length. Needs no
+ * reference copy of the image — the signature is self-evident in the stored
+ * bytes — which is what makes it usable in the field.
+ *
+ * Reports fully-blank pages separately from partially-written ones: all-0xFF
+ * means the page was never programmed at all, a partial tail means the
+ * program started and was cut off. Which of the two appears (and at what
+ * offset) distinguishes a lost write from an aborted one. */
+static void FOTA_vScanBlankRuns(uint32_t u32Len)
+{
+    uint8_t  au8Page[FOTA_DRIVER_PAGE_SIZE];
+    uint32_t u32BlankPages = 0U;
+    uint32_t u32PartialTail = 0U;
+    uint32_t u32FirstBlank = 0xFFFFFFFFUL;
+    uint32_t u32FirstPartial = 0xFFFFFFFFUL;
+
+    for (uint32_t u32Off = 0U; u32Off < u32Len; u32Off += FOTA_DRIVER_PAGE_SIZE)
+    {
+        uint16_t u16Chunk = (uint16_t)((u32Len - u32Off) > FOTA_DRIVER_PAGE_SIZE
+                                       ? FOTA_DRIVER_PAGE_SIZE
+                                       : (u32Len - u32Off));
+        if (!FOTA_bReadImage(u32Off, au8Page, u16Chunk))
+            continue;
+
+        /* Count trailing 0xFF for this page. */
+        uint16_t u16Tail = 0U;
+        while (u16Tail < u16Chunk && au8Page[u16Chunk - 1U - u16Tail] == 0xFFU)
+            u16Tail++;
+
+        if (u16Tail == u16Chunk)
+        {
+            u32BlankPages++;
+            if (u32FirstBlank == 0xFFFFFFFFUL) u32FirstBlank = u32Off;
+        }
+        else if (u16Tail >= 16U)
+        {
+            u32PartialTail++;
+            if (u32FirstPartial == 0xFFFFFFFFUL) u32FirstPartial = u32Off;
+        }
+
+        if ((u32Off % 0x8000UL) == 0U && u32Off > 0U)
+            osDelay(1);
+    }
+
+    DBG_LOG("Fota: BLANKSCAN blankPages=%lu (first 0x%lX) partialTail>=16B=%lu (first 0x%lX)\r\n",
+            (unsigned long)u32BlankPages,
+            (unsigned long)(u32FirstBlank   == 0xFFFFFFFFUL ? 0UL : u32FirstBlank),
+            (unsigned long)u32PartialTail,
+            (unsigned long)(u32FirstPartial == 0xFFFFFFFFUL ? 0UL : u32FirstPartial));
+}
+
+/* Dump the first bytes of the staged image.
+ *
+ * This is the check that directly proves or disproves the boot-log overwrite
+ * the LOG_vWrite range guard was added for (Services/Log/Log.c): nothing but
+ * the log writer puts ASCII text at offset 0, and an intact image starts
+ * with the Cortex-M vector table — word 0 is the initial stack pointer
+ * (0x2000xxxx, RAM) and word 1 the reset vector (0x0800xxxx, internal
+ * flash). The three outcomes are unmistakable at a glance:
+ *
+ *   20 xx xx xx 08 xx ...  -> intact
+ *   FF FF FF FF ...        -> sector erased and not rewritten
+ *   readable ASCII         -> log text written over the image
+ *
+ * printable= counts bytes in 0x20..0x7E so a text overwrite is a number even
+ * if the hex is skimmed past. Two full reads of 32 bytes cost nothing next to
+ * the whole-image passes around it, so this runs on every probe rather than
+ * only after a failure — the previous diagnostics were all failure-gated,
+ * which is why five clean field cycles produced no evidence either way. */
+#define FOTA_HEAD_DUMP_LEN   16U
+
+static void FOTA_vDumpImageHead(void)
+{
+    /* 16 bytes, not 32: enough for the two vector-table words that identify an
+     * intact image with room to spare, and this runs on the DeviceDiscovery
+     * AppTask whose frame is already ~3 KB of a 5120-byte stack. */
+    uint8_t au8Head[FOTA_HEAD_DUMP_LEN];
+
+    if (!FOTA_bReadImage(0U, au8Head, sizeof(au8Head)))
+    {
+        DBG_LOG("Fota: HEAD read FAILED\r\n");
+        return;
+    }
+
+    char     acHex[3U * FOTA_HEAD_DUMP_LEN + 1U];
+    int      iPos        = 0;
+    uint8_t  u8Printable = 0U;
+
+    for (uint8_t i = 0U; i < (uint8_t)sizeof(au8Head); i++)
+    {
+        if ((au8Head[i] >= 0x20U) && (au8Head[i] <= 0x7EU)) u8Printable++;
+        iPos += snprintf(&acHex[iPos], sizeof(acHex) - (size_t)iPos,
+                         "%02X ", (unsigned)au8Head[i]);
+    }
+
+    DBG_LOG("Fota: HEAD @0x0: %s(printable=%u/%u)\r\n",
+            acHex, (unsigned)u8Printable, (unsigned)sizeof(au8Head));
+}
+
+/* Re-read the whole image twice more, at the two different chunk sizes, when a
+ * verify has already failed. Disagreement between the 64-byte and 224-byte
+ * passes points at the read path; agreement on a value that is not the
+ * expected one points at the stored bytes.
+ *
+ * Failure path only. It ran on every check while the 2026-08-31 transient was
+ * being characterised — which is what produced the evidence that identified it
+ * — but that question is answered, and two extra whole-image passes (~1.5 s
+ * each at the SPI2 rate this device runs at) is not worth paying on every
+ * campaign forever. FOTA_vDumpImageHead is the part cheap enough to keep
+ * unconditional, and the call sites invoke it directly for that reason.
+ *
+ * FOTA_vScanBlankRuns is deliberately NOT called from here — call sites
+ * invoke the two as siblings. Nesting them would stack a 296-byte frame on
+ * this one on the DeviceDiscovery AppTask, whose own frame is already ~3 KB
+ * of a 5120-byte stack. */
+static void FOTA_vProbeImage(uint32_t u32Len, uint8_t u8ExpectedXor)
+{
+    bool     bOk64  = true, bOk224 = true;
+    uint32_t u32Fail64 = 0U, u32Fail224 = 0U;
+
+    uint8_t u8Xor64  = FOTA_u8CalcImageXorRangeEx(0U, u32Len, &bOk64,  &u32Fail64);
+    uint8_t u8Xor224 = FOTA_u8CalcImageXor224   (0U, u32Len, &bOk224, &u32Fail224);
+
+    DBG_LOG("Fota: PROBE 64B-buf=0x%02X%s 224B-buf=0x%02X%s expected=0x%02X\r\n",
+            (unsigned)u8Xor64,  bOk64  ? "" : "(READ FAILED)",
+            (unsigned)u8Xor224, bOk224 ? "" : "(READ FAILED)",
+            (unsigned)u8ExpectedXor);
+
+    if (!bOk64 || !bOk224)
+        DBG_LOG("Fota: PROBE read failure at 0x%lX / 0x%lX\r\n",
+                (unsigned long)u32Fail64, (unsigned long)u32Fail224);
+}
+
+/* Hold off a whole-image verify pass until the radio has been quiet for
+ * OTA_VERIFY_TX_SETTLE_MS - see that constant for the confirmed mechanism and
+ * the field evidence. Bounded by OTA_VERIFY_TX_QUIET_MAX_MS: a busy radio must
+ * never stall a campaign, and a pass spoiled anyway is still covered by the
+ * retry budget above.
+ *
+ * Costs nothing in the common case - if the radio is already quiet
+ * LORARADIO_bTxQuiet() returns true on the first test and this returns
+ * immediately without a single osDelay. */
+static void FOTA_vWaitRadioQuiet(void)
+{
+    uint32_t u32Start = osKernelGetTickCount();
+
+    while (!LORARADIO_bTxQuiet(OTA_VERIFY_TX_SETTLE_MS) &&
+           ((osKernelGetTickCount() - u32Start) < OTA_VERIFY_TX_QUIET_MAX_MS))
+        osDelay(20);
+
+    uint32_t u32Waited = osKernelGetTickCount() - u32Start;
+
+    /* Only worth a line when it actually gave up - a normal short wait is
+     * uninteresting and this runs on every verify attempt. */
+    if (!LORARADIO_bTxQuiet(OTA_VERIFY_TX_SETTLE_MS))
+        DBG_LOG("Fota: radio still busy after %lu ms - verifying anyway\r\n",
+                (unsigned long)u32Waited);
+}
+
+/* A full-image XOR pass can occasionally return a wrong value while the
+ * stored bytes are actually fine, and an immediate re-read recovers the
+ * correct one (matching known-good metadata/manifest). Tearing down a valid
+ * image over a single flaky read was the actual root cause behind the
+ * "corrupted every time, differently every time" symptom seen in the field —
+ * not a real storage or LoRa-transfer bug. Retry the scan a bounded number
+ * of times and accept the first pass that agrees with the expected value;
+ * only report a genuine mismatch if every attempt fails to match (they don't
+ * need to agree with each other — any single match is proof the bytes are
+ * correct and this pass's read was the fluke).
+ *
+ * THE CAUSE IS NOW KNOWN: an SX126x TX firing inside the pass sags the shared
+ * rail and the flash reads back corrupted bytes. Confirmed in the field on
+ * 2026-08-31 — see OTA_VERIFY_TX_SETTLE_MS for the evidence. Each attempt
+ * therefore waits for the radio to go quiet first, which removes the cause
+ * rather than just retrying past it; the retry budget stays as the backstop
+ * for a TX that slips in anyway (the wait is bounded, and carrier sense means
+ * the radio is never guaranteed quiet).
+ *
+ * Earlier wording here asserted "a transient SPI/flash read glitch confirmed
+ * on hardware". That was never established, and could not be: the old code
+ * laundered read failures into a wrong checksum byte and discarded the failing
+ * pass's value on the recovery path, so a transport failure and corrupted
+ * bytes were indistinguishable. The FAILPASS line below is what separated
+ * them — readOk=1/rdFails=0 proved every read succeeded and the bytes were
+ * simply wrong, while txIntoPass put the PA inside the failing pass. Keep it:
+ * it is cheap (failure path only) and it is what would identify a regression. */
 #define FOTA_XOR_VERIFY_MAX_ATTEMPTS  8U
 
 static bool FOTA_bVerifyImageXorRetry(uint32_t u32Start, uint32_t u32Len,
@@ -218,39 +547,189 @@ static bool FOTA_bVerifyImageXorRetry(uint32_t u32Start, uint32_t u32Len,
 {
     uint8_t au8Attempts[FOTA_XOR_VERIFY_MAX_ATTEMPTS];
 
+    /* Forensics for the FIRST failing pass, emitted only once the retry loop
+     * has finished. Deliberately not logged inside the loop: DBG_LOG wakes
+     * the DbgLog consumer, which writes the log partition on this same flash
+     * chip, and injecting that between attempts would perturb the very
+     * timing this is trying to measure. */
+    bool     bHaveFail     = false;
+    uint8_t  u8FailAttempt = 0U;
+    uint8_t  u8FailXor     = 0U;
+    bool     bFailReadOk   = true;
+    uint32_t u32FailAddr   = 0U;
+    uint32_t u32FailPassMs = 0U;
+    int32_t  i32TxIntoPass = 0;
+    uint16_t u16FailRdFails = 0U;
+    Flash_ReadFailReason_t tFailReason = FLASH_RDFAIL_NONE;
+    uint32_t u32FlashFailAddr = 0U;
+    uint8_t  u8FailHal     = 0U;
+
+    /* Discard any tally left over from earlier work so what we report below
+     * belongs to this verify and nothing else. */
+    (void)FLASH_u16GetAndClearReadFails(NULL, NULL, NULL);
+
+    uint8_t u8PassesRun   = 0U;
+    bool    bMatched      = false;
+    uint8_t u8MatchAttempt = 0U;
+
     for (uint8_t u8Attempt = 0U; u8Attempt < FOTA_XOR_VERIFY_MAX_ATTEMPTS; u8Attempt++)
     {
-        /* Use the reliable continuous 224-byte read (never yields for an
-         * image this size, so nothing interleaves on the shared flash — the
-         * same gap-free pattern the bootloader and the clean PROBE use).
-         * The 64-byte scan yields every 32 KB and reads unreliably. */
-        uint8_t u8Xor = FOTA_u8CalcImageXor224(u32Start, u32Len);
+        /* Remove the known cause before reading, not after failing on it. */
+        FOTA_vWaitRadioQuiet();
+
+        /* The continuous 224-byte read, matching the gap-free pattern the
+         * bootloader and the clean PROBE use. */
+        bool     bReadOk      = true;
+        uint32_t u32ReadFail  = 0U;
+        uint32_t u32PassStart = osKernelGetTickCount();
+
+        uint8_t u8Xor = FOTA_u8CalcImageXor224(u32Start, u32Len, &bReadOk, &u32ReadFail);
+
+        uint32_t u32PassMs = osKernelGetTickCount() - u32PassStart;
+
         au8Attempts[u8Attempt] = u8Xor;
-        *pu8LastGot = u8Xor;
-        if (u8Xor == u8Expected)
+        u8PassesRun            = (uint8_t)(u8Attempt + 1U);
+        *pu8LastGot            = u8Xor;
+
+        /* bReadOk gates the accept. A pass that aborted on a failed chunk
+         * read is never a match however its partial XOR happened to land —
+         * the old in-band "guaranteed mismatch" was wrong 1 time in 256, and
+         * being wrong meant shipping an unverified image. */
+        if (bReadOk && (u8Xor == u8Expected))
         {
-            if (u8Attempt > 0U)
-                DBG_LOG("Fota: xor verify recovered on attempt %u/%u (transient read glitch)\r\n",
-                        (unsigned)(u8Attempt + 1U), (unsigned)FOTA_XOR_VERIFY_MAX_ATTEMPTS);
-            return true;
+            bMatched       = true;
+            u8MatchAttempt = u8Attempt;
+            break;
+        }
+
+        if (!bHaveFail)
+        {
+            bHaveFail     = true;
+            u8FailAttempt = u8Attempt;
+            u8FailXor     = u8Xor;
+            bFailReadOk   = bReadOk;
+            u32FailAddr   = u32ReadFail;
+            u32FailPassMs = u32PassMs;
+
+            u16FailRdFails = FLASH_u16GetAndClearReadFails(&tFailReason,
+                                                           &u32FlashFailAddr,
+                                                           &u8FailHal);
+
+            /* Signed so tick wrap is handled. Negative => the PA last fired
+             * before this pass began (by that many ms); a value between 0 and
+             * u32FailPassMs => it fired INSIDE the pass, which is the rail-sag
+             * prediction. */
+            i32TxIntoPass = (int32_t)(LORARADIO_u32GetLastTxTick() - u32PassStart);
         }
     }
 
-    /* Every attempt disagreed with the expected value — dump each one so a
-     * genuine failure shows whether the reads are converging on a single
-     * consistent (real corruption) value or scattering randomly (glitch
-     * rate too high for this budget, not a data problem). */
-    DBG_LOG("Fota: xor verify FAILED all %u attempts, expected=0x%02X, got:",
-            (unsigned)FOTA_XOR_VERIFY_MAX_ATTEMPTS, (unsigned)u8Expected);
-    for (uint8_t i = 0U; i < FOTA_XOR_VERIFY_MAX_ATTEMPTS; i++)
-        DBG_LOG(" 0x%02X", (unsigned)au8Attempts[i]);
-    DBG_LOG("\r\n");
-    return false;
+    if (bMatched && (u8MatchAttempt > 0U))
+        DBG_LOG("Fota: xor verify recovered on attempt %u/%u\r\n",
+                (unsigned)(u8MatchAttempt + 1U),
+                (unsigned)FOTA_XOR_VERIFY_MAX_ATTEMPTS);
+
+    if (!bMatched)
+    {
+        /* Every attempt disagreed — dump each one so a genuine failure shows
+         * whether the reads are converging on a single consistent (real
+         * corruption) value or scattering randomly (glitch rate too high for
+         * this budget, not a data problem). */
+        DBG_LOG("Fota: xor verify FAILED all %u attempts, expected=0x%02X, got:",
+                (unsigned)u8PassesRun, (unsigned)u8Expected);
+        for (uint8_t i = 0U; i < u8PassesRun; i++)
+            DBG_LOG(" 0x%02X", (unsigned)au8Attempts[i]);
+        DBG_LOG("\r\n");
+    }
+
+    /* One forensic line per verify that saw at least one bad pass, whether or
+     * not a later attempt recovered. This is the line that distinguishes the
+     * competing explanations:
+     *   readOk=0                 -> the transfer failed; reason/hal say how
+     *   readOk=1                 -> the pass completed and computed wrong
+     *                               bytes, i.e. corruption, not a fault
+     *   txIntoPass in [0,passMs] -> the PA fired INSIDE the failing pass
+     *   passMs << a clean pass   -> the pass aborted early
+     * reason values are Flash_ReadFailReason_t: 1=absent 2=waitready 3=cmd
+     * 4=data; hal is the HAL_StatusTypeDef (0=OK 1=ERROR 2=BUSY 3=TIMEOUT). */
+    if (bHaveFail)
+        DBG_LOG("Fota: xor FAILPASS attempt=%u got=0x%02X exp=0x%02X readOk=%u "
+                "passMs=%lu failAddr=0x%lX rdFails=%u reason=%u rdFailAddr=0x%lX "
+                "hal=%u txIntoPass=%ld ms\r\n",
+                (unsigned)(u8FailAttempt + 1U), (unsigned)u8FailXor,
+                (unsigned)u8Expected, (unsigned)(bFailReadOk ? 1U : 0U),
+                (unsigned long)u32FailPassMs, (unsigned long)u32FailAddr,
+                (unsigned)u16FailRdFails, (unsigned)tFailReason,
+                (unsigned long)u32FlashFailAddr, (unsigned)u8FailHal,
+                (long)i32TxIntoPass);
+
+    return bMatched;
 }
 
 uint8_t FOTA_u8CalcImageXor(uint32_t u32SizeBytes)
 {
     return FOTA_u8CalcImageXorRange(0U, u32SizeBytes);
+}
+
+/* ==========================================================================
+ * Image identity — what the staged bytes say they are
+ *
+ * Every version number the tag acted on used to come from something ABOUT the
+ * image rather than from the image: an fr9 manifest, an AT+FWREQ answer, a
+ * LoRa OtaPrep header. Those are all assertions by a third party, and on
+ * 2026-09-01 they were unanimously wrong — fr9's "already on the filesystem"
+ * check is (size, xor8), 2.1.7/2.1.8/2.1.9 all built to 109068 B with xor8
+ * 0xC5, so it adopted the 2.1.8 file it already had and re-served those bytes
+ * as v20109. The tag verified the XOR (correct), committed metadata saying
+ * v20109 (wrong), and the bootloader dutifully programmed 2.1.8. The app came
+ * back reporting v20108, fr9 offered v20109 again, and that loop ran until it
+ * was noticed.
+ *
+ * Nothing in that chain was broken: every layer checked INTEGRITY (are these
+ * the bytes I was promised) and no layer checked IDENTITY (are these bytes the
+ * firmware version I am about to install). The fw_info record the linker
+ * places at OTA_FW_INFO_OFFSET is the one witness that cannot be fooled by a
+ * mislabelling upstream, because it travels inside the payload.
+ * ========================================================================== */
+
+/* Read the version a staged image declares about itself. Returns false only if
+ * the scratch read fails or the record is blank (0xFFFF x3, i.e. erased) —
+ * both mean "cannot establish identity", which callers must treat as a
+ * rejection, not as a pass. */
+static bool FOTA_bReadStagedFwInfo(uint32_t *pu32Version)
+{
+    uint8_t au8Info[6];
+
+    if (!FOTA_DRIVER_bRead(OTA_SCRATCH_START_ADDR + OTA_FW_INFO_OFFSET,
+                           au8Info, sizeof(au8Info)))
+        return false;
+
+    uint16_t u16Major = (uint16_t)((uint16_t)au8Info[0] | ((uint16_t)au8Info[1] << 8));
+    uint16_t u16Minor = (uint16_t)((uint16_t)au8Info[2] | ((uint16_t)au8Info[3] << 8));
+    uint16_t u16Patch = (uint16_t)((uint16_t)au8Info[4] | ((uint16_t)au8Info[5] << 8));
+
+    if ((u16Major == 0xFFFFU) && (u16Minor == 0xFFFFU) && (u16Patch == 0xFFFFU))
+        return false;   /* erased region — no image, or no fw_info record */
+
+    /* Same MMmmpp encoding the bootloader and VERSION_u32Get() use, so the
+     * three can be compared directly. */
+    if (pu32Version != NULL)
+        *pu32Version = (uint32_t)u16Major * 10000UL
+                     + (uint32_t)u16Minor * 100UL
+                     + (uint32_t)u16Patch;
+    return true;
+}
+
+bool FOTA_bStagedImageIsVersion(uint32_t u32Claimed, uint32_t *pu32Actual)
+{
+    uint32_t u32Actual = 0U;
+
+    if (pu32Actual != NULL) *pu32Actual = 0U;
+
+    if (!FOTA_bReadStagedFwInfo(&u32Actual))
+        return false;
+
+    if (pu32Actual != NULL) *pu32Actual = u32Actual;
+    return (u32Actual == u32Claimed);
 }
 
 bool FOTA_bCommitMetadata(uint32_t u32Version, uint32_t u32StopAddr, uint8_t u8Xor8)
@@ -428,8 +907,22 @@ bool FOTA_bUartAcquire(void)
     DBG_LOG("Fota: acquiring v%lu (%lu file bytes)\r\n",
             (unsigned long)u32Version, (unsigned long)u32FileBytes);
 
+    /* Own the flash for the whole acquire, exactly as vDistribute and
+     * vSecondaryReceive already do — this path was the odd one out. The
+     * DbgLog consumer parks this chip in deep power-down when it finishes a
+     * drain, and a park landing on top of an in-flight image page program
+     * truncates that page. Every exit below must undo the inhibit.
+     *
+     * There was a LOG_vSuspend(true) here too, to stop that consumer writing
+     * log pages between image pages. It was removed because it never did
+     * anything (LOG_vWrite never read the flag) and is not needed: the log
+     * writer is confined to the log partition, far above the OTA scratch, and
+     * the flash mutex serialises the transactions themselves. */
+    FLASH_vInhibitDeepPowerDown(true);
+
     if (!FOTA_bEraseScratch())
     {
+        FLASH_vInhibitDeepPowerDown(false);
         (void)FARMRANGER_bFwReportDone(false);
         return false;
     }
@@ -445,6 +938,7 @@ bool FOTA_bUartAcquire(void)
         if (!FOTA_bFetchAndStoreBlock(u32Offset, u16Len))
         {
             DBG_LOG("Fota: acquire FAILED\r\n");
+            FLASH_vInhibitDeepPowerDown(false);
             (void)FARMRANGER_bFwReportDone(false);
             return false;
         }
@@ -477,16 +971,50 @@ bool FOTA_bUartAcquire(void)
          * a state-consistency fix. */
         if (!FOTA_bEraseScratch())
             DBG_LOG("Fota: scratch erase after acquire xor mismatch FAILED\r\n");
+        FLASH_vInhibitDeepPowerDown(false);
+        (void)FARMRANGER_bFwReportDone(false);
+        return false;
+    }
+
+    /* Identity, not just integrity. The XOR above proves we stored the bytes
+     * fr9 sent; it says nothing about whether those bytes are v%u32Version.
+     * This is the check that would have stopped the 2026-09-01 install loop at
+     * its source: fr9 served the 2.1.8 file labelled v20109, the XOR matched
+     * because 2.1.8 and 2.1.9 share size and xor8, and without this the tag
+     * committed metadata claiming a version the image simply was not.
+     *
+     * Rejecting costs one FOTA window. Accepting costs every window until a
+     * human notices — the bootloader is frozen in the field and will re-attempt
+     * the install on every boot for as long as the record says newer. */
+    uint32_t u32ImageVer = 0U;
+    if (!FOTA_bStagedImageIsVersion(u32Version, &u32ImageVer))
+    {
+        DBG_LOG("Fota: staged image identity MISMATCH - fr9 offered v%lu, image "
+                "declares v%lu - discarding (mislabelled upstream, NOT corruption)\r\n",
+                (unsigned long)u32Version, (unsigned long)u32ImageVer);
+
+        /* Same cleanup as the XOR-mismatch path above: metadata has not been
+         * committed, so nothing else treats this scratch as valid yet, and
+         * leaving known-wrong bytes there only gives the next acquire something
+         * to partially overwrite. */
+        if (!FOTA_bEraseScratch())
+            DBG_LOG("Fota: scratch erase after identity mismatch FAILED\r\n");
+        FLASH_vInhibitDeepPowerDown(false);
         (void)FARMRANGER_bFwReportDone(false);
         return false;
     }
 
     if (!FOTA_bCommitMetadata(u32Version, u32StopAddr, u8Xor))
     {
+        FLASH_vInhibitDeepPowerDown(false);
         DBG_LOG("Fota: metadata commit FAILED\r\n");
         (void)FARMRANGER_bFwReportDone(false);
         return false;
     }
+
+    /* Image and metadata are both committed — hand the chip back to the
+     * logger so the lines below are actually persisted. */
+    FLASH_vInhibitDeepPowerDown(false);
 
     DBG_LOG("Fota: image v%lu stored OK (size=%luB, xor=0x%02X, map 0x%08lX..0x%08lX)\r\n",
             (unsigned long)u32Version, (unsigned long)u32Size, u8Xor,
@@ -554,6 +1082,15 @@ static volatile bool bDistributeReq;
  * for an update that won't arrive. Only a sustained streak justifies erasing
  * — see the PRE-SEND block in FOTA_vDistribute. Cleared by any good verify. */
 static volatile uint8_t u8PreSendFailStreak = 0U;
+
+/* Set when the staged image's own fw_info disagrees with the version the
+ * metadata claims. Deliberately separate from u8PreSendFailStreak because the
+ * two mean opposite things: a failed XOR pass is "these bytes may be damaged,
+ * retry", while an identity mismatch is "these bytes are intact and are the
+ * WRONG FIRMWARE". Retrying cannot fix the latter, so it is latched, it
+ * suppresses the TimeSync advertisement outright, and it clears only when a
+ * staged image proves it is what it claims to be. */
+static volatile bool bStagedIdentityBad = false;
 
 /* Multi-primary listen-before-distribute: RTC tick of the last Ota* packet
  * heard whose session id was not our own (i.e. another primary's live
@@ -1091,7 +1628,6 @@ void FOTA_vDistribute(void)
      * is what made the primary transmit a differently-corrupted image every
      * session. Released at every exit below. */
     FLASH_vInhibitDeepPowerDown(true);
-    LOG_vSuspend(true);
     bDistributeActive = true;
 
     uint16_t u16Total = (uint16_t)((tMeta.u32SizeBytes + OTA_LORA_CHUNK_LEN - 1U)
@@ -1131,7 +1667,6 @@ void FOTA_vDistribute(void)
         {
             DBG_LOG("Fota: another primary distributing - deferring to next wake\r\n");
             bDistributeActive = false;
-            LOG_vSuspend(false);
             FLASH_vInhibitDeepPowerDown(false);
             return;
         }
@@ -1139,12 +1674,18 @@ void FOTA_vDistribute(void)
 
     /* Re-verify our OWN stored copy immediately before every send, not just
      * once at acquire time: a single scan can occasionally return a wrong
-     * value while the stored bytes are fine (a transient SPI/flash read
-     * glitch), and an immediate re-read recovers the correct value — see
-     * FOTA_bVerifyImageXorRetry. Only a mismatch that survives every retry
-     * means the primary's own copy has actually drifted. */
+     * value while the stored bytes are fine, and an immediate re-read recovers
+     * the correct value — see FOTA_bVerifyImageXorRetry. Only a mismatch that
+     * survives every retry means the primary's own copy has actually drifted. */
     uint8_t u8PreSendXor;
-    if (!FOTA_bVerifyImageXorRetry(0U, tMeta.u32SizeBytes, tMeta.u8Xor8, &u8PreSendXor))
+    bool bPreSendOk = FOTA_bVerifyImageXorRetry(0U, tMeta.u32SizeBytes, tMeta.u8Xor8, &u8PreSendXor);
+
+    /* One 16-byte read, cheap enough to run on every campaign, and the
+     * permanent canary against the boot-log-over-image class of bug the
+     * LOG_vWrite range guard was added for. */
+    FOTA_vDumpImageHead();
+
+    if (!bPreSendOk)
     {
         if (u8PreSendFailStreak < UINT8_MAX) u8PreSendFailStreak++;
 
@@ -1153,6 +1694,39 @@ void FOTA_vDistribute(void)
                 (unsigned)u8PreSendXor, (unsigned)tMeta.u8Xor8,
                 (unsigned)u8PreSendFailStreak,
                 (unsigned)OTA_PRESEND_FAIL_ERASE_THRESHOLD);
+
+        /* Two more whole-image passes at different chunk sizes. Only worth the
+         * ~3 s here, on the path that is about to start counting towards
+         * erasing a staged image. */
+        FOTA_vProbeImage(tMeta.u32SizeBytes, tMeta.u8Xor8);
+
+        /* Bisect into quarters to localize which part of the image disagrees
+         * — same technique as the secondary's receive-side mismatch. Turns
+         * "the whole image disagrees" into "here's the ~25 KB window", which
+         * is what actually lets a byte-offset root cause be found instead of
+         * guessed at. */
+        {
+            uint32_t u32Q = tMeta.u32SizeBytes / 4U;
+            uint32_t au32Start[4] = { 0U, u32Q, 2U * u32Q, 3U * u32Q };
+            uint32_t au32Len[4]   = { u32Q, u32Q, u32Q, tMeta.u32SizeBytes - (3U * u32Q) };
+            for (uint8_t i = 0U; i < 4U; i++)
+            {
+                uint8_t u8Q = FOTA_u8CalcImageXorRange(au32Start[i], au32Len[i]);
+                DBG_LOG("  Q%u [0x%lX..0x%lX] (chunks %lu..%lu) xor=0x%02X\r\n", i,
+                        (unsigned long)au32Start[i],
+                        (unsigned long)(au32Start[i] + au32Len[i] - 1U),
+                        (unsigned long)(au32Start[i] / OTA_LORA_CHUNK_LEN),
+                        (unsigned long)((au32Start[i] + au32Len[i] - 1U) / OTA_LORA_CHUNK_LEN),
+                        u8Q);
+            }
+        }
+
+        /* Direct test of the aborted-page-program theory — see
+         * FOTA_vScanBlankRuns. Sibling call to FOTA_vProbeImage above, not
+         * nested inside it, on stack-depth grounds. Field runs so far report
+         * blankPages=0 partialTail=0 every time, i.e. storage is fully written
+         * and faults are read-time; a nonzero count here would overturn that. */
+        FOTA_vScanBlankRuns(tMeta.u32SizeBytes);
 
         /* Do NOT erase on the first failures. The in-function retry budget
          * only defends against a glitch WITHIN one verify pass; a supply-rail
@@ -1186,10 +1760,33 @@ void FOTA_vDistribute(void)
         }
 
         bDistributeActive = false;
-        LOG_vSuspend(false);
         FLASH_vInhibitDeepPowerDown(false);
         return;
     }
+
+    /* Integrity is settled; now identity. A primary is about to tell every
+     * secondary in range that these bytes are v%tMeta.u32Version, and each of
+     * them will commit metadata and hand it to a bootloader that cannot be
+     * updated. Distributing a mislabelled image does not cost one unit a FOTA
+     * window — it puts the whole fleet into the same permanent install loop,
+     * reachable only by wire.
+     *
+     * Refused rather than erased: a wrong label is an upstream fault, so
+     * re-acquiring would fetch the same wrong bytes and spin. Holding the image
+     * and staying quiet is stable, diagnosable, and leaves the unit fully
+     * functional on its current firmware. */
+    uint32_t u32StagedVer = 0U;
+    if (!FOTA_bStagedImageIsVersion(tMeta.u32Version, &u32StagedVer))
+    {
+        bStagedIdentityBad = true;
+        DBG_LOG("Fota: REFUSING to distribute - metadata says v%lu, image declares "
+                "v%lu. Mislabelled upstream; not advertising to secondaries\r\n",
+                (unsigned long)tMeta.u32Version, (unsigned long)u32StagedVer);
+        bDistributeActive = false;
+        FLASH_vInhibitDeepPowerDown(false);
+        return;
+    }
+    bStagedIdentityBad = false;
 
     /* Verified clean: the staged copy is deliverable, so clear any suspicion
      * raised by earlier failed passes and let it be advertised again. */
@@ -1216,7 +1813,6 @@ void FOTA_vDistribute(void)
     {
         DBG_LOG("Fota: no targets joined\r\n");
         bDistributeActive = false;
-        LOG_vSuspend(false);
         FLASH_vInhibitDeepPowerDown(false);
         return;
     }
@@ -1400,7 +1996,6 @@ void FOTA_vDistribute(void)
     }
 
     bDistributeActive = false;
-    LOG_vSuspend(false);
     FLASH_vInhibitDeepPowerDown(false);
 }
 
@@ -1415,7 +2010,11 @@ bool FOTA_bPrepPending(void)
 
 bool FOTA_bStagedImageTrusted(void)
 {
-    return (u8PreSendFailStreak == 0U);
+    /* Both gates, for opposite reasons: the streak means "we could not confirm
+     * this copy is deliverable", the identity flag means "this copy is
+     * deliverable and is the wrong firmware". Either must stop secondaries
+     * arming for an update they should not be offered. */
+    return (u8PreSendFailStreak == 0U) && !bStagedIdentityBad;
 }
 
 void FOTA_vDropStalePrep(void)
@@ -1491,11 +2090,9 @@ void FOTA_vSecondaryReceive(void)
     /* Keep the NOR flash awake for the whole receive+verify session — same
      * DPD-wake read-corruption reason as the primary's distribute path. */
     FLASH_vInhibitDeepPowerDown(true);
-    LOG_vSuspend(true);
 
     if (!FOTA_bEraseScratch())
     {
-        LOG_vSuspend(false);
         FLASH_vInhibitDeepPowerDown(false);
         return;
     }
@@ -1622,7 +2219,6 @@ void FOTA_vSecondaryReceive(void)
                 }
             }
             bRxSessionActive = false;
-            LOG_vSuspend(false);
             FLASH_vInhibitDeepPowerDown(false);
             return;
         }
@@ -1630,27 +2226,21 @@ void FOTA_vSecondaryReceive(void)
         {
             DBG_LOG("Fota: session hard cap - abort\r\n");
             bRxSessionActive = false;
-            LOG_vSuspend(false);
             FLASH_vInhibitDeepPowerDown(false);
             return;
         }
     }
 
-    /* Diagnostic: same probe as the primary's pre-send check — see there
-     * for why. */
-    {
-        uint8_t u8Xor64  = FOTA_u8CalcImageXorRange(0U, tPrep.u32ImageSize);
-        uint8_t u8Xor224 = FOTA_u8CalcImageXor224(0U, tPrep.u32ImageSize);
-        DBG_LOG("Fota: PROBE 64B-buf=0x%02X 224B-buf=0x%02X expected=0x%02X\r\n",
-                (unsigned)u8Xor64, (unsigned)u8Xor224, (unsigned)tPrep.u8ImageXor);
-    }
-
-    /* Retried: confirmed on hardware that a single scan can occasionally
-     * return a wrong value while the stored bytes are fine (a transient
-     * SPI/flash read glitch — see FOTA_bVerifyImageXorRetry). Only a
-     * mismatch that survives every retry is treated as a real failure. */
+    /* Retried, and each attempt waits for the radio to go quiet first: a TX
+     * firing inside a pass sags the rail and corrupts the bytes read back
+     * while the stored image is fine (see OTA_VERIFY_TX_SETTLE_MS and
+     * FOTA_bVerifyImageXorRetry). Only a mismatch that survives every attempt
+     * is treated as a real failure. */
     uint8_t u8Xor;
     bool bValid = FOTA_bVerifyImageXorRetry(0U, tPrep.u32ImageSize, tPrep.u8ImageXor, &u8Xor);
+
+    /* Cheap permanent canary — see the matching call in FOTA_vDistribute. */
+    FOTA_vDumpImageHead();
 
     uint8_t au8Rpt[OTA_PKT_REPORT_LEN];
     au8Rpt[0] = (uint8_t)MeshPktType_OtaReport;
@@ -1661,8 +2251,14 @@ void FOTA_vSecondaryReceive(void)
 
     if (!bValid)
     {
-        DBG_LOG("Fota: image XOR mismatch (0x%02X != 0x%02X) after 3 attempts\r\n",
-                u8Xor, tPrep.u8ImageXor);
+        DBG_LOG("Fota: image XOR mismatch (0x%02X != 0x%02X) after %u attempts\r\n",
+                u8Xor, tPrep.u8ImageXor, (unsigned)FOTA_XOR_VERIFY_MAX_ATTEMPTS);
+
+        /* Two more whole-image passes at different chunk sizes, plus the
+         * blank-run scan. Failure path only — see FOTA_vProbeImage. Sibling
+         * calls, not nested, on stack-depth grounds. */
+        FOTA_vProbeImage(tPrep.u32ImageSize, tPrep.u8ImageXor);
+        FOTA_vScanBlankRuns(tPrep.u32ImageSize);
 
         /* Every chunk passed its own LoRa packet CRC and the receive
          * bitmap says complete, yet the whole-image XOR disagrees — either
@@ -1698,7 +2294,36 @@ void FOTA_vSecondaryReceive(void)
 
         (void)MESHNETWORK_bSendOtaResponse(au8Rpt, sizeof(au8Rpt));
         bRxSessionActive = false;
-        LOG_vSuspend(false);
+        FLASH_vInhibitDeepPowerDown(false);
+        return;
+    }
+
+    /* Last gate before this secondary commits metadata and hands the image to
+     * a bootloader it cannot update. The version here came off the air in an
+     * OtaPrep header — another assertion about the image rather than from it —
+     * so a primary that was itself mislabelled upstream would otherwise
+     * propagate the fault into every unit that received cleanly. A secondary
+     * has no fr9 and no UART in the field: if it installs the wrong firmware it
+     * loops on the next boot with nothing able to intervene. */
+    uint32_t u32RxImageVer = 0U;
+    if (!FOTA_bStagedImageIsVersion(tPrep.u32Version, &u32RxImageVer))
+    {
+        DBG_LOG("Fota: received image identity MISMATCH - Prep says v%lu, image "
+                "declares v%lu - rejecting, NOT installing\r\n",
+                (unsigned long)tPrep.u32Version, (unsigned long)u32RxImageVer);
+
+        /* Status byte is index 9 (see where au8Rpt is built above) — the image
+         * verified fine, so it is still OTA_RPT_VALID at this point and has to
+         * be corrected, or the primary would record this unit as UPDATED. */
+        au8Rpt[9] = (uint8_t)OTA_RPT_ERROR;
+        (void)MESHNETWORK_bSendOtaResponse(au8Rpt, sizeof(au8Rpt));
+
+        /* Drop the bytes: no metadata was committed, so nothing treats this
+         * scratch as valid, and a later distribute must not find it. */
+        if (!FOTA_bEraseScratch())
+            DBG_LOG("Fota: scratch erase after identity mismatch FAILED\r\n");
+
+        bRxSessionActive = false;
         FLASH_vInhibitDeepPowerDown(false);
         return;
     }
@@ -1708,7 +2333,6 @@ void FOTA_vSecondaryReceive(void)
                               u8Xor))
     {
         bRxSessionActive = false;
-        LOG_vSuspend(false);
         FLASH_vInhibitDeepPowerDown(false);
         return;
     }
@@ -1719,7 +2343,6 @@ void FOTA_vSecondaryReceive(void)
     osDelay(2000);   /* let the (jittered) report leave the radio */
 
     bRxSessionActive = false;
-    LOG_vSuspend(false);
     FLASH_vInhibitDeepPowerDown(false);
     FOTA_vArmBootloaderAndReset(tPrep.u32Version);
 }
