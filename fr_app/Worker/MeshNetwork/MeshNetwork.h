@@ -45,26 +45,65 @@
  * on each lap around the mesh. 8 entries covers APP_PRIMARY_MAX_WAVES with
  * margin and cannot be displaced by beacon/ack churn. */
 #define MESH_DREQ_DEDUPE_SIZE         8U
+
+/* Forwards permitted per DReq id. A DReq is the one packet the whole campaign
+ * hangs on: lose it and a node never learns a campaign is running, never
+ * beacons, and is not counted for the rest of the window. One relay per node
+ * gave that packet a single chance to survive a collision, so each id now gets
+ * two — the dedupe store counts forwards instead of just remembering the id.
+ *
+ * The two copies are driven by two separate RECEPTIONS of the same id (a flood
+ * arrives from several neighbours), so the spacing is whatever the mesh gives,
+ * plus MESH_DREQ_FWD2_EXTRA_*_MS below to keep the pair off one another. A node
+ * that only ever hears an id once still forwards once, exactly as before.
+ *
+ * This applies to both relay paths — the wave-1 flood and the forwarder relay
+ * of waves 2+. What stays unchanged is WHO relays: wave 1 by every node, waves
+ * 2+ only by forwarders. */
+#define MESH_DREQ_MAX_FORWARDS        2U
 /* 120 (was 128): freed 160 B of .bss for the superOptimise fixes on a part
  * whose RAM was byte-exact full. Still far beyond a realistic per-primary
  * fleet — D-Acks carry 8 ids per 2 s, so even 120 nodes need ~30 s of ack
  * airtime per campaign. */
 #define MESH_MAX_NEIGHBORS            120
 
-/* A beaconing node stops (becomes forwarder) after this many beacons — bounds
- * airtime if its D-Ack is silently lost. This is a PER-WAVE budget: the
- * primary's next DReq wave re-arms a node that was never acked, so hitting it
- * is a backoff, not a giveup for the whole campaign.
- * (A parallel 30 s duration cap used to sit alongside this; at the 3.5 s
+/* A beaconing node used to stop (become forwarder) after MESH_MAX_BEACONS_PER_
+ * CAMPAIGN (6) beacons, on the theory that it bounded airtime when a D-Ack was
+ * silently lost. What it actually bounded was the node's chance of being found:
+ * six beacons is ~17.5 s of a 180 s window, after which a node the primary was
+ * still hunting for went mute and was not counted. A per-wave re-arm was bolted
+ * on to claw some of that back, which only made the giving-up harder to follow.
+ *
+ * A secondary now beacons until it is ACKED, or until the campaign's 180 s hard
+ * cap (APP_DISCOVERY_WINDOW_TIMEOUT_MS in DeviceDiscovery.h) ends the window —
+ * that cap was always the real bound and is now the only one. The ack path
+ * (MESHNETWORK_vStopBeaconingByOrigin) is unchanged, so a node that IS heard
+ * still stops on the first ack and costs no more airtime than before.
+ *
+ * (A parallel 30 s duration cap once sat alongside the count; at the 3.5 s
  * beacon interval 6 beacons take ~21 s, so the count always won and the timer
- * never once decided anything. Removed rather than left as dead config.) */
-#define MESH_MAX_BEACONS_PER_CAMPAIGN 6U
+ * never once decided anything. It was already removed.) */
 
 /* TX jitter window — wide enough to de-correlate many nodes answering one DReq.
  * Max stays well under MESH_BEACON_INTERVAL_MS so a jittered beacon never slips
  * past the next interval. */
 #define MESH_TX_JITTER_MIN_MS         20U
 #define MESH_TX_JITTER_MAX_MS         1500U
+
+/* Send delay for the SECOND forward of a DReq id. REPLACES the normal jitter
+ * window above for that one packet (it is not added to it), so the two copies
+ * cannot land inside one congestion window — a collision that killed copy 1 is
+ * then unlikely to kill copy 2, which is the entire point of sending two.
+ *
+ * The window deliberately does not overlap [MIN, MAX] above, so the pair is
+ * always separated by at least (1600 - 1500) = 100 ms and typically ~1 s. The
+ * ceiling matters: the mesh TX queue is drained in order and each item blocks
+ * on its own ready-tick, so a deferred forward holds up whatever is queued
+ * behind it. 2600 ms worst case stays under MESH_BEACON_INTERVAL_MS, keeping
+ * the existing guarantee that a queued beacon never slips past its next
+ * interval. */
+#define MESH_DREQ_FWD2_DELAY_MIN_MS   1600U
+#define MESH_DREQ_FWD2_DELAY_MAX_MS   2600U
 
 /*
  * Per-packet verbose text logging. During a campaign every node hears every
@@ -144,6 +183,18 @@ typedef struct {
                               * so "did unit X pick up the latest OTA" is
                               * answerable from the fr9 flash log without
                               * touching each device with `tag <ID> fwver`. */
+    /* Which node's DReq produced i16Rssi above. i16Rssi is the BEST reading of
+     * the wave, and the DReq that gave it may have come from the primary
+     * directly or from any relaying peer, so the reading alone does not say
+     * where this node's good path actually is. Carried as the 16-bit device id
+     * of the immediate sender of that DReq (see MESH_DREQ_LEN_SRC).
+     *
+     * bValid is a separate flag rather than "u16 != 0" because 0x0000 is a
+     * reachable device id, and because a beacon relayed by an older forwarder
+     * arrives with the field genuinely absent — which must not be reported as
+     * a real id of zero. */
+    bool     bBestRssiSrcValid;
+    uint16_t u16BestRssiSrcId;
     bool     bGpsValid;      /* true if i32Lat/Lon hold a real fix */
     int32_t  i32LatUDeg;     /* latitude  in microdegrees (10^-6 deg) */
     int32_t  i32LonUDeg;     /* longitude in microdegrees (10^-6 deg) */
@@ -204,9 +255,17 @@ typedef struct {
 } ForwardRing_t;
 
 /* ---- Neighbor entry (internal) ----
- * Field order and the u8MoveState/bGpsValid bitfields keep this at 20 bytes
- * (vs. 24 with naive ordering) — tNeighborTable[MESH_MAX_NEIGHBORS] makes
- * every byte here cost 128x in a 64K-RAM part. */
+ * Field order is load-bearing. The declared fields below occupy 21 bytes and
+ * the struct is 24 (verified against .bss.tNeighborTable = 0xb40 = 120 x 24 in
+ * the linked map), so there are 3 bytes of tail padding the compiler inserts
+ * whatever we do. u16BestRssiSrcId is placed last deliberately: it lands at
+ * offset 22 inside that existing padding and sizeof stays 24, which is the only
+ * reason this field is affordable at all.
+ *
+ * That headroom is now spent. .bss is byte-exact full on this part — the linked
+ * image leaves 8 bytes of the 64K RAM region — so a SECOND 2-byte field here,
+ * or widening this one to uint32_t, pushes sizeof to 28 and costs 480 B, which
+ * will not link. The static assert in MeshNetwork.c is what catches that. */
 typedef struct {
     uint32_t u32DeviceId;
     int32_t  i32LatUDeg;     /* latitude  in microdegrees */
@@ -219,6 +278,8 @@ typedef struct {
     uint8_t  u8MoveState : 1;  /* 0 = moving, 1 = still */
     uint8_t  bGpsValid   : 1;  /* 1 = i32Lat/LonUDeg hold a fix */
     bool     bAcked;
+    uint16_t u16BestRssiSrcId; /* node whose DReq gave i16Rssi; 0 = not reported
+                                * (older peer, or relayed via an older node) */
 } NeighborEntry_t;
 
 /* ---- Node role ---- */
@@ -235,7 +296,11 @@ typedef enum {
     DEVICE_ROLE_SECONDARY = 2
 } DeviceRole_e;
 
-/* ---- Discovered neighbor (application interface) ---- */
+/* ---- Discovered neighbor (application interface) ----
+ * Callers stack-allocate MESH_MAX_NEIGHBORS of these (DeviceDiscovery.c), so
+ * sizeof is a 120x stack cost, not just a RAM one. u16BestRssiSrcId sits after
+ * bGpsValid to fall in the 2-byte hole already there ahead of i32LatUDeg;
+ * sizeof stays 24. */
 typedef struct {
     uint32_t u32DeviceId;
     uint8_t  u8HopCount;
@@ -245,6 +310,7 @@ typedef struct {
     uint8_t  u8MoveState;    /* 0 = moving, 1 = still */
     uint8_t  u8FwPatch;      /* neighbor's VERSION_SW_PATCH from beacon */
     bool     bGpsValid;
+    uint16_t u16BestRssiSrcId; /* node whose DReq gave i16Rssi; 0 = not reported */
     int32_t  i32LatUDeg;     /* latitude  in microdegrees */
     int32_t  i32LonUDeg;     /* longitude in microdegrees */
 } MeshDiscoveredNeighbor_t;

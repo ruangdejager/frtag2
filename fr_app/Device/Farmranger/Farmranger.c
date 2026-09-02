@@ -445,8 +445,11 @@ bool FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
 /* --------------------------------------------------------------------------
  * FARMRANGER_bLogData — sends neighbor table to logger
  * -------------------------------------------------------------------------- */
-/* One CSV row: "DeviceId,Hops,Rssi,BatMv,Wave,Move,Lat,Lon\t". Worst case
- * is ~60 chars (8-hex id + signed micro-degree lat/lon); 80 leaves margin. */
+/* One CSV row — see FARMRANGER_iFormatRow for the column order. Worst case is
+ * ~67 chars (8-hex id + signed micro-degree lat/lon + the 4-hex RssiSrc); 80
+ * still leaves margin. The margin matters: a row that would exceed this aborts
+ * the WHOLE upload rather than truncating (both passes in FARMRANGER_bLogData
+ * treat >= FR_CSV_ROW_MAX as a hard failure). */
 #define FR_CSV_ROW_MAX 80
 
 /* Inter-row pacing for the CSV upload (ms). The fr9 receives into a 128-byte
@@ -464,9 +467,16 @@ bool FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
 static int FARMRANGER_iFormatRow(char *row, const MeshDiscoveredNeighbor_t *n)
 {
     /* Column order (must match fr9-side advanced-mode DBG_LOG header in
-     * FRTAG_vLogCmdHandler): DeviceId, Hops, Wave, RSSI, BatMv, Move, Lat, Lon, FwPatch */
+     * FRTAG_vLogCmdHandler): DeviceId, Hops, Wave, RSSI, BatMv, Move, Lat, Lon,
+     * FwPatch, RssiSrc.
+     *
+     * RssiSrc is appended LAST, and is the node whose DReq produced the RSSI in
+     * this row — 0 when the neighbour's firmware predates the field. The fr9
+     * counts tab-separated records and streams the bytes to its log without
+     * parsing the columns, so a new column costs it nothing; only its printed
+     * header line needs the matching update. */
     return snprintf(row, FR_CSV_ROW_MAX,
-                    "%X,%u,%u,%d,%u,%u,%ld,%ld,%u\t",
+                    "%X,%u,%u,%d,%u,%u,%ld,%ld,%u,%X\t",
                     (unsigned int)n->u32DeviceId,
                     n->u8HopCount,
                     n->u8Wave,
@@ -475,7 +485,8 @@ static int FARMRANGER_iFormatRow(char *row, const MeshDiscoveredNeighbor_t *n)
                     n->u8MoveState,
                     (long)n->i32LatUDeg,
                     (long)n->i32LonUDeg,
-                    n->u8FwPatch);
+                    n->u8FwPatch,
+                    (unsigned int)n->u16BestRssiSrcId);
 }
 
 /* Upload retry policy. The fr9 signals a failed transfer (bytes lost on the

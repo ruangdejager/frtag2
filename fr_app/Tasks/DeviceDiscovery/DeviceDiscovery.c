@@ -349,11 +349,13 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
              *   - 10 s of mesh radio silence while NOT beaconing (UNKNOWN that
              *     heard nothing, or FORWARDER once the mesh goes quiet),
              *   - the 180 s hard cap.
-             * While beaconing the silence rule is suppressed; that path ends via
-             * MeshNetwork's beacon cap, which flips the node to FORWARDER, after
-             * which the silence rule resumes. u32SilenceRef starts at the
-             * campaign start (fair first window) and advances to the latest
-             * discovery packet from ANY primary (multi-primary safe). */
+             * While beaconing the silence rule is suppressed, and since the
+             * beacon count cap was removed a node that is never acked keeps
+             * beaconing to the end of the window — so for that node this 180 s
+             * cap is the terminator, and MESHNETWORK_vStopBeaconingSelf() below
+             * is what stops it. u32SilenceRef starts at the campaign start (fair
+             * first window) and advances to the latest discovery packet from ANY
+             * primary (multi-primary safe). */
             uint32_t u32CampaignStart = osKernelGetTickCount();
             uint32_t u32SilenceRef    = u32CampaignStart;
             bool     bTimeSync        = false;
@@ -570,11 +572,16 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 EVTLOG(LOG_DISCOVERY_COUNT, u16NeighborCount);
                 for (uint16_t i = 0; i < u16NeighborCount; i++)
                 {
-                    DBG_LOG("  ID:%X  Hops:%X  Wave:%d  RSSI:%d  Bat:%d  Move:%u  Lat:%ld  Lon:%ld  FwPatch:%u\r\n",
+                    /* RssiSrc: the node whose DReq gave this neighbour its
+                     * reported RSSI — 0 if that neighbour's firmware predates
+                     * the field. Together with RSSI it says where the tag's
+                     * good path actually is, which hop count alone does not. */
+                    DBG_LOG("  ID:%X  Hops:%X  Wave:%d  RSSI:%d  RssiSrc:%04X  Bat:%d  Move:%u  Lat:%ld  Lon:%ld  FwPatch:%u\r\n",
                         tNeighbors[i].u32DeviceId,
                         tNeighbors[i].u8HopCount,
                         tNeighbors[i].u8Wave,
                         tNeighbors[i].i16Rssi,
+                        tNeighbors[i].u16BestRssiSrcId,
                         tNeighbors[i].u16BatMv,
                         tNeighbors[i].u8MoveState,
                         tNeighbors[i].bGpsValid ? (long)tNeighbors[i].i32LatUDeg : 0L,
