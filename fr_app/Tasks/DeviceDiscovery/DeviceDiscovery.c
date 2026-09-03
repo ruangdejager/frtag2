@@ -201,7 +201,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         MESHNETWORK_vResetDreqWaveCnt();
         /* R6: drop any TX left over from the previous campaign (e.g. a
          * late-jittered forward) so it can't fire at the start of this one. */
-        MESHNETWORK_vFlushTxQueue();
+        MESHNETWORK_vFlushTxQueue(false);
 #ifdef STORAGE_BACKEND_FLASH
         /* Likewise drop an OtaPrep latched last campaign but never serviced —
          * left set, it makes the session-id latch reject this campaign's Prep
@@ -263,8 +263,10 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         }
         else if (eDeviceRole == DEVICE_ROLE_PRIMARY)
         {
-            bool    bDiscoveryFinished = false;
-            uint8_t u8WaveCount        = 0;
+            bool     bDiscoveryFinished = false;
+            uint8_t  u8WaveCount        = 0;
+            bool     bDeadlineHit       = false;
+            uint32_t u32CampaignStart   = osKernelGetTickCount();
             DBG_LOG("DeviceDiscovery: Primary starting discovery campaign\r\n");
 
             while (!bDiscoveryFinished)
@@ -273,10 +275,31 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 bool bBeaconSeenThisWave = false;
 
                 MESHNETWORK_vIncrDreqWaveCnt();
-                MESHNETWORK_bStartDiscoveryRound(u32DreqId);
+                /* Return value now checked. A DReq that never reached the
+                 * queue (encode failure, queue full, radio test) used to leave
+                 * the primary listening out a whole idle window for a wave it
+                 * had not actually asked for - and MESHNETWORK_vStartPrimaryAck
+                 * lives past those failure returns, so that wave sent no D-Ack
+                 * either. txDrop is non-zero in the field, so this is not
+                 * hypothetical. One retry, then give up on the campaign rather
+                 * than burn the rest of the waves silently. */
+                if (!MESHNETWORK_bStartDiscoveryRound(u32DreqId))
+                {
+                    DBG_LOG("DeviceDiscovery: Primary DReq %08X not queued - retrying\r\n",
+                        (unsigned)u32DreqId);
+                    osDelay(500);
+                    u32DreqId = MESHNETWORK_u32GenerateGlobalMsgID();
+                    if (!MESHNETWORK_bStartDiscoveryRound(u32DreqId))
+                    {
+                        DBG_LOG("DeviceDiscovery: Primary cannot send DReq - ending campaign\r\n");
+                        MESHNETWORK_vStopPrimaryAck();
+                        break;
+                    }
+                }
                 u8WaveCount++;
 
                 uint32_t tLastBeaconTick = MESHNETWORK_u32GetLastBeaconHeardTick();
+                uint32_t u32WaveStart    = osKernelGetTickCount();
 
                 for (;;)
                 {
@@ -291,16 +314,75 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                         tLastBeaconTick      = tMeshLastBeacon;
                     }
 
-                    if ((tNow - tLastBeaconTick) > MESH_DISCOVERY_IDLE_MS)
+                    uint32_t u32WaveMs = tNow - u32WaveStart;
+
+                    /* The campaign deadline is checked HERE, not only between
+                     * waves: a wave ends on beacon silence and now also holds
+                     * open while anyone is un-acked, so a single wave is what
+                     * could overrun. Every exit from this loop has to leave the
+                     * ack timer stopped - it is periodic, and one left running
+                     * keeps queueing D-Acks through the fr9 session and into
+                     * the FOTA chunk stream. */
+                    if (u32WaveMs >= MESH_DISCOVERY_WAVE_MAX_MS ||
+                        (osKernelGetTickCount() - u32CampaignStart) >= APP_PRIMARY_CAMPAIGN_MAX_MS)
+                    {
+                        bDeadlineHit = ((osKernelGetTickCount() - u32CampaignStart) >=
+                                        APP_PRIMARY_CAMPAIGN_MAX_MS);
+                        break;
+                    }
+
+                    /* Listen floor for THIS wave: the flat base plus an
+                     * allowance for every ring of depth the herd has already
+                     * proven. A wave is looking for the ring one deeper than
+                     * the deepest answer so far, and the round trip out and
+                     * back grows with that depth - 2 s to the first ring and
+                     * 8 s to the fourth in one measured campaign - so a flat
+                     * floor is always too short for exactly the outermost
+                     * tags, which are the ones the extra waves exist to reach.
+                     * See MESH_DISCOVERY_WAVE_ALLOWANCE_MS.
+                     *
+                     * Recomputed every poll rather than fixed at wave start: a
+                     * beacon from a deeper ring arriving mid-wave is itself the
+                     * evidence that the ring behind IT will need longer, and in
+                     * a herd still being mapped that is the common case. */
+                    uint32_t u32WaveFloorMs =
+                        MESH_DISCOVERY_MIN_WAVE_MS +
+                        ((uint32_t)MESHNETWORK_u8GetMaxDiscoveredWave() *
+                         MESH_DISCOVERY_WAVE_ALLOWANCE_MS);
+                    if (u32WaveFloorMs > MESH_DISCOVERY_MIN_WAVE_CAP_MS)
+                        u32WaveFloorMs = MESH_DISCOVERY_MIN_WAVE_CAP_MS;
+
+                    /* Silence only means "the herd has finished answering"
+                     * once two other things are true.
+                     *
+                     * MIN_WAVE: the wave clock starts when the DReq is
+                     * ENQUEUED, and between enqueue and air a packet waits out
+                     * its jitter, whatever is queued ahead of it, and the radio
+                     * layer's carrier sense. Without a floor the idle window
+                     * could expire before the DReq had even been transmitted,
+                     * which is the 3 s / 0 neighbour campaign in the logs.
+                     *
+                     * UN-ACKED: a node the primary has heard but not yet put
+                     * in a D-Ack has no reason to stop beaconing, so ending
+                     * its wave is the one thing guaranteed to be wrong. This
+                     * is the direct form of what the idle window used to have
+                     * to infer from timing and could not - and it is what lets
+                     * the beacon cadence back off (MESH_BEACON_BASE_MS) past
+                     * any idle value we could afford. Bounded by the wave
+                     * ceiling above, because a node whose acks never reach it
+                     * re-beacons and so stays un-acked indefinitely. */
+                    if (u32WaveMs >= u32WaveFloorMs &&
+                        (tNow - tLastBeaconTick) > MESH_DISCOVERY_IDLE_MS &&
+                        !MESHNETWORK_bHasUnackedNeighbors())
                         break;
 
                     /* Radio test entered mid-campaign. Bail out rather than
                      * run the waves out: MESHNETWORK_bSendPacket returns false
                      * for the duration of a test, so the DReq never actually
-                     * goes out, no beacon can be heard in reply, and every
-                     * wave would time out on MESH_DISCOVERY_IDLE_MS — five of
-                     * them, ~35 s, followed by a logger session that fights
-                     * the test for the same Farmranger link and PA0 line. */
+                     * goes out, no beacon can be heard in reply, and every wave
+                     * would sit out its full wave ceiling - eight of them,
+                     * followed by a logger session that fights the test for the
+                     * same Farmranger link and PA0 line. */
                     if (RADIOTESTMODE_bActive())
                         break;
                 }
@@ -310,7 +392,19 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                     bDiscoveryFinished = true;
                     MESHNETWORK_vStopPrimaryAck();
                 }
-                else if (!bBeaconSeenThisWave || u8WaveCount >= APP_PRIMARY_MAX_WAVES)
+                else if (bDeadlineHit)
+                {
+                    DBG_LOG("DeviceDiscovery: Primary campaign deadline (%u ms) reached after %u waves\r\n",
+                        (unsigned)APP_PRIMARY_CAMPAIGN_MAX_MS, (unsigned)u8WaveCount);
+                    bDiscoveryFinished = true;
+                    MESHNETWORK_vStopPrimaryAck();
+                }
+                /* A barren wave no longer ends the campaign on its own: the
+                 * frontier advances one ring per wave, and "no beacon this
+                 * wave" has meant "nobody answered in time" as often as
+                 * "nobody is there". See APP_PRIMARY_MIN_WAVES. */
+                else if ((!bBeaconSeenThisWave && u8WaveCount >= APP_PRIMARY_MIN_WAVES) ||
+                         u8WaveCount >= APP_PRIMARY_MAX_WAVES)
                 {
                     if (bBeaconSeenThisWave)
                         DBG_LOG("DeviceDiscovery: Primary wave cap (%u) reached\r\n",
@@ -486,7 +580,11 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
          * campaigns and so never arm FOTA acceptance at all. Flushed here,
          * before the stats line, so the drop shows up in this campaign's
          * tally. */
-        MESHNETWORK_vFlushTxQueue();
+        /* true: keep a pending TimeSync relay. On a secondary this flush runs
+         * the instant a TimeSync ends its campaign, which is exactly while its
+         * own relay of that TimeSync is still waiting out its TX jitter -
+         * dropping it is what left the nodes behind it unsynced. */
+        MESHNETWORK_vFlushTxQueue(true);
         LORARADIO_vFlushTxQueue();
 
         MESHNETWORK_vLogCampaignStats("campaign");
@@ -555,7 +653,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                  * flip-back next time they open their big-interval RX
                  * window. */
                 DEVICE_DISCOVERY_vSendTS();
-                EVTLOG(LOG_TX_TS, 1);
             }
             osDelay(2000);
         }
@@ -676,7 +773,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                  * to OTA_FWREQ_WAIT_MAX_MS). Only the primary talks to fr9 at
                  * all — secondaries have no Farmranger UART link. */
                 DEVICE_DISCOVERY_vSendTS();
-                EVTLOG(LOG_TX_TS, 1);
 
 #ifdef STORAGE_BACKEND_FLASH
                 /* ---- LoRa distribution to secondaries (if a staged image is
@@ -1220,6 +1316,10 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
 /* --------------------------------------------------------------------------
  * DEVICE_DISCOVERY_vSendTS
  * -------------------------------------------------------------------------- */
+/* Both call sites used to EVTLOG(LOG_TX_TS, 1) themselves. The event now
+ * comes from MESHNETWORK_vSendTimeSync, which is the only place that knows
+ * whether the packet actually reached the TX queue and which of its two
+ * airings went out. */
 static void DEVICE_DISCOVERY_vSendTS(void)
 {
     DBG_LOG("\r\n--- START TIMESYNC ---\r\n");

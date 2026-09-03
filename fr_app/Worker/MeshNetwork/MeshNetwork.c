@@ -192,11 +192,27 @@ _Static_assert(sizeof(NeighborEntry_t) == 24,
 _Static_assert(sizeof(MeshDiscoveredNeighbor_t) == 24,
                "MeshDiscoveredNeighbor_t grew: DeviceDiscovery stack-allocates "
                "120 of these.");
+/* A full D-Ack must fit one TX queue item. 10 header bytes + 4 per id; the
+ * queue silently refuses anything longer (see MESHNETWORK_bSendPacketDelayed),
+ * which would make every ack of a full batch vanish with no distinguishable
+ * error. */
+_Static_assert(10 + 4 * MESH_MAX_ACK_IDS_PER_PACKET <= MESH_TX_MAX_PACKET_SIZE,
+               "A full D-Ack no longer fits a mesh TX queue item.");
 
 static bool       bNodeBeaconing      = false;
 static uint32_t   u32NodeBeaconDreqId = 0;
 static uint8_t    u8NodeHopCount      = 0;
 static NodeRole_e eNodeRole           = NODE_ROLE_UNKNOWN;
+
+/* Beacons already sent in the CURRENT beaconing episode - the n of
+ * MESH_BEACON_BASE_MS's interval(n). Guarded by xRoleMutex together with the
+ * scalars above, and zeroed by every start and every stop, so the invariant
+ * "not beaconing implies n == 0" holds unconditionally and no path can arm the
+ * timer with a stale backed-off period. Saturates rather than wrapping: at
+ * MESH_BEACON_MAX_MS the interval stops growing anyway, so the count past that
+ * point carries no information and a wrap to 0 would silently restore the fast
+ * cadence to a node that has been beaconing unheard for minutes. */
+static uint8_t    u8NodeBeaconSeq     = 0;
 
 /* Survives the stop that bStopBeaconingLocked performs (which zeroes
  * u32NodeBeaconDreqId), so after we stop we still know which primary we were
@@ -259,9 +275,23 @@ static uint16_t u16MsgCounter        = 0;
 static uint64_t u64LastPrimaryHeardTick = 0;
 static uint8_t  u8PrimaryDreqWaveCnt = 0;
 
-/* Best DReq RSSI of the current wave, together with the device id of the node
- * that sent that DReq, in ONE 32-bit word: [31:16] = sender id, [15:0] = RSSI
- * as int16.
+/* RSSI of the ONE DReq that actually triggered this node's current beaconing
+ * episode - the direct hearing, re-arm, or re-anchor that called
+ * MESHNETWORK_vStartBeaconing - together with the device id of whoever sent
+ * that specific frame, packed in ONE 32-bit word: [31:16] = sender id,
+ * [15:0] = RSSI as int16.
+ *
+ * This used to track the BEST (strongest) RSSI seen across the whole episode,
+ * updated every time a stronger copy of the wave's DReq arrived. That made the
+ * reported "good path" drift as the episode went on and is also the wrong
+ * question for what this field is FOR - MESHNETWORK_bStartDiscoveryRound.c's
+ * primary reads it to tell operators which of ITS relays actually reached a
+ * given tag, and the answer to that is the one reception that made the tag
+ * answer, not whichever later reception happened to be loudest. So the value
+ * is now LATCHED: set once by the trigger, and frozen - see bBestDreqLatched -
+ * until the episode ends (acked, campaign end) or is re-triggered (re-arm,
+ * re-anchor onto a newer dreq from the same primary), each of which is itself
+ * a fresh "first hearing" and gets its own latch.
  *
  * Packed rather than kept as two statics because the pair is written from the
  * parser task (every DReq received) and read from the MeshTx task (when a
@@ -273,15 +303,24 @@ static uint8_t  u8PrimaryDreqWaveCnt = 0;
  * is single-copy atomic on Cortex-M, so packing removes the tear outright
  * instead of papering over it with a mutex.
  *
- * Always go through BEST_* below; nothing should touch the raw word. */
+ * Always go through BEST_* below; nothing should touch the raw word or the
+ * latch directly. */
 #define BEST_DREQ_RSSI_NONE   (-256)
 static volatile uint32_t u32BestDreqPacked =
     ((uint32_t)0U << 16) | (uint32_t)(uint16_t)(int16_t)BEST_DREQ_RSSI_NONE;
 
-static int16_t BEST_i16Rssi(void)
-{
-    return (int16_t)(uint16_t)(u32BestDreqPacked & 0xFFFFU);
-}
+/* True once u32BestDreqPacked holds this episode's triggering reception.
+ * BEST_vSet() is the trigger call — it always latches, unconditionally, so
+ * a re-arm or re-anchor can always overwrite an older episode's value even
+ * though it never explicitly unlatches first. BEST_vTryLatchFirst() is for
+ * the two sites that are NOT themselves a trigger (a wave-1 relay heard before
+ * this node has beaconed at all this campaign, and a duplicate/relayed copy of
+ * the SAME dreq heard again while already beaconing) — both must have no
+ * effect once the real trigger has already latched a value. Same volatile-bool
+ * reasoning as bCampaignHeard: written on the parser task, read on the MeshTx
+ * task, and a one-pass-late read costs at most one stale beacon. */
+static volatile bool bBestDreqLatched = false;
+
 /* Both halves from ONE read — the whole reason the pair is packed. Never fetch
  * the RSSI and the id in two separate accesses. */
 static void BEST_vGet(int16_t *pi16Rssi, uint16_t *pu16SrcId)
@@ -290,14 +329,27 @@ static void BEST_vGet(int16_t *pi16Rssi, uint16_t *pu16SrcId)
     *pi16Rssi  = (int16_t)(uint16_t)(u32P & 0xFFFFU);
     *pu16SrcId = (uint16_t)(u32P >> 16);
 }
+/* The authoritative "this is the trigger" call. Always overwrites and always
+ * latches - see the comment on bBestDreqLatched above for why that is safe
+ * even across a re-arm/re-anchor that skips an explicit unlatch. */
 static void BEST_vSet(int16_t i16Rssi, uint16_t u16SrcId)
 {
     u32BestDreqPacked = ((uint32_t)u16SrcId << 16) |
                         (uint32_t)(uint16_t)i16Rssi;
+    bBestDreqLatched  = true;
+}
+/* For the two non-trigger sites: record ONLY if nothing has latched yet this
+ * episode, so the first reception standing wins and nothing after it can move
+ * the value. */
+static void BEST_vTryLatchFirst(int16_t i16Rssi, uint16_t u16SrcId)
+{
+    if (!bBestDreqLatched) BEST_vSet(i16Rssi, u16SrcId);
 }
 static void BEST_vReset(void)
 {
-    BEST_vSet((int16_t)BEST_DREQ_RSSI_NONE, 0U);
+    u32BestDreqPacked = ((uint32_t)0U << 16) |
+                        (uint32_t)(uint16_t)(int16_t)BEST_DREQ_RSSI_NONE;
+    bBestDreqLatched  = false;
 }
 
 /* Campaign-level traffic counters — a one-line DBG_LOG summary in place of
@@ -335,6 +387,41 @@ static volatile bool bCampaignHeard = false;
  * losing exactly the deep tags this change exists to catch. */
 #if (MESH_DISCOVERY_IDLE_MS <= MESH_TX_JITTER_MAX_MS)
 #  error "MESH_DISCOVERY_IDLE_MS must exceed MESH_TX_JITTER_MAX_MS"
+#endif
+
+/* The SHORTEST beacon interval is the binding one for "a queued packet must
+ * not slip past the next beacon": both the jitter window and the second-copy
+ * DReq delay hold up whatever is behind them in the TX queue, and the beacon
+ * behind them is the next one due. Both invariants used to be stated against a
+ * single MESH_BEACON_INTERVAL_MS in comments only; with a backing-off cadence
+ * they are stated against the base and actually enforced. */
+#if (MESH_BEACON_BASE_MS <= MESH_TX_JITTER_MAX_MS)
+#  error "MESH_BEACON_BASE_MS must exceed MESH_TX_JITTER_MAX_MS"
+#endif
+#if (MESH_BEACON_BASE_MS <= MESH_DREQ_FWD2_DELAY_MAX_MS)
+#  error "MESH_BEACON_BASE_MS must exceed MESH_DREQ_FWD2_DELAY_MAX_MS"
+#endif
+/* An ack hold longer than the first beacon interval would provoke the extra
+ * beacon the longer hold is supposed to be free of. */
+#if (MESH_PRIMARY_ACK_INTERVAL_MS > MESH_BEACON_BASE_MS)
+#  error "MESH_PRIMARY_ACK_INTERVAL_MS must not exceed MESH_BEACON_BASE_MS"
+#endif
+#if (MESH_BEACON_MAX_MS < MESH_BEACON_BASE_MS)
+#  error "MESH_BEACON_MAX_MS must be >= MESH_BEACON_BASE_MS"
+#endif
+/* A wave that may not end before the floor but must end by the ceiling. The
+ * floor is scaled by herd depth at run time, so it is the CAP on that scaling
+ * that has to leave room for the idle tail underneath the ceiling - otherwise
+ * a deep herd's wave would always be cut off by the ceiling before its own
+ * floor let it end, and the wave-end reasoning would silently stop applying. */
+#if (MESH_DISCOVERY_WAVE_MAX_MS <= MESH_DISCOVERY_MIN_WAVE_MS)
+#  error "MESH_DISCOVERY_WAVE_MAX_MS must exceed MESH_DISCOVERY_MIN_WAVE_MS"
+#endif
+#if (MESH_DISCOVERY_MIN_WAVE_CAP_MS < MESH_DISCOVERY_MIN_WAVE_MS)
+#  error "MESH_DISCOVERY_MIN_WAVE_CAP_MS must be >= MESH_DISCOVERY_MIN_WAVE_MS"
+#endif
+#if ((MESH_DISCOVERY_MIN_WAVE_CAP_MS + MESH_DISCOVERY_IDLE_MS) > MESH_DISCOVERY_WAVE_MAX_MS)
+#  error "Scaled wave floor + idle tail must fit inside MESH_DISCOVERY_WAVE_MAX_MS"
 #endif
 
 /* ---- Forward declarations ---- */
@@ -737,10 +824,61 @@ static uint32_t MESHNETWORK_u32GetTxJitterMs(void)
     return MESH_TX_JITTER_MIN_MS + (MESHNETWORK_u32JitterRand() % (u32Range + 1));
 }
 
-/* Send delay for forward number u8Ordinal of a DReq (1-based, from
- * DREQ_bClaimForward). The first copy takes the ordinary jitter; the second
- * takes the non-overlapping later window so the two cannot land inside one
- * congestion window. See MESH_DREQ_FWD2_DELAY_MIN_MS. */
+/* interval(n) for the beacon backoff - see MESH_BEACON_BASE_MS. Pure function
+ * of the count so both the arming site and any future caller agree. */
+static uint32_t MESHNETWORK_u32BeaconIntervalMs(uint8_t u8Seq)
+{
+    uint32_t u32Ms = MESH_BEACON_BASE_MS +
+                     ((uint32_t)u8Seq * MESH_BEACON_STEP_MS);
+    return (u32Ms > MESH_BEACON_MAX_MS) ? MESH_BEACON_MAX_MS : u32Ms;
+}
+
+/* Arm/re-arm the beacon timer for the next interval, but ONLY while this node
+ * is still beaconing, with the check and the arm inside one hold of
+ * xRoleMutex.
+ *
+ * The lock is what makes this safe against the stop paths, and the ordering
+ * argument is worth stating because it is the only reason a kernel call is
+ * made under this mutex at all (everything else deliberately keeps timer calls
+ * outside it). A stop clears bNodeBeaconing UNDER the lock and calls
+ * osTimerStop AFTER releasing it. So either we get the lock first - we arm,
+ * and the stop's osTimerStop is strictly later and wins - or the stop gets it
+ * first and we see bNodeBeaconing == false and do not arm. There is no
+ * interleaving that leaves the timer running with beaconing false, which
+ * without the lock would leave a periodic timer waking the MCU every interval
+ * for a node that has already been acked.
+ *
+ * A failed osTimerStart is survivable and logged rather than retried: the timer
+ * is periodic and already running with the previous interval, so the only cost
+ * is that this one step of the backoff does not take effect. (The exception is
+ * the very first arm in MESHNETWORK_vStartBeaconing, which has nothing to fall
+ * back on - see there.) */
+static void MESHNETWORK_vArmBeaconTimer(void)
+{
+    if (xBeaconTimer == NULL) return;
+    if (osMutexAcquire(xRoleMutex, 100) != osOK) return;
+    if (bNodeBeaconing)
+    {
+        /* Consume interval(n) for the beacon just built, THEN advance n, so
+         * the gaps run BASE, BASE+STEP, ... and not BASE+STEP first. Both the
+         * count and the arming live in this one locked region, which is what
+         * makes the count single-owner: it cannot advance for a beacon that
+         * was never built (this runs after the build), and it cannot be read
+         * stale by a re-anchor (which resets it under the same lock). */
+        uint32_t u32Ms = MESHNETWORK_u32BeaconIntervalMs(u8NodeBeaconSeq);
+        if (u8NodeBeaconSeq < UINT8_MAX) u8NodeBeaconSeq++;
+        if (osTimerStart(xBeaconTimer, u32Ms) != osOK)
+            DBG_LOG("MeshNetwork: beacon timer re-arm failed (keeping previous interval)\r\n");
+    }
+    osMutexRelease(xRoleMutex);
+}
+
+/* Send delay for airing number u8Ordinal of a packet (1-based; for DReqs it
+ * comes from DREQ_bClaimForward). The first copy takes the ordinary jitter; the
+ * second takes the non-overlapping later window so the two cannot land inside
+ * one congestion window. See MESH_DREQ_FWD2_DELAY_MIN_MS. Also used for the two
+ * airings of a TimeSync (MESH_TIMESYNC_AIRINGS), which want exactly the same
+ * spacing for exactly the same reason. */
 static uint32_t MESHNETWORK_u32DreqFwdDelayMs(uint8_t u8Ordinal)
 {
     if (u8Ordinal < 2U) return MESHNETWORK_u32GetTxJitterMs();
@@ -805,15 +943,23 @@ static void MESHNETWORK_vBuildAndQueueBeacon(void)
 
     uint8_t u8Buf[64];
     size_t  u32Len = 0;
-    if (!MESHNETWORK_bEncodeDBeacon(&tBeacon, u8Buf, sizeof(u8Buf), &u32Len)) return;
-    FORWARD_vAdd(tBeacon.u32BeaconMsgId);
-    MESHNETWORK_bSendPacket(u8Buf, u32Len);
+    if (MESHNETWORK_bEncodeDBeacon(&tBeacon, u8Buf, sizeof(u8Buf), &u32Len))
+    {
+        FORWARD_vAdd(tBeacon.u32BeaconMsgId);
+        MESHNETWORK_bSendPacket(u8Buf, u32Len);
+    }
 
     /* No beacon count or duration cap here any more: a secondary keeps beaconing
      * on xBeaconTimer until a D-Ack stops it (MESHNETWORK_vStopBeaconingByOrigin)
      * or the campaign's 180 s window closes and DeviceDiscovery calls
      * MESHNETWORK_vStopBeaconingSelf. See MeshNetwork.h above
-     * MESH_TX_JITTER_MIN_MS for why the old 6-beacon cap went. */
+     * MESH_TX_JITTER_MIN_MS for why the old 6-beacon cap went.
+     *
+     * What there IS now is a decaying cadence: re-arm the timer for the next
+     * interval(n). Done last, and unconditionally on the build succeeding or
+     * not, so an encode failure costs one beacon rather than the whole
+     * episode. */
+    MESHNETWORK_vArmBeaconTimer();
 }
 
 /* Timer callback (Tmr Svc context): stay tiny — just wake the MeshTx task.
@@ -856,7 +1002,13 @@ static void MESHNETWORK_vBuildAndQueueAck(void)
 
         if (tAck.u8AckCount > 0)
         {
-            uint8_t u8Buf[128];
+            /* Sized against the TX item, not generously: MESHNETWORK_
+             * bSendPacketDelayed refuses anything over MESH_TX_MAX_PACKET_SIZE
+             * and the refusal is indistinguishable from a full queue, so a
+             * D-Ack that outgrew the item would fail silently on every send.
+             * The assert above the neighbour-table tripwires is what keeps
+             * MESH_MAX_ACK_IDS_PER_PACKET and this cap in step. */
+            uint8_t u8Buf[MESH_TX_MAX_PACKET_SIZE];
             size_t  u32Len = 0;
             bool    bQueued = false;
             if (MESHNETWORK_bEncodeDAck(&tAck, u8Buf, sizeof(u8Buf), &u32Len))
@@ -1070,11 +1222,16 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
             }
 
             /* Relayed copy: stay awake, but do not join the roll-call yet —
-             * this node's own wave will come. */
+             * this node's own wave will come. Not a trigger event (this node
+             * has not started beaconing off THIS reception), so latch-if-first
+             * only: a node not yet beaconing has nothing to protect and this
+             * gets overwritten by the real trigger regardless; a node ALREADY
+             * beaconing this wave must not have its first-heard value nudged
+             * by every further relayed copy that happens to reach it too. */
             if (u8SenderHopCount != 0U)
             {
-                if ((u8PrimaryDreqWaveCnt == u8WaveCnt) && (s16Rssi > BEST_i16Rssi()))
-                    BEST_vSet(s16Rssi, u16ImmSenderId);
+                if (u8PrimaryDreqWaveCnt == u8WaveCnt)
+                    BEST_vTryLatchFirst(s16Rssi, u16ImmSenderId);
                 return;
             }
             /* hop == 0: heard the primary directly — fall through and beacon. */
@@ -1149,12 +1306,14 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
             if (eRole != NODE_ROLE_BEACONING ||
                 (u32DreqId != u32NodeBeaconDreqId && bSamePrimary))
             {
-                /* Seed the wave and best-RSSI baseline BEFORE starting to beacon.
-                 * R1 fires the first beacon immediately from the higher-priority
-                 * MeshTx task, which stamps the best RSSI into the beacon; if we
-                 * left the RSSI to the max-update below (which runs after
-                 * vStartBeaconing) that first beacon would carry the -256 reset
-                 * value - exactly the -256 RSSI seen at the primary. */
+                /* Seed the wave count and latch THIS reception as the trigger
+                 * BEFORE starting to beacon. R1 fires the first beacon
+                 * immediately from the higher-priority MeshTx task, which reads
+                 * the latched value into the beacon; vStartBeaconing is what
+                 * sets that task running, so if the latch happened AFTER it
+                 * instead (e.g. down at the catch-all) the race would be live
+                 * and that first beacon could carry the -256 reset value -
+                 * exactly the -256 RSSI seen at the primary. */
                 u8PrimaryDreqWaveCnt = u8WaveCnt;
                 BEST_vSet(s16Rssi, u16ImmSenderId);
                 MESHNETWORK_vStartBeaconing(u32DreqId, (uint8_t)(u8SenderHopCount + 1));
@@ -1162,8 +1321,13 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
         }
     }
 
-    if ((u8PrimaryDreqWaveCnt == u8WaveCnt) && (s16Rssi > BEST_i16Rssi()))
-        BEST_vSet(s16Rssi, u16ImmSenderId);
+    /* Catch-all for receptions the branches above did not already treat as a
+     * trigger: most commonly a duplicate/relayed copy of the SAME dreq this
+     * node is already beaconing for, arriving via a different path. Not a new
+     * trigger - latch-if-first, so the value stays pinned to whichever
+     * reception actually started this episode. */
+    if (u8PrimaryDreqWaveCnt == u8WaveCnt)
+        BEST_vTryLatchFirst(s16Rssi, u16ImmSenderId);
 }
 
 static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
@@ -1379,7 +1543,15 @@ static void MESHNETWORK_vHandleBasicBeacon(const uint8_t *pBuf,
     if (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY)
     {
         BASIC_vAddOrUpdate(&tBB);
-        tLastBeaconHeardTick = osKernelGetTickCount();
+        /* The wave clock is an ADVANCED-mode concept, so only stamp it when
+         * this primary is actually running a basic-mode listen. A secondary
+         * that has not yet heard the TimeSync carrying a flip back to advanced
+         * keeps basic-beaconing every 2-8 s straight across the advanced
+         * campaign's start; counting those as wave activity would keep every
+         * wave alive for nodes that never enter the neighbour table and are
+         * never uploaded - a full-length campaign that finds nothing. */
+        if (MESHNETWORK_eGetDiscoveryMode() == DISCOVERY_MODE_BASIC)
+            tLastBeaconHeardTick = osKernelGetTickCount();
     }
 }
 
@@ -1634,7 +1806,13 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
     }
 #endif
 
+    /* Relayed twice for the same reason the primary originates twice, and with
+     * the same pair of windows - see MESH_TIMESYNC_AIRINGS. The dedup above has
+     * already guaranteed this runs once per UTC per node, so total airings stay
+     * bounded at 2 per node however many copies arrive. */
     MESHNETWORK_bSendPacket(pBuf, u32Len);
+    MESHNETWORK_bSendPacketDelayed(pBuf, u32Len,
+                                   MESHNETWORK_u32DreqFwdDelayMs(2U));
     DBG("MeshNetwork: TimeSync forwarded\r\n");
     u16StatMsgsForwarded++;
     EVTLOG(LOG_TX_TS, 2);
@@ -1879,7 +2057,6 @@ uint32_t MESHNETWORK_u32GenerateGlobalMsgID(void)
 
 bool MESHNETWORK_bStartDiscoveryRound(uint32_t u32DreqId)
 {
-    tLastBeaconHeardTick = osKernelGetTickCount();
     u32NodeBeaconDreqId  = u32DreqId;
 
     uint8_t u8Out[32];
@@ -1893,6 +2070,14 @@ bool MESHNETWORK_bStartDiscoveryRound(uint32_t u32DreqId)
 
     if (!MESHNETWORK_bSendPacket(u8Out, u32Len))
         return false;
+
+    /* Stamped only now, AFTER the DReq is safely queued. It used to be the
+     * first line of this function, ahead of two failure returns - so an encode
+     * failure, a full TX queue or an active radio test produced a wave that
+     * listened out its whole idle window with nothing ever transmitted, and
+     * MESHNETWORK_vStartPrimaryAck below never ran either, so that wave sent no
+     * D-Ack at all. The caller now checks the return value as well. */
+    tLastBeaconHeardTick = osKernelGetTickCount();
 
     MESHNETWORK_vStartPrimaryAck();
     DBG_LOG("MeshNetwork: DReq %08X sent\r\n", u32DreqId);
@@ -1916,11 +2101,37 @@ void MESHNETWORK_vSendTimeSync(uint32_t u32UtcTimestamp,
     uint8_t u8Buf[16];
     size_t  u32Len = 0;
     if (!MESHNETWORK_bEncodeTimeSync(&tTs, u8Buf, sizeof(u8Buf), &u32Len)) return;
+
+    /* Aired TWICE, exactly like a DReq: the ordinary jitter, then the
+     * non-overlapping second-copy window, so a collision that eats copy 1
+     * cannot also eat copy 2. See MESH_TIMESYNC_AIRINGS. One encode, one UTC,
+     * two enqueues - nothing downstream can tell the copies apart, and the
+     * receive-side dedup means a secondary still decodes and applies exactly
+     * one TimeSync per campaign. */
+    bool bSent = MESHNETWORK_bSendPacket(u8Buf, u32Len);
+    if (bSent)
+    {
+        EVTLOG(LOG_TX_TS, 1);
+        if (MESHNETWORK_bSendPacketDelayed(u8Buf, u32Len,
+                                           MESHNETWORK_u32DreqFwdDelayMs(2U)))
+            EVTLOG(LOG_TX_TS, 3);   /* 3 = second airing of an origination */
+    }
     /* I2: record in the dedicated TimeSync tracker (not the msg-id ring) so
      * echoes of our own TimeSync are not re-forwarded. */
-    u32LastTimeSyncUtc = u32UtcTimestamp;
-    bTimeSyncUtcValid  = true;
-    MESHNETWORK_bSendPacket(u8Buf, u32Len);
+    if (bSent)
+    {
+        u32LastTimeSyncUtc = u32UtcTimestamp;
+        bTimeSyncUtcValid  = true;
+    }
+    else
+    {
+        /* Not latched on a refusal (radio test, queue full): advancing the
+         * tracker for a UTC that never aired would make the primary drop the
+         * next, lower one as an old echo. */
+        DBG_LOG("MeshNetwork: TimeSync %u NOT SENT (queue refused)\r\n",
+                u32UtcTimestamp);
+        return;
+    }
     DBG_LOG("MeshNetwork: TimeSync sent %u interval=%u fwVer=%lu mode=%s gps=%u\r\n",
         u32UtcTimestamp, tWakeupInterval, (unsigned long)u32StagedFwVersion,
         (eMode == DISCOVERY_MODE_BASIC) ? "basic" : "advanced",
@@ -1957,6 +2168,10 @@ static bool MESHNETWORK_bStopBeaconingLocked(uint32_t u32DreqId)
 {
     if (!bNodeBeaconing)                  return false;
     if (u32NodeBeaconDreqId != u32DreqId) return false;
+    /* Keeps "not beaconing implies n == 0" true, so no path can arm the timer
+     * off a stale backed-off count. This is the common core of both the ack
+     * stop and the campaign-end stop. */
+    u8NodeBeaconSeq     = 0U;
     bNodeBeaconing      = false;
     BEST_vReset();
     /* Remember who we were beaconing to before clearing the live id: a D-Ack
@@ -2038,14 +2253,30 @@ static void MESHNETWORK_vStartBeaconing(uint32_t u32DreqId, uint8_t u8HopCount)
             u32NodeBeaconDreqId    = u32DreqId;
             u8NodeHopCount         = u8HopCount;
             eNodeRole              = NODE_ROLE_BEACONING;
+            /* Fresh episode: back to the fast cadence. This is what gives a
+             * node re-anchoring onto a newer dreq, or re-arming on a later
+             * wave, a prompt first answer instead of inheriting the decayed
+             * interval of the episode it just left. Reset HERE, inside the
+             * same lock that flips bNodeBeaconing, because the re-arming site
+             * runs on the higher-priority MeshTx task and would otherwise be
+             * able to read the old count. */
+            u8NodeBeaconSeq        = 0U;
             bDoStart               = true;
         }
         osMutexRelease(xRoleMutex);
     }
     if (bDoStart)
     {
-        /* Periodic retries... */
-        osTimerStart(xBeaconTimer, MESH_BEACON_INTERVAL_MS);
+        /* Periodic retries at interval(0); MESHNETWORK_vArmBeaconTimer takes
+         * the cadence over from the second beacon on. Retried once on failure,
+         * unlike those re-arms: there is no already-running timer to fall back
+         * on here, so a dropped command (osTimerStart passes a block time of 0
+         * to a 10-entry timer command queue) would leave the node mute for the
+         * rest of the wave after its one immediate beacon, with nothing in the
+         * log to say so. */
+        if (osTimerStart(xBeaconTimer, MESH_BEACON_BASE_MS) != osOK &&
+            osTimerStart(xBeaconTimer, MESH_BEACON_BASE_MS) != osOK)
+            DBG_LOG("MeshNetwork: beacon timer start FAILED - one beacon only this wave\r\n");
         /* ...plus R1: fire the FIRST beacon immediately (built on the MeshTx
          * full stack), not after a full interval. */
         if (xMeshTxTaskHandle != NULL)
@@ -2085,6 +2316,35 @@ bool MESHNETWORK_bGetDiscoveredNeighbors(MeshDiscoveredNeighbor_t *pBuffer,
 }
 
 void MESHNETWORK_vClearDiscoveredNeighbors(void) { NEIGHBOR_vClearAll(); }
+
+bool MESHNETWORK_bHasUnackedNeighbors(void)
+{
+    bool bAny = false;
+    if (osMutexAcquire(xNeighborTableMutex, 100) == osOK)
+    {
+        for (uint16_t i = 0; i < u16NeighborCount; i++)
+        {
+            if (!tNeighborTable[i].bAcked) { bAny = true; break; }
+        }
+        osMutexRelease(xNeighborTableMutex);
+    }
+    return bAny;
+}
+
+uint8_t MESHNETWORK_u8GetMaxDiscoveredWave(void)
+{
+    uint8_t u8Max = 0U;
+    if (osMutexAcquire(xNeighborTableMutex, 100) == osOK)
+    {
+        for (uint16_t i = 0; i < u16NeighborCount; i++)
+        {
+            if (tNeighborTable[i].u8DreqWaveDiscovered > u8Max)
+                u8Max = tNeighborTable[i].u8DreqWaveDiscovered;
+        }
+        osMutexRelease(xNeighborTableMutex);
+    }
+    return u8Max;
+}
 
 void MESHNETWORK_vSetWakeupInterval(WakeupInterval tNewInterval)
 {
@@ -2137,6 +2397,7 @@ void MESHNETWORK_vResetNodeRole(void)
          * acked, so the per-wave re-arm starts from a clean slate. */
         u32LastBeaconDreqId    = 0;
         bNodeAckedThisCampaign = false;
+        u8NodeBeaconSeq        = 0U;   /* and the backoff cadence with them */
         osMutexRelease(xRoleMutex);
     }
 
@@ -2187,17 +2448,60 @@ void MESHNETWORK_vWakeTxWorker(void)
 }
 
 /* R6: drop any TX still queued (e.g. a late-jittered forward from the previous
- * campaign) so it can't fire at the start of the next one. Call on wake. */
-void MESHNETWORK_vFlushTxQueue(void)
+ * campaign) so it can't fire at the start of the next one. Call on wake.
+ *
+ * bKeepTimeSync re-queues a TimeSync frame instead of dropping it. Pass it at
+ * CAMPAIGN END, never on the wake flush: this flush also runs at campaign end,
+ * and on a secondary the campaign ends the instant a TimeSync is received -
+ * while that node's own relay of it is still sitting out its TX jitter. So the
+ * node that had just been served destroyed the copy the nodes behind it were
+ * waiting for, every time, and only a node whose campaign had
+ * already ended for some other reason ever relayed one. That is the shape of
+ * the field data: the 1-hop secondary heard its TimeSync in 6 of 7 wakes,
+ * while the 3-hop and 5-hop ones heard it in 4. Holding a relay back costs a
+ * fraction of the post-campaign delay - the secondary then waits 5 s before
+ * deep-sleeping the radio, which covers the second airing's window too - and
+ * this is the one packet the whole mesh depends on.
+ *
+ * The wake flush must NOT keep it. A relay that outlived the post-campaign
+ * delay (carrier sense can hold a packet ~5 s past a ~2.6 s ready tick) would
+ * otherwise sit in the queue through deep sleep and go on air a whole wake
+ * interval later, handing a secondary that missed the original a timestamp
+ * 15 minutes in the past - the dedup on the receiver only rejects a TimeSync
+ * it has ALREADY seen, so a node that missed it would apply it. */
+void MESHNETWORK_vFlushTxQueue(bool bKeepTimeSync)
 {
     if (xMeshTxQueue == NULL) return;
     MeshTxItem_t tItem;
-    while (osMessageQueueGet(xMeshTxQueue, &tItem, NULL, 0) == osOK)
+    uint8_t u8Kept = 0U;
+    /* Bounded by the queue length rather than draining until empty: every
+     * iteration removes one item and only a TimeSync goes back, so the loop
+     * cannot re-examine what it has kept. */
+    for (uint8_t u8i = 0U; u8i < MESH_TX_QUEUE_LEN; u8i++)
     {
+        if (osMessageQueueGet(xMeshTxQueue, &tItem, NULL, 0) != osOK) break;
+
+        if (bKeepTimeSync && tItem.u16Len > 0U &&
+            tItem.u8Buf[0] == (uint8_t)MeshPktType_TimeSync &&
+            osMessageQueuePut(xMeshTxQueue, &tItem, 0, 0) == osOK)
+        {
+            u8Kept++;
+            continue;
+        }
+
         /* Counted, not silent: a flush that routinely discards a lot is the
          * signature of a node queueing relays faster than the channel drains
-         * them — the condition that used to leave it deaf for minutes. */
+         * them - the condition that used to leave it deaf for minutes. */
         if (u16StatTxDropped < UINT16_MAX) u16StatTxDropped++;
+    }
+
+    if (u8Kept > 0U)
+    {
+        /* Something is still due out, so make sure the worker drains it. */
+        if (xMeshTxTaskHandle != NULL)
+            osThreadFlagsSet(xMeshTxTaskHandle, MESH_TX_FLAG_QUEUE);
+        DBG_LOG("MeshNetwork: TX flush kept %u queued TimeSync\r\n",
+                (unsigned)u8Kept);
     }
 }
 

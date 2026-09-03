@@ -331,7 +331,9 @@ bool RADIOTESTMODE_bEnter(void)
      * node does not spend the test chewing through a stale backlog. */
     MESHNETWORK_vResetNodeRole();
     MESHNETWORK_vStopPrimaryAck();
-    MESHNETWORK_vFlushTxQueue();
+    /* false: the test owns the air from here, so there is nothing to keep -
+     * a held-back TimeSync relay could not be transmitted anyway. */
+    MESHNETWORK_vFlushTxQueue(false);
     LORARADIO_vFlushTxQueue();
 
     /* The TX worker we are about to beacon from is parked on osWaitForever

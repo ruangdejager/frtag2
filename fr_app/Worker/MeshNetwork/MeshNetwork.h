@@ -15,15 +15,144 @@
 #include <stdbool.h>
 
 /* ---- Timing constants ---- */
-#define MESH_BEACON_INTERVAL_MS       3500U   /* beacon retry period while awaiting ACK */
-#define MESH_PRIMARY_ACK_INTERVAL_MS  2000U
-/* Beacon silence that ends one DReq wave on the primary. Was 7000: with the
- * frontier advancing one ring per wave (see MESHNETWORK_vHandleDReq), a spread
- * herd needs several waves and 7 s of dead air each was the bulk of a 100 s
- * campaign. Must stay above MESH_TX_JITTER_MAX_MS (a beacon is queued with up
- * to that much jitter, so a shorter idle could end the wave before the only
- * node in a sparse outer ring has transmitted) — asserted in MeshNetwork.c. */
-#define MESH_DISCOVERY_IDLE_MS        3000U
+/* Beacon retry cadence while awaiting a D-Ack. Was one fixed 3500 ms period.
+ *
+ * A fixed period made an UNACKED node the loudest thing on the mesh for the
+ * whole 180 s window: field logs show one hop-3 tag emitting 48 beacons in
+ * 171 s, and the forwarder in front of it relaying 89 packets in the same
+ * campaign. Every one of those transmissions costs the relay up to
+ * MESH_TX_JITTER_MAX_MS of queue jitter plus up to LORA_TX_CARRIER_WAIT_MS of
+ * carrier sense, and carrier sense runs the chip in CAD, not RX - so the relay
+ * was deaf for the majority of the window and dropped both the D-Ack meant for
+ * the node behind it and its own TimeSync. That is congestion collapse, and
+ * the node beaconing hardest is what drives it.
+ *
+ * The cadence now backs off within one beaconing episode:
+ *   interval(n) = min(BASE + n * STEP, MAX),  n = beacons already sent
+ * so the first answers to a DReq are still prompt (that is when the primary is
+ * listening and an ack is most likely) and the tail of an unheard node decays
+ * to MAX instead of hammering. Same 171 s window: ~17 beacons instead of 48.
+ * n resets to 0 every time beaconing (re-)starts - a new wave, a re-anchor
+ * onto a newer dreq, or a re-arm - so each wave gets a fast first beacon; see
+ * MESHNETWORK_vStartBeaconing.
+ *
+ * BASE is deliberately above both MESH_TX_JITTER_MAX_MS and
+ * MESH_DREQ_FWD2_DELAY_MAX_MS (asserted in MeshNetwork.c) so a queued packet
+ * still cannot slip past the NEXT beacon - the invariant the old single
+ * constant carried. MAX is NOT bounded by MESH_DISCOVERY_IDLE_MS and cannot
+ * be: the gap the primary observes is the period plus both ends' jitter and
+ * carrier sense, up to ~6.5 s more, so no affordable idle window covers a 12 s
+ * cadence. Wave end therefore no longer relies on beacon silence alone - see
+ * MESH_DISCOVERY_IDLE_MS below. */
+#define MESH_BEACON_BASE_MS           5000U
+#define MESH_BEACON_STEP_MS           2000U
+#define MESH_BEACON_MAX_MS            12000U
+
+/* Primary D-Ack cadence. 2000 -> 4000: every tick emits one D-Ack carrying up
+ * to MESH_MAX_ACK_IDS_PER_PACKET ids, but the sniffer logs show the packet was
+ * never the constraint - across five campaigns not one D-Ack carried more than
+ * 2 ids (81 with one id, 35 with two), because at 2 s the tick keeps outrunning
+ * the arrival rate. Each of those near-empty acks is then re-flooded ~3x by the
+ * forwarders. Holding twice as long roughly halves the ack packet count and
+ * doubles the ids per packet for the same information.
+ *
+ * The extra hold is free only because MESH_BEACON_BASE_MS (5000) now exceeds
+ * it: a node waiting one more ack period was going to be silent for that
+ * period anyway, so no additional beacon is provoked. Do not raise this above
+ * MESH_BEACON_BASE_MS - asserted in MeshNetwork.c. */
+#define MESH_PRIMARY_ACK_INTERVAL_MS  4000U
+
+/* Beacon silence that ends one DReq wave on the primary. 7000 -> 3000 -> 5000:
+ * the history matters, because both previous values were wrong for the same
+ * reason - beacon silence was the ONLY wave-end signal, so this one constant
+ * had to serve as both "the herd has finished answering" and "nobody is still
+ * mid-cadence", and no value does both.
+ *
+ * 7000 made 7 s of dead air the bulk of a ~100 s campaign. 3000 was below the
+ * old 3500 ms beacon period, so a lone node's own inter-beacon gap
+ * (3500 +/- jitter = 2.0..5.0 s) routinely read as silence and its wave was
+ * declared over while it was still beaconing - visible in the sniffer logs as
+ * 4 of 8 waves starting while beacons for the previous dreq were still
+ * arriving, and at its worst as a campaign that ended after ONE wave and 3 s
+ * with 0 neighbours while a 1-hop secondary was mid-cadence.
+ *
+ * Three changes remove the overload, and only then is a value pickable:
+ *   - a wave cannot end before MESH_DISCOVERY_MIN_WAVE_MS (the DReq has to
+ *     reach the air and a reply has to get back before silence means
+ *     anything);
+ *   - a wave does not end while the primary still has un-acked neighbours
+ *     (MESHNETWORK_bHasUnackedNeighbors) - those are by definition nodes that
+ *     are still beaconing, which is the condition this constant used to have
+ *     to infer from timing and could not;
+ *   - APP_PRIMARY_MIN_WAVES keeps the campaign alive through a barren wave.
+ * So this is now only the tail timer: how long to keep a wave open after the
+ * answers stop and everyone heard has been acked. 5000 covers one relay hop's
+ * jitter at each end with margin.
+ *
+ * Must stay above MESH_TX_JITTER_MAX_MS (a beacon is queued with up to that
+ * much jitter) - asserted in MeshNetwork.c. It deliberately does NOT try to
+ * cover MESH_BEACON_MAX_MS; see there. */
+#define MESH_DISCOVERY_IDLE_MS        5000U
+
+/* Floor on one DReq wave. The wave clock starts when the DReq is ENQUEUED, and
+ * between enqueue and air a packet waits out its own jitter (up to
+ * MESH_TX_JITTER_MAX_MS), anything already queued ahead of it, and the radio
+ * layer's carrier sense (up to LORA_TX_CARRIER_WAIT_MS, 5 s). The reply then
+ * pays the same on the way back. With no floor, MESH_DISCOVERY_IDLE_MS could
+ * elapse before the DReq had even been transmitted - which is exactly the 3 s
+ * / 0 neighbour campaign in the field logs. 8000 covers both ends' jitter plus
+ * a realistic carrier-sense wait; the absolute worst case is not covered by
+ * any affordable floor, which is what the un-acked and min-wave rules above
+ * are for. */
+#define MESH_DISCOVERY_MIN_WAVE_MS    8000U
+
+/* Added to the floor above for every ring of herd depth the primary has ALREADY
+ * proven this campaign (MESHNETWORK_u8GetMaxDiscoveredWave).
+ *
+ * A flat floor is wrong because what it has to cover is not fixed: it is the
+ * round trip out to the frontier and back, and that grows with depth. One
+ * campaign, measured at a sniffer beside the primary:
+ *
+ *     wave  DReq sent   first beacon back          round trip
+ *     1     03:32:45    03:32:47 (1316, ring 1)    2 s
+ *     2     03:32:59    03:33:02 (3E1E, ring 2)    3 s
+ *     3     03:33:11    03:33:15 (241F, ring 3)    4 s
+ *     4     03:33:28    03:33:36 (2D94, ring 4)    8 s
+ *
+ * The 8 s floor expired on wave 4 in the same second 2D94's beacon arrived, so
+ * that one tag missed the union by under a second while every shallower ring
+ * made it. The outermost ring is precisely what the extra waves exist to
+ * reach, so a flat floor fails the tags it is there for. Scaling means the
+ * wave that goes looking for ring N+1 waits in proportion to how far out ring
+ * N already is: with ring 3 on the table before wave 4 the floor becomes
+ * 8000 + 3*2000 = 14000 ms, and that same beacon lands with 6 s to spare.
+ *
+ * 2000 rather than the ~1000 ms per ring the first three waves alone suggest,
+ * because the round trip goes superlinear at the edge (2, 3, 4, then 8 s): the
+ * outer rings are both further out and contending with every relay between
+ * them and the primary.
+ *
+ * A tight herd pays almost nothing - one ring proven leaves the floor at
+ * 10000 ms - which is the whole point of scaling it rather than just raising
+ * the flat value: the campaigns that would need a 14 s floor are exactly the
+ * ones that never see it. APP_PRIMARY_CAMPAIGN_MAX_MS bounds the total either
+ * way. */
+#define MESH_DISCOVERY_WAVE_ALLOWANCE_MS 2000U
+
+/* Cap on the scaled floor, so no ring count can push a single wave past
+ * MESH_DISCOVERY_WAVE_MAX_MS and leave no room for the idle tail underneath
+ * it. Asserted against both in MeshNetwork.c. */
+#define MESH_DISCOVERY_MIN_WAVE_CAP_MS  18000U
+
+/* Ceiling on one DReq wave, so the un-acked extension cannot run a wave
+ * forever: a node whose acks never reach it re-beacons (NEIGHBOR_vAddOrUpdate
+ * clears bAcked on every re-beacon), so "un-acked neighbours exist" can stay
+ * true for as long as that node keeps trying. Holding the wave open IS the
+ * right response for a while - the primary keeps re-acking, and one ack that
+ * lands stops 20+ beacons - but the campaign has a deadline to meet
+ * (APP_PRIMARY_CAMPAIGN_MAX_MS), so bound it per wave and move on to the next
+ * wave, which re-solicits anyway. */
+#define MESH_DISCOVERY_WAVE_MAX_MS    25000U
 /* Dedup window. R5 (meshOptimise) raises this to 64 to cut re-forward storms in
  * large fleets, but +128 B does not fit the current RAM budget, so it stays
  * small. Revisit with a RAM reclaim before scaling the fleet. (uint8
@@ -82,11 +211,17 @@
  *
  * (A parallel 30 s duration cap once sat alongside the count; at the 3.5 s
  * beacon interval 6 beacons take ~21 s, so the count always won and the timer
- * never once decided anything. It was already removed.) */
+ * never once decided anything. It was already removed.)
+ *
+ * What DID need bounding was the RATE, not the count - see the backoff at
+ * MESH_BEACON_BASE_MS above. An unheard node still beacons to the end of the
+ * window, but at a decaying cadence, so it keeps its chance of being found
+ * without deafening the relay in front of it. */
 
-/* TX jitter window — wide enough to de-correlate many nodes answering one DReq.
- * Max stays well under MESH_BEACON_INTERVAL_MS so a jittered beacon never slips
- * past the next interval. */
+/* TX jitter window - wide enough to de-correlate many nodes answering one DReq.
+ * Max stays well under MESH_BEACON_BASE_MS (the SHORTEST beacon interval, and
+ * therefore the binding one) so a jittered beacon never slips past the next
+ * interval. Asserted in MeshNetwork.c. */
 #define MESH_TX_JITTER_MIN_MS         20U
 #define MESH_TX_JITTER_MAX_MS         1500U
 
@@ -99,11 +234,27 @@
  * always separated by at least (1600 - 1500) = 100 ms and typically ~1 s. The
  * ceiling matters: the mesh TX queue is drained in order and each item blocks
  * on its own ready-tick, so a deferred forward holds up whatever is queued
- * behind it. 2600 ms worst case stays under MESH_BEACON_INTERVAL_MS, keeping
- * the existing guarantee that a queued beacon never slips past its next
- * interval. */
+ * behind it. 2600 ms worst case stays under MESH_BEACON_BASE_MS, keeping the
+ * existing guarantee that a queued beacon never slips past its next interval.
+ * Asserted in MeshNetwork.c. */
 #define MESH_DREQ_FWD2_DELAY_MIN_MS   1600U
 #define MESH_DREQ_FWD2_DELAY_MAX_MS   2600U
+
+/* TimeSync is aired TWICE per node - once by the primary that originates it and
+ * once by every node that relays it - using the same two-copy scheme as a DReq:
+ * the ordinary jitter for copy 1 and the non-overlapping window above for
+ * copy 2. Same reasoning, and a stronger case for it: TimeSync is the one
+ * packet that ends a secondary's campaign, sets its clock and tells it a
+ * firmware image is waiting, and it goes out exactly once per campaign, at the
+ * moment the mesh is at its noisiest. Field logs: 5 of 21 device-wakes never
+ * saw it, and in the worst campaign none of the three secondaries did.
+ *
+ * The receive-side dedup is untouched - it is keyed on the UTC value, so a node
+ * decodes one TimeSync per campaign no matter how many copies reach it, and
+ * still relays exactly two. No fabricated timestamp, no second origination
+ * path, no extra state: total airings are bounded at 2 per node per UTC, the
+ * same budget MESH_DREQ_MAX_FORWARDS already grants a DReq. */
+#define MESH_TIMESYNC_AIRINGS         2U
 
 /*
  * Per-packet verbose text logging. During a campaign every node hears every
@@ -183,11 +334,14 @@ typedef struct {
                               * so "did unit X pick up the latest OTA" is
                               * answerable from the fr9 flash log without
                               * touching each device with `tag <ID> fwver`. */
-    /* Which node's DReq produced i16Rssi above. i16Rssi is the BEST reading of
-     * the wave, and the DReq that gave it may have come from the primary
-     * directly or from any relaying peer, so the reading alone does not say
-     * where this node's good path actually is. Carried as the 16-bit device id
-     * of the immediate sender of that DReq (see MESH_DREQ_LEN_SRC).
+    /* Which node's DReq produced i16Rssi above. i16Rssi is the reading of the
+     * ONE DReq that triggered this beaconing episode - not the strongest heard
+     * during it (that used to drift as later, unrelated receptions came in;
+     * it is now latched at the trigger and frozen — see bBestDreqLatched in
+     * MeshNetwork.c) - and the DReq that gave it may have come from the
+     * primary directly or from any relaying peer, so the reading alone does
+     * not say where this node's good path actually is. Carried as the 16-bit
+     * device id of the immediate sender of that DReq (see MESH_DREQ_LEN_SRC).
      *
      * bValid is a separate flag rather than "u16 != 0" because 0x0000 is a
      * reachable device id, and because a beacon relayed by an older forwarder
@@ -349,7 +503,33 @@ bool MESHNETWORK_bIsBeaconing(void);     /* true while this node is beaconing */
  * exactly, so out-of-range units cost no extra power. Cleared by
  * MESHNETWORK_vResetNodeRole() at campaign end. */
 bool MESHNETWORK_bCampaignHeard(void);
-void MESHNETWORK_vFlushTxQueue(void);    /* drop any pending TX (call on campaign wake) */
+/* Drop pending TX. Called on campaign wake and again at campaign end.
+ * bKeepTimeSync re-queues a pending TimeSync instead of dropping it: pass true
+ * at campaign end (a secondary's campaign ENDS on the TimeSync it must still
+ * relay), false on the wake flush (a relay that survived deep sleep would air
+ * a 15-minute-old timestamp). See the implementation. */
+void MESHNETWORK_vFlushTxQueue(bool bKeepTimeSync);
+
+/* Primary: does the neighbour table hold anyone this campaign has not put in a
+ * D-Ack yet? True means at least one node is still beaconing at us and has no
+ * reason to stop, so the wave it answered must not be declared over - that is
+ * the direct signal MESH_DISCOVERY_IDLE_MS used to have to guess at from
+ * timing. NEIGHBOR_vAddOrUpdate clears bAcked on every re-beacon, so this also
+ * goes true again for a node whose acks are not reaching it. */
+bool MESHNETWORK_bHasUnackedNeighbors(void);
+
+/* Primary: the highest wave number that has discovered anything this campaign,
+ * i.e. how many rings deep the herd has PROVEN to be; 0 before anything
+ * answers. The wave loop scales its listen floor by this - see
+ * MESH_DISCOVERY_WAVE_ALLOWANCE_MS.
+ *
+ * Reads u8DreqWaveDiscovered, which the table keeps at the FIRST wave that
+ * found each node, so this is a true ring count. Deliberately NOT the hop
+ * count: a beacon's hop field is the depth of whichever relayed COPY arrived
+ * last, which routinely overshoots the ring - a 1-ring node's beacon reaches
+ * the primary at hop 2, a 4-ring node's at hop 6-8 - and scaling a timer by an
+ * inflated number would make every tight herd pay for a spread one. */
+uint8_t MESHNETWORK_u8GetMaxDiscoveredWave(void);
 
 /* TX-worker hooks for the runtime radio range test (RadioTestMode.c), whose
  * beaconing secondary has no task of its own and runs on the TX worker.

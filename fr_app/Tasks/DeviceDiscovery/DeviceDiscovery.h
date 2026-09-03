@@ -37,6 +37,45 @@
  * wave turns up no new beacons. */
 #define APP_PRIMARY_MAX_WAVES              8U
 
+/* Floor on DReq waves per campaign. A barren wave used to end the campaign
+ * outright, which reads as "nobody is out there" but in the field also meant
+ * "nobody answered in time": one campaign ended after ONE wave and 3 seconds
+ * with 0 neighbours, while a 1-hop secondary was mid-cadence and two others
+ * were relaying that very DReq (the primary's own stats line for it says
+ * "DReq heard=3 beacons heard=0"). A DReq is one packet on a channel this
+ * change set exists to decongest; three attempts at it cost little and remove
+ * a whole-campaign failure mode.
+ *
+ * Scope this claim honestly: waves 2+ are relayed only by nodes that have been
+ * ACKED (see MESHNETWORK_vHandleDReq), and a wave that heard no beacon
+ * produced no acks and therefore no forwarders - so the forced waves are a
+ * retry of the DIRECT earshot ring, not a way to reach the deep herd on a
+ * silent wave 1. That is exactly what the 3 s campaign lost. */
+#define APP_PRIMARY_MIN_WAVES              3U
+
+/* Deadline for the primary's wave loop, measured from campaign start.
+ *
+ * The wave loop had no time bound at all - only the wave COUNT was capped, and
+ * a wave ends on beacon silence, so a herd that keeps beaconing could hold the
+ * primary past the point where its TimeSync is any use. It has to be a
+ * deadline on the wave loop specifically, not on the whole wake, because
+ * TimeSync is not sent at campaign end: the fr9 logger session runs first
+ * (connect, AT+LOG with up to 3 attempts, AT+TSREQ, AT+SETREQ) and that is
+ * ~55 s of blocking AT timeouts in the worst case.
+ *
+ * Both roles start their campaign clock after the same APP_WAKEUP_BUFFER_MS,
+ * so the secondaries' windows close at campaign_start + APP_DISCOVERY_WINDOW_
+ * TIMEOUT_MS (180 s). 110 s leaves ~15 s of margin on top of that worst-case
+ * fr9 budget, so the TimeSync is queued while the herd is still listening even
+ * on a bad wake. */
+#define APP_PRIMARY_CAMPAIGN_MAX_MS        (110 * 1000)
+
+_Static_assert(APP_PRIMARY_MIN_WAVES <= APP_PRIMARY_MAX_WAVES,
+               "APP_PRIMARY_MIN_WAVES exceeds APP_PRIMARY_MAX_WAVES");
+_Static_assert(APP_PRIMARY_CAMPAIGN_MAX_MS < APP_DISCOVERY_WINDOW_TIMEOUT_MS,
+               "The primary must finish its waves before the secondaries' "
+               "campaign window closes, with room for the fr9 session.");
+
 /* Secondary, flash backend only: once armed (see MESHNETWORK_vHandleTimeSync
  * auto-arm off the staged-fw version carried in TimeSync), how long to keep
  * listening for the OtaPrep the primary sends right after TimeSync in the
@@ -50,7 +89,16 @@
 /* GPS pre-trigger lead time: how many seconds before each scheduled wake the
  * wake-schedule task asks the GPS module for a fresh fix. The dispatcher runs
  * asynchronously; the AppTask never blocks waiting for it. */
-#define DEVICE_DISCOVERY_GPS_PRETRIGGER_S   180U          /* 3 minutes              */
+/* 180 -> 150 s. A beacon may only carry a fix younger than
+ * MESH_GPS_FIX_MAX_AGE_S (300 s), and the fix is taken by this pre-trigger, so
+ * a 180 s lead left beacons GPS-valid only until about wake+120 s - the field
+ * logs catch a tag flipping to gps=0 at wake+147 s mid-campaign, and its row
+ * in the primary's union then carries Lat:0 Lon:0. Since this change set
+ * deliberately lets a campaign run longer to find the deep tags, the fix has
+ * to stay valid longer, and making it FRESHER at wake is the way to do that
+ * without widening the staleness gate. 150 s still clears the 120 s TTFF
+ * timeout the GPS session runs with (observed TTFF here: 8-34 s). */
+#define DEVICE_DISCOVERY_GPS_PRETRIGGER_S   150U          /* 2.5 minutes            */
 
 /* Basic-mode primary passive-listen cadence + duration. Independent of
  * WakeupInterval: the primary opens a 60 s RX window every 15 min and
