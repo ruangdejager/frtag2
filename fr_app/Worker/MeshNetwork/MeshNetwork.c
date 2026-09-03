@@ -427,6 +427,8 @@ static volatile bool bCampaignHeard = false;
 /* ---- Forward declarations ---- */
 static void MESHNETWORK_vTxTask(void *pvParameters);
 static bool MESHNETWORK_bSendPacket(const uint8_t *pBuf, size_t u32Len);
+static bool MESHNETWORK_bSendPacketDelayed(const uint8_t *pBuf, size_t u32Len,
+                                           uint32_t u32DelayMs);
 static void MESHNETWORK_vStartBeaconing(uint32_t u32DreqId, uint8_t u8HopCount);
 static NodeRole_e MESHNETWORK_eGetRole(void);
 static bool MESHNETWORK_bStopBeaconingLocked(uint32_t u32DreqId);
@@ -1016,7 +1018,19 @@ static void MESHNETWORK_vBuildAndQueueAck(void)
                 FORWARD_vAdd(tAck.u32AckMsgId);
                 bQueued = MESHNETWORK_bSendPacket(u8Buf, u32Len);
                 if (bQueued)
+                {
                     EVTLOG(LOG_TX_ACK, 1);
+                    /* Second airing - see MESH_DACK_AIRINGS. Same non-
+                     * overlapping window as a DReq's copy 2, so the pair cannot
+                     * share one congestion window. Only copy 1 gates bAcked
+                     * below (bQueued), so a refused copy 2 costs redundancy, not
+                     * correctness. Both copies share u32AckMsgId, so this never
+                     * amplifies: it just gives the first, un-relayed ack of a
+                     * campaign a second chance to reach the first ring. */
+                    if (MESHNETWORK_bSendPacketDelayed(u8Buf, u32Len,
+                                          MESHNETWORK_u32DreqFwdDelayMs(2U)))
+                        EVTLOG(LOG_TX_ACK, 3);   /* 3 = second airing */
+                }
             }
 
             if (bQueued && osMutexAcquire(xNeighborTableMutex, 100) == osOK)

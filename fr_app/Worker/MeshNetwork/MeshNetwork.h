@@ -256,6 +256,27 @@
  * same budget MESH_DREQ_MAX_FORWARDS already grants a DReq. */
 #define MESH_TIMESYNC_AIRINGS         2U
 
+/* A primary D-Ack is aired TWICE, the same two-copy scheme as a DReq/TimeSync
+ * origination: the ordinary jitter places copy 1, MESH_DREQ_FWD2_DELAY_[MIN,MAX]
+ * places the non-overlapping copy 2, so a collision that eats one copy is
+ * unlikely to eat the other.
+ *
+ * The case is strongest for the FIRST ack of a campaign, which is uniquely
+ * unprotected. A D-Ack is relayed only by nodes already in NODE_ROLE_FORWARDER,
+ * and a node becomes a forwarder only once it has itself been acked - so at the
+ * instant the first ack goes out no forwarders exist yet, and it gets a single,
+ * unrelayed airing. That lone packet is the one that silences the whole first
+ * ring; a field log showed it lost, and the first ring re-beaconed until the
+ * second ack (which by then had relays behind it) finally landed.
+ *
+ * No amplification: both copies carry the same u32AckMsgId, which the receive-
+ * side dedup (MESHNETWORK_vHandleDAck) and the primary's own FORWARD_vAdd key
+ * on, so every node applies one ack and relays a given id once regardless of how
+ * many copies reach it. The extra airing only ever reaches the primary's direct
+ * earshot - exactly the ring that has no relay support - and costs one extra
+ * primary transmission (~30 ms) per ack. Total airings stay bounded at 2. */
+#define MESH_DACK_AIRINGS             2U
+
 /*
  * Per-packet verbose text logging. During a campaign every node hears every
  * neighbour's (re)transmissions, so the per-packet plumbing lines — the
