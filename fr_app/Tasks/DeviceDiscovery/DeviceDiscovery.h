@@ -26,16 +26,30 @@
 #define APP_SECONDARY_SILENCE_MS           (10 * 1000)   /* radio-silence end window    */
 #define APP_SECONDARY_POLL_MS              250U          /* secondary wait poll cadence */
 
-/* Primary issues at most this many DReq waves per campaign (R8). */
-/* Ceiling on DReq waves per campaign. Each wave advances the discovery
- * frontier by one ring (only acked nodes relay, so wave N reaches depth N),
- * which makes this the maximum discoverable herd depth. Raised 5 -> 8 after
- * field data showed the count falling off exactly as the needed wave depth
- * rose (wave 2 -> 28 tags found, wave 3 -> 27, wave 4 -> 24): a spread herd
- * was running out of budget before its outermost tags were asked. Costs
- * nothing on a tight herd — the primary already ends a campaign as soon as a
- * wave turns up no new beacons. */
-#define APP_PRIMARY_MAX_WAVES              8U
+/* Ceiling on DReq waves per campaign. Each wave advances the discovery frontier
+ * by one ring (only acked nodes relay, so wave N reaches depth N), which makes
+ * this the maximum discoverable herd depth.
+ *
+ * 8 -> 6, to match what the campaign budget can actually run. The wave-listen
+ * floor scales with proven depth (MESH_DISCOVERY_WAVE_ALLOWANCE_MS: 8 s at
+ * ring 1 climbing to the 18 s cap by ring 5), because the round trip out to the
+ * frontier and back is superlinear (a measured campaign: 2, 3, 4, 8 s to rings
+ * 1-4). Summing the worst-case per-wave cost (scaled floor + one idle tail):
+ *
+ *     wave   1    2    3    4    5    6      -> cumulative
+ *     ms   13k  15k  17k  19k  21k  23k        108k
+ *
+ * The campaign deadline (APP_PRIMARY_CAMPAIGN_MAX_MS, 110 s) is reached DURING
+ * wave 6-7, so waves 7-8 were never reachable for the deep herd they existed
+ * for - a 7-ring herd simply needs more than 110 s to map, and 110 s cannot
+ * grow without eating the fr9/TimeSync margin (see APP_PRIMARY_CAMPAIGN_MAX_MS).
+ * 6 is the honest ceiling; the MESH_WAVE_BUDGET_MS assert below now makes any
+ * future disagreement between the wave count and the budget a build error
+ * instead of a wave that silently never runs. Costs nothing on a tight herd -
+ * the primary still ends a campaign as soon as a wave turns up no new beacons
+ * (APP_PRIMARY_MIN_WAVES), and the field herd (4 rings) finishes by wave 4 in
+ * ~64 s with ample margin. */
+#define APP_PRIMARY_MAX_WAVES              6U
 
 /* Floor on DReq waves per campaign. A barren wave used to end the campaign
  * outright, which reads as "nobody is out there" but in the field also meant
@@ -75,6 +89,41 @@ _Static_assert(APP_PRIMARY_MIN_WAVES <= APP_PRIMARY_MAX_WAVES,
 _Static_assert(APP_PRIMARY_CAMPAIGN_MAX_MS < APP_DISCOVERY_WINDOW_TIMEOUT_MS,
                "The primary must finish its waves before the secondaries' "
                "campaign window closes, with room for the fr9 session.");
+
+/* Worst-case time to run every wave: each of APP_PRIMARY_MAX_WAVES waves can run
+ * to its depth-scaled listen floor plus one idle tail before it ends, so the
+ * whole loop costs SUM_{k=1..N}(floor(k) + IDLE), where
+ * floor(k) = min(MIN_WAVE + (k-1)*ALLOWANCE, MIN_WAVE_CAP). The floor ramps
+ * linearly until it saturates at the cap, so the sum splits into the ramp and a
+ * flat tail; RAMP_STEPS is how many ALLOWANCE steps fit before the cap, so the
+ * floor first reaches the cap at wave (RAMP_STEPS + 1).
+ *
+ * This exists so the wave count and the campaign budget cannot silently
+ * disagree: raise APP_PRIMARY_MAX_WAVES past what 110 s can run (or make a wave
+ * more expensive) and this becomes a build error, not a wave that never fires.
+ * See the table at APP_PRIMARY_MAX_WAVES. */
+#define MESH_WAVE_FLOOR_RAMP_STEPS \
+    ((MESH_DISCOVERY_MIN_WAVE_CAP_MS - MESH_DISCOVERY_MIN_WAVE_MS) / \
+     MESH_DISCOVERY_WAVE_ALLOWANCE_MS)
+
+#define MESH_WAVE_BUDGET_MS ( \
+    ( (APP_PRIMARY_MAX_WAVES <= (MESH_WAVE_FLOOR_RAMP_STEPS + 1U)) \
+      ? ( APP_PRIMARY_MAX_WAVES * MESH_DISCOVERY_MIN_WAVE_MS \
+          + MESH_DISCOVERY_WAVE_ALLOWANCE_MS \
+            * (APP_PRIMARY_MAX_WAVES * (APP_PRIMARY_MAX_WAVES - 1U) / 2U) ) \
+      : ( (MESH_WAVE_FLOOR_RAMP_STEPS + 1U) * MESH_DISCOVERY_MIN_WAVE_MS \
+          + MESH_DISCOVERY_WAVE_ALLOWANCE_MS \
+            * (MESH_WAVE_FLOOR_RAMP_STEPS * (MESH_WAVE_FLOOR_RAMP_STEPS + 1U) / 2U) \
+          + (APP_PRIMARY_MAX_WAVES - (MESH_WAVE_FLOOR_RAMP_STEPS + 1U)) \
+            * MESH_DISCOVERY_MIN_WAVE_CAP_MS ) ) \
+    + APP_PRIMARY_MAX_WAVES * MESH_DISCOVERY_IDLE_MS )
+
+_Static_assert(MESH_WAVE_BUDGET_MS <= APP_PRIMARY_CAMPAIGN_MAX_MS,
+               "APP_PRIMARY_MAX_WAVES cannot all run inside "
+               "APP_PRIMARY_CAMPAIGN_MAX_MS at the depth-scaled wave floor + "
+               "idle tail. Lower APP_PRIMARY_MAX_WAVES or the per-wave cost, or "
+               "(last resort, costs fr9/TimeSync margin) raise the campaign "
+               "budget.");
 
 /* Secondary, flash backend only: once armed (see MESHNETWORK_vHandleTimeSync
  * auto-arm off the staged-fw version carried in TimeSync), how long to keep
