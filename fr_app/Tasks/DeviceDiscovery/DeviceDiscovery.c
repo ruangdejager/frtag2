@@ -266,6 +266,10 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             bool     bDiscoveryFinished = false;
             uint8_t  u8WaveCount        = 0;
             bool     bDeadlineHit       = false;
+            /* Two barren waves in a row end the campaign; one does not — a lone
+             * quiet wave at the frontier is as often a late/collided deep answer
+             * as an empty ring. See the wave-end branch below. */
+            bool     bPrevWaveBarren    = false;
             uint32_t u32CampaignStart   = osKernelGetTickCount();
             DBG_LOG("DeviceDiscovery: Primary starting discovery campaign\r\n");
 
@@ -399,16 +403,25 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                     bDiscoveryFinished = true;
                     MESHNETWORK_vStopPrimaryAck();
                 }
-                /* A barren wave no longer ends the campaign on its own: the
-                 * frontier advances one ring per wave, and "no beacon this
-                 * wave" has meant "nobody answered in time" as often as
-                 * "nobody is there". See APP_PRIMARY_MIN_WAVES. */
-                else if ((!bBeaconSeenThisWave && u8WaveCount >= APP_PRIMARY_MIN_WAVES) ||
+                /* A single barren wave no longer ends the campaign: the frontier
+                 * advances one ring per wave, deep answers arrive late (a ring-5
+                 * beacon measured 21 s behind its DReq, past that wave's floor),
+                 * and one wave's lone beacon can be lost to a collision — so "no
+                 * beacon this wave" has meant "nobody answered in time" as often
+                 * as "nobody is there". End only on TWO barren waves in a row
+                 * (past APP_PRIMARY_MIN_WAVES), or the wave cap. A tight herd
+                 * still ends promptly: each productive wave resets the run, and
+                 * once the herd is truly mapped two silent waves follow. */
+                else if ((!bBeaconSeenThisWave && bPrevWaveBarren &&
+                          u8WaveCount >= APP_PRIMARY_MIN_WAVES) ||
                          u8WaveCount >= APP_PRIMARY_MAX_WAVES)
                 {
-                    if (bBeaconSeenThisWave)
+                    if (u8WaveCount >= APP_PRIMARY_MAX_WAVES)
                         DBG_LOG("DeviceDiscovery: Primary wave cap (%u) reached\r\n",
                             APP_PRIMARY_MAX_WAVES);
+                    else
+                        DBG_LOG("DeviceDiscovery: Primary ending - two barren waves after %u waves\r\n",
+                            (unsigned)u8WaveCount);
                     bDiscoveryFinished = true;
                     MESHNETWORK_vStopPrimaryAck();
                 }
@@ -416,6 +429,8 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 {
                     DBG_LOG("DeviceDiscovery: Primary extending discovery with new DReq wave\r\n");
                 }
+
+                bPrevWaveBarren = !bBeaconSeenThisWave;
             }
         }
         else
@@ -442,10 +457,10 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
              *   - TimeSync received (clean end),
              *   - 10 s of mesh radio silence while NOT beaconing (UNKNOWN that
              *     heard nothing, or FORWARDER once the mesh goes quiet),
-             *   - the 180 s hard cap.
+             *   - the 205 s hard cap.
              * While beaconing the silence rule is suppressed, and since the
              * beacon count cap was removed a node that is never acked keeps
-             * beaconing to the end of the window — so for that node this 180 s
+             * beaconing to the end of the window — so for that node this 205 s
              * cap is the terminator, and MESHNETWORK_vStopBeaconingSelf() below
              * is what stops it. u32SilenceRef starts at the campaign start (fair
              * first window) and advances to the latest discovery packet from ANY
@@ -511,7 +526,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                  * tags: u32SilenceRef starts at campaign start, so a node
                  * awaiting its wave was already 10 s into its own death clock
                  * at wake-up. Such a node now holds until TimeSync or the
-                 * 180 s hard cap above.
+                 * 205 s hard cap above.
                  *
                  * A node that truly hears nothing keeps the old behaviour
                  * unchanged, so out-of-range units cost no extra power — which

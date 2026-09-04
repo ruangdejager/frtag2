@@ -953,7 +953,7 @@ static void MESHNETWORK_vBuildAndQueueBeacon(void)
 
     /* No beacon count or duration cap here any more: a secondary keeps beaconing
      * on xBeaconTimer until a D-Ack stops it (MESHNETWORK_vStopBeaconingByOrigin)
-     * or the campaign's 180 s window closes and DeviceDiscovery calls
+     * or the campaign's 205 s window closes and DeviceDiscovery calls
      * MESHNETWORK_vStopBeaconingSelf. See MeshNetwork.h above
      * MESH_TX_JITTER_MIN_MS for why the old 6-beacon cap went.
      *

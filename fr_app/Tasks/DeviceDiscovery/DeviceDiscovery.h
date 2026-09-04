@@ -18,11 +18,11 @@
 
 /* ---- Discovery timing ---- */
 #define APP_WAKEUP_BUFFER_MS                (5  * 1000)   /* buffer after sync wake-up   */
-#define APP_DISCOVERY_WINDOW_TIMEOUT_MS     (180 * 1000)  /* hard cap on a campaign      */
+#define APP_DISCOVERY_WINDOW_TIMEOUT_MS     (205 * 1000)  /* hard cap on a campaign      */
 
 /* Secondary campaign-end (R3): once the mesh has been silent (no discovery
  * packet from any primary) for this long AND the node is not beaconing, end the
- * campaign instead of waiting out the 180 s hard cap. Polled at this cadence. */
+ * campaign instead of waiting out the 205 s hard cap. Polled at this cadence. */
 #define APP_SECONDARY_SILENCE_MS           (10 * 1000)   /* radio-silence end window    */
 #define APP_SECONDARY_POLL_MS              250U          /* secondary wait poll cadence */
 
@@ -30,25 +30,28 @@
  * by one ring (only acked nodes relay, so wave N reaches depth N), which makes
  * this the maximum discoverable herd depth.
  *
- * 8 -> 6, to match what the campaign budget can actually run. The wave-listen
+ * Stays at 6, now with a budget that can actually run all six. The wave-listen
  * floor scales with proven depth (MESH_DISCOVERY_WAVE_ALLOWANCE_MS: 8 s at
- * ring 1 climbing to the 18 s cap by ring 5), because the round trip out to the
- * frontier and back is superlinear (a measured campaign: 2, 3, 4, 8 s to rings
- * 1-4). Summing the worst-case per-wave cost (scaled floor + one idle tail):
+ * ring 1 climbing 4 s/ring to the 24 s cap by ring 4), because the round trip
+ * out to the frontier and back is superlinear (measured: 2, 3, 4, 8, 21 s to
+ * rings 1-5). Summing the worst-case per-wave cost (scaled floor + one idle
+ * tail):
  *
  *     wave   1    2    3    4    5    6      -> cumulative
- *     ms   13k  15k  17k  19k  21k  23k        108k
+ *     ms   13k  17k  21k  25k  29k  29k        134k
  *
- * The campaign deadline (APP_PRIMARY_CAMPAIGN_MAX_MS, 110 s) is reached DURING
- * wave 6-7, so waves 7-8 were never reachable for the deep herd they existed
- * for - a 7-ring herd simply needs more than 110 s to map, and 110 s cannot
- * grow without eating the fr9/TimeSync margin (see APP_PRIMARY_CAMPAIGN_MAX_MS).
- * 6 is the honest ceiling; the MESH_WAVE_BUDGET_MS assert below now makes any
- * future disagreement between the wave count and the budget a build error
- * instead of a wave that silently never runs. Costs nothing on a tight herd -
- * the primary still ends a campaign as soon as a wave turns up no new beacons
- * (APP_PRIMARY_MIN_WAVES), and the field herd (4 rings) finishes by wave 4 in
- * ~64 s with ample margin. */
+ * All six now fit under APP_PRIMARY_CAMPAIGN_MAX_MS (135 s) with ~1 s to spare;
+ * that budget - and the secondary window it sits under - was raised so wave 6
+ * is reachable for the deep herd instead of the campaign ending mid wave-5 the
+ * way 110 s + an 18 s floor cap did (241F, ring 5, missed its wave by 5 s and
+ * the barren wave ended the campaign). A 7-ring herd still needs more than
+ * this; 6 is the ceiling the current budget honestly funds. The
+ * MESH_WAVE_BUDGET_MS assert below makes any future disagreement between the
+ * wave count and the budget a build error instead of a wave that silently never
+ * runs. Costs little on a tight herd - the primary still ends a campaign once
+ * two waves in a row turn up no new beacon (APP_PRIMARY_MIN_WAVES plus the
+ * two-consecutive-barren rule in DeviceDiscovery.c), and the field herd
+ * (4 rings) finishes by wave 4 in ~76 s with margin. */
 #define APP_PRIMARY_MAX_WAVES              6U
 
 /* Floor on DReq waves per campaign. A barren wave used to end the campaign
@@ -64,7 +67,13 @@
  * ACKED (see MESHNETWORK_vHandleDReq), and a wave that heard no beacon
  * produced no acks and therefore no forwarders - so the forced waves are a
  * retry of the DIRECT earshot ring, not a way to reach the deep herd on a
- * silent wave 1. That is exactly what the 3 s campaign lost. */
+ * silent wave 1. That is exactly what the 3 s campaign lost.
+ *
+ * MIN_WAVES is only the floor below which no barren wave may end the campaign;
+ * above it, ending now also requires TWO barren waves in a row (see
+ * DeviceDiscovery.c). A single quiet wave at the frontier - a deep node whose
+ * one beacon that wave was lost to a collision - no longer ends a campaign that
+ * has been steadily pushing outward. */
 #define APP_PRIMARY_MIN_WAVES              3U
 
 /* Deadline for the primary's wave loop, measured from campaign start.
@@ -79,10 +88,18 @@
  *
  * Both roles start their campaign clock after the same APP_WAKEUP_BUFFER_MS,
  * so the secondaries' windows close at campaign_start + APP_DISCOVERY_WINDOW_
- * TIMEOUT_MS (180 s). 110 s leaves ~15 s of margin on top of that worst-case
+ * TIMEOUT_MS (205 s). 135 s leaves ~15 s of margin on top of that worst-case
  * fr9 budget, so the TimeSync is queued while the herd is still listening even
- * on a bad wake. */
-#define APP_PRIMARY_CAMPAIGN_MAX_MS        (110 * 1000)
+ * on a bad wake.
+ *
+ * 110 -> 135 s (window 180 -> 205 s in lockstep, so the fr9/TimeSync margin is
+ * unchanged): 135 s is what six waves at the deep-scaled floor now cost
+ * (MESH_WAVE_BUDGET_MS = 134 s). The pair moved together on purpose - raising
+ * the wave budget without moving the window would push TimeSync past the point
+ * secondaries stop listening. The cost is real: an in-footprint node the
+ * primary never acks stays awake up to 25 s longer per campaign (an
+ * out-of-range node still bails at APP_SECONDARY_SILENCE_MS, unaffected). */
+#define APP_PRIMARY_CAMPAIGN_MAX_MS        (135 * 1000)
 
 _Static_assert(APP_PRIMARY_MIN_WAVES <= APP_PRIMARY_MAX_WAVES,
                "APP_PRIMARY_MIN_WAVES exceeds APP_PRIMARY_MAX_WAVES");
@@ -99,7 +116,7 @@ _Static_assert(APP_PRIMARY_CAMPAIGN_MAX_MS < APP_DISCOVERY_WINDOW_TIMEOUT_MS,
  * floor first reaches the cap at wave (RAMP_STEPS + 1).
  *
  * This exists so the wave count and the campaign budget cannot silently
- * disagree: raise APP_PRIMARY_MAX_WAVES past what 110 s can run (or make a wave
+ * disagree: raise APP_PRIMARY_MAX_WAVES past what 135 s can run (or make a wave
  * more expensive) and this becomes a build error, not a wave that never fires.
  * See the table at APP_PRIMARY_MAX_WAVES. */
 #define MESH_WAVE_FLOOR_RAMP_STEPS \

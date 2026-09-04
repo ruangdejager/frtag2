@@ -18,7 +18,7 @@
 /* Beacon retry cadence while awaiting a D-Ack. Was one fixed 3500 ms period.
  *
  * A fixed period made an UNACKED node the loudest thing on the mesh for the
- * whole 180 s window: field logs show one hop-3 tag emitting 48 beacons in
+ * whole 205 s window: field logs show one hop-3 tag emitting 48 beacons in
  * 171 s, and the forwarder in front of it relaying 89 packets in the same
  * campaign. Every one of those transmissions costs the relay up to
  * MESH_TX_JITTER_MAX_MS of queue jitter plus up to LORA_TX_CARRIER_WAIT_MS of
@@ -110,39 +110,47 @@
  * proven this campaign (MESHNETWORK_u8GetMaxDiscoveredWave).
  *
  * A flat floor is wrong because what it has to cover is not fixed: it is the
- * round trip out to the frontier and back, and that grows with depth. One
- * campaign, measured at a sniffer beside the primary:
+ * round trip out to the frontier and back, and that grows - superlinearly -
+ * with depth. Measured at a sniffer beside the primary, across two campaigns:
  *
- *     wave  DReq sent   first beacon back          round trip
- *     1     03:32:45    03:32:47 (1316, ring 1)    2 s
- *     2     03:32:59    03:33:02 (3E1E, ring 2)    3 s
- *     3     03:33:11    03:33:15 (241F, ring 3)    4 s
- *     4     03:33:28    03:33:36 (2D94, ring 4)    8 s
+ *     ring   round trip (DReq sent -> first beacon back)
+ *     1      2 s
+ *     2      3 s
+ *     3      4 s
+ *     4      8 s     (2D94, hop 8)
+ *     5      21 s    (241F, hop 9)
  *
- * The 8 s floor expired on wave 4 in the same second 2D94's beacon arrived, so
- * that one tag missed the union by under a second while every shallower ring
- * made it. The outermost ring is precisely what the extra waves exist to
- * reach, so a flat floor fails the tags it is there for. Scaling means the
- * wave that goes looking for ring N+1 waits in proportion to how far out ring
- * N already is: with ring 3 on the table before wave 4 the floor becomes
- * 8000 + 3*2000 = 14000 ms, and that same beacon lands with 6 s to spare.
+ * Ring 5 is the datapoint that set these numbers. 241F's wave-5 beacon arrived
+ * 21 s after the DReq - 5 s after a 16 s floor (8000 + 4*2000) had already
+ * expired, the wave had been declared barren, and the campaign had moved on to
+ * TimeSync. That tag, and the ring behind it, is exactly what the deep waves
+ * exist to reach, so the floor has to cover the deep round trip or the wave
+ * that finds the frontier ends while the frontier is still answering.
  *
- * 2000 rather than the ~1000 ms per ring the first three waves alone suggest,
- * because the round trip goes superlinear at the edge (2, 3, 4, then 8 s): the
- * outer rings are both further out and contending with every relay between
- * them and the primary.
+ * Scaling means the wave looking for ring N+1 waits in proportion to how far
+ * out ring N already is: with ring 4 on the table before wave 5 the floor is
+ * 8000 + 4*4000 = 24000 ms (the cap below), and 241F's 21 s beacon lands with
+ * 3 s to spare.
  *
- * A tight herd pays almost nothing - one ring proven leaves the floor at
- * 10000 ms - which is the whole point of scaling it rather than just raising
- * the flat value: the campaigns that would need a 14 s floor are exactly the
- * ones that never see it. APP_PRIMARY_CAMPAIGN_MAX_MS bounds the total either
- * way. */
-#define MESH_DISCOVERY_WAVE_ALLOWANCE_MS 2000U
+ * 4000 (was 2000): the 2000 step covered the 2/3/4/8 s inner rings but left the
+ * wave-5 floor at 16 s against a 21 s round trip. 4000 puts the floor ahead of
+ * the measured edge and saturates at the cap by ring 4.
+ *
+ * A tight herd still pays little - one ring proven leaves the floor at
+ * 12000 ms - which is the whole point of scaling it rather than raising the
+ * flat value: the campaigns that would need a 24 s floor are exactly the ones
+ * that never see it. APP_PRIMARY_CAMPAIGN_MAX_MS bounds the total either way. */
+#define MESH_DISCOVERY_WAVE_ALLOWANCE_MS 4000U
 
 /* Cap on the scaled floor, so no ring count can push a single wave past
  * MESH_DISCOVERY_WAVE_MAX_MS and leave no room for the idle tail underneath
- * it. Asserted against both in MeshNetwork.c. */
-#define MESH_DISCOVERY_MIN_WAVE_CAP_MS  18000U
+ * it. Asserted against both in MeshNetwork.c.
+ *
+ * 18000 -> 24000: the ring-5 round trip measured at 21 s (see the ALLOWANCE
+ * comment above), so an 18 s cap left the deepest wave 3 s short of the very
+ * tag it existed to hear. 24000 clears it; the ceiling and campaign budget
+ * both moved to keep the idle tail fitting underneath. */
+#define MESH_DISCOVERY_MIN_WAVE_CAP_MS  24000U
 
 /* Ceiling on one DReq wave, so the un-acked extension cannot run a wave
  * forever: a node whose acks never reach it re-beacons (NEIGHBOR_vAddOrUpdate
@@ -151,8 +159,9 @@
  * right response for a while - the primary keeps re-acking, and one ack that
  * lands stops 20+ beacons - but the campaign has a deadline to meet
  * (APP_PRIMARY_CAMPAIGN_MAX_MS), so bound it per wave and move on to the next
- * wave, which re-solicits anyway. */
-#define MESH_DISCOVERY_WAVE_MAX_MS    25000U
+ * wave, which re-solicits anyway. 25000 -> 30000 to stay above the raised
+ * scaled-floor cap (24000) plus the idle tail (5000); asserted in MeshNetwork.c. */
+#define MESH_DISCOVERY_WAVE_MAX_MS    30000U
 /* Dedup window. R5 (meshOptimise) raises this to 64 to cut re-forward storms in
  * large fleets, but +128 B does not fit the current RAM budget, so it stays
  * small. Revisit with a RAM reclaim before scaling the fleet. (uint8
@@ -199,11 +208,11 @@
 /* A beaconing node used to stop (become forwarder) after MESH_MAX_BEACONS_PER_
  * CAMPAIGN (6) beacons, on the theory that it bounded airtime when a D-Ack was
  * silently lost. What it actually bounded was the node's chance of being found:
- * six beacons is ~17.5 s of a 180 s window, after which a node the primary was
+ * six beacons is ~17.5 s of a 205 s window, after which a node the primary was
  * still hunting for went mute and was not counted. A per-wave re-arm was bolted
  * on to claw some of that back, which only made the giving-up harder to follow.
  *
- * A secondary now beacons until it is ACKED, or until the campaign's 180 s hard
+ * A secondary now beacons until it is ACKED, or until the campaign's 205 s hard
  * cap (APP_DISCOVERY_WINDOW_TIMEOUT_MS in DeviceDiscovery.h) ends the window —
  * that cap was always the real bound and is now the only one. The ack path
  * (MESHNETWORK_vStopBeaconingByOrigin) is unchanged, so a node that IS heard
