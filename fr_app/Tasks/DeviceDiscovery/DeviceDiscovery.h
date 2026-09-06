@@ -32,15 +32,15 @@
  *
  * Stays at 6, now with a budget that can actually run all six. The wave-listen
  * floor scales with proven depth (MESH_DISCOVERY_WAVE_ALLOWANCE_MS: 8 s at
- * ring 1 climbing 4 s/ring to the 24 s cap by ring 4), because the round trip
+ * ring 1 climbing 4 s/ring to the 27 s cap by ring 5), because the round trip
  * out to the frontier and back is superlinear (measured: 2, 3, 4, 8, 21 s to
  * rings 1-5). Summing the worst-case per-wave cost (scaled floor + one idle
  * tail):
  *
  *     wave   1    2    3    4    5    6      -> cumulative
- *     ms   13k  17k  21k  25k  29k  29k        134k
+ *     ms   13k  17k  21k  25k  29k  32k        137k
  *
- * All six now fit under APP_PRIMARY_CAMPAIGN_MAX_MS (135 s) with ~1 s to spare;
+ * All six now fit under APP_PRIMARY_CAMPAIGN_MAX_MS (140 s) with ~3 s to spare;
  * that budget - and the secondary window it sits under - was raised so wave 6
  * is reachable for the deep herd instead of the campaign ending mid wave-5 the
  * way 110 s + an 18 s floor cap did (241F, ring 5, missed its wave by 5 s and
@@ -88,7 +88,7 @@
  *
  * Both roles start their campaign clock after the same APP_WAKEUP_BUFFER_MS,
  * so the secondaries' windows close at campaign_start + APP_DISCOVERY_WINDOW_
- * TIMEOUT_MS (205 s). 135 s leaves ~15 s of margin on top of that worst-case
+ * TIMEOUT_MS (205 s). 140 s leaves ~10 s of margin on top of that worst-case
  * fr9 budget, so the TimeSync is queued while the herd is still listening even
  * on a bad wake.
  *
@@ -98,8 +98,22 @@
  * the wave budget without moving the window would push TimeSync past the point
  * secondaries stop listening. The cost is real: an in-footprint node the
  * primary never acks stays awake up to 25 s longer per campaign (an
- * out-of-range node still bails at APP_SECONDARY_SILENCE_MS, unaffected). */
-#define APP_PRIMARY_CAMPAIGN_MAX_MS        (135 * 1000)
+ * out-of-range node still bails at APP_SECONDARY_SILENCE_MS, unaffected).
+ *
+ * 135 -> 140 s, and this time the window did NOT move with it: the extra 5 s
+ * comes out of the fr9/TimeSync margin (15 -> 10 s) instead. That is the
+ * cheaper side to spend. The fr9 margin is only consumed on a wake that has
+ * already hit the worst case - three failed AT+LOG attempts and a full
+ * AT+SETREQ timeout - whereas raising APP_DISCOVERY_WINDOW_TIMEOUT_MS costs
+ * every un-acked secondary 5 s more radio-on in EVERY campaign, on a
+ * solar-charged tag. Ten seconds on top of an already-pathological 55 s fr9
+ * session is enough; if it ever proves not to be, move the window rather than
+ * trimming the wave budget back, because the budget is what funds wave 6.
+ *
+ * What bought the 5 s: MESH_DISCOVERY_MIN_WAVE_CAP_MS 24 -> 27 s, so the
+ * deepest wave can still hear a ring-5 node whose only surviving copy of the
+ * DReq was the second airing (MESH_DREQ_ORIGIN_AIRINGS). */
+#define APP_PRIMARY_CAMPAIGN_MAX_MS        (140 * 1000)
 
 _Static_assert(APP_PRIMARY_MIN_WAVES <= APP_PRIMARY_MAX_WAVES,
                "APP_PRIMARY_MIN_WAVES exceeds APP_PRIMARY_MAX_WAVES");
@@ -116,9 +130,20 @@ _Static_assert(APP_PRIMARY_CAMPAIGN_MAX_MS < APP_DISCOVERY_WINDOW_TIMEOUT_MS,
  * floor first reaches the cap at wave (RAMP_STEPS + 1).
  *
  * This exists so the wave count and the campaign budget cannot silently
- * disagree: raise APP_PRIMARY_MAX_WAVES past what 135 s can run (or make a wave
- * more expensive) and this becomes a build error, not a wave that never fires.
- * See the table at APP_PRIMARY_MAX_WAVES. */
+ * disagree: raise APP_PRIMARY_MAX_WAVES past what the budget can run (or make a
+ * wave more expensive) and this becomes a build error, not a wave that never
+ * fires. See the table at APP_PRIMARY_MAX_WAVES.
+ *
+ * It models the QUIET case, which is the one the wave count depends on: a wave
+ * that stops being answered costs its floor plus one idle tail. A wave still
+ * being answered deliberately has no per-wave bound at all (see
+ * MESH_DISCOVERY_UNACKED_HOLD_MS - cutting one off mid-answer resets the whole
+ * mid-cadence herd's beacon backoff), so it can exceed its modelled cost and
+ * APP_PRIMARY_CAMPAIGN_MAX_MS is what bounds it. So this assert guarantees the
+ * wave COUNT is fundable on a quiet campaign, not that six waves always fit -
+ * which is the right guarantee, because a campaign that runs out of budget
+ * while the herd is still answering is spending it on exactly what it is
+ * for. */
 #define MESH_WAVE_FLOOR_RAMP_STEPS \
     ((MESH_DISCOVERY_MIN_WAVE_CAP_MS - MESH_DISCOVERY_MIN_WAVE_MS) / \
      MESH_DISCOVERY_WAVE_ALLOWANCE_MS)

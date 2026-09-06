@@ -142,26 +142,58 @@
  * that never see it. APP_PRIMARY_CAMPAIGN_MAX_MS bounds the total either way. */
 #define MESH_DISCOVERY_WAVE_ALLOWANCE_MS 4000U
 
-/* Cap on the scaled floor, so no ring count can push a single wave past
- * MESH_DISCOVERY_WAVE_MAX_MS and leave no room for the idle tail underneath
- * it. Asserted against both in MeshNetwork.c.
+/* Cap on the scaled floor, so no ring count can push the floor past
+ * MESH_DISCOVERY_UNACKED_HOLD_MS and leave no room for the idle tail
+ * underneath it. Asserted against both in MeshNetwork.c.
  *
  * 18000 -> 24000: the ring-5 round trip measured at 21 s (see the ALLOWANCE
  * comment above), so an 18 s cap left the deepest wave 3 s short of the very
  * tag it existed to hear. 24000 clears it; the ceiling and campaign budget
- * both moved to keep the idle tail fitting underneath. */
-#define MESH_DISCOVERY_MIN_WAVE_CAP_MS  24000U
+ * both moved to keep the idle tail fitting underneath.
+ *
+ * 24000 -> 27000: MESH_DREQ_ORIGIN_AIRINGS now airs the primary's DReq twice,
+ * and a node rescued by copy 2 answers up to MESH_DREQ_FWD2_DELAY_MAX_MS
+ * (2600 ms) later than one that heard copy 1. Everywhere but the deepest wave
+ * the floor has seconds of slack to absorb that; at the cap it had 3 s, so
+ * copy 2 would have left a ring-5 rescue 0.4 s of margin - which is the same
+ * coin flip the flat floor used to lose, just one packet further along. 27000
+ * puts the deep round trip AND its copy-2 rescue (21 + 2.6 = 23.6 s) back at
+ * ~3.4 s, i.e. restores the margin the cap was chosen to give.
+ *
+ * Only the ring-5+ floor moves (24 -> 27 s); rings 1-4 ramp below the cap and
+ * are untouched, so this is paid by the deepest wave of the deepest herds and
+ * by nothing else. It does cost 3 s of MESH_WAVE_BUDGET_MS, which is why
+ * APP_PRIMARY_CAMPAIGN_MAX_MS moved 135 -> 140 s with it. */
+#define MESH_DISCOVERY_MIN_WAVE_CAP_MS  27000U
 
-/* Ceiling on one DReq wave, so the un-acked extension cannot run a wave
- * forever: a node whose acks never reach it re-beacons (NEIGHBOR_vAddOrUpdate
- * clears bAcked on every re-beacon), so "un-acked neighbours exist" can stay
- * true for as long as that node keeps trying. Holding the wave open IS the
- * right response for a while - the primary keeps re-acking, and one ack that
- * lands stops 20+ beacons - but the campaign has a deadline to meet
- * (APP_PRIMARY_CAMPAIGN_MAX_MS), so bound it per wave and move on to the next
- * wave, which re-solicits anyway. 25000 -> 30000 to stay above the raised
- * scaled-floor cap (24000) plus the idle tail (5000); asserted in MeshNetwork.c. */
-#define MESH_DISCOVERY_WAVE_MAX_MS    30000U
+/* How long the UN-ACKED hold alone may keep a wave open. Formerly
+ * MESH_DISCOVERY_WAVE_MAX_MS, a flat ceiling on the whole wave, which was
+ * wrong in a way worth recording.
+ *
+ * Of the three reasons a wave stays open, only one can run forever. The listen
+ * floor is bounded (MESH_DISCOVERY_MIN_WAVE_CAP_MS). Ongoing beacons are
+ * self-limiting - the herd stops when it is acked. But "un-acked neighbours
+ * exist" can stay true indefinitely: NEIGHBOR_vAddOrUpdate clears bAcked on
+ * every re-beacon, so a node the primary can hear but whose acks never reach it
+ * re-arms that condition forever. So THAT is what needs the time box, and it is
+ * the only thing this bounds.
+ *
+ * As a ceiling on the whole wave it also cut off waves that were still being
+ * answered, and the cost was not the one lost beacon. Every node mid-cadence
+ * hears the next wave's DReq, takes the re-anchor branch in
+ * MESHNETWORK_vHandleDReq, and MESHNETWORK_vStartBeaconing resets its
+ * u8NodeBeaconSeq to 0 - so the entire mid-cadence herd's backoff collapses
+ * back to MESH_BEACON_BASE_MS at once. That is precisely the congestion the
+ * backoff exists to prevent, and the ceiling only ever fired when the un-acked
+ * hold had kept the wave open, i.e. exactly in the congested case. A wave now
+ * ends only once the air has actually gone quiet for MESH_DISCOVERY_IDLE_MS;
+ * APP_PRIMARY_CAMPAIGN_MAX_MS is the single hard stop.
+ *
+ * Must exceed the scaled floor plus one idle tail, or the hold would expire
+ * before the floor and quiet conditions it qualifies are even evaluable and the
+ * un-acked gate would hold nothing at all: 27000 + 5000 = 32000, so 33000
+ * keeps a ~1 s cushion. Asserted in MeshNetwork.c. */
+#define MESH_DISCOVERY_UNACKED_HOLD_MS 33000U
 /* Dedup window. R5 (meshOptimise) raises this to 64 to cut re-forward storms in
  * large fleets, but +128 B does not fit the current RAM budget, so it stays
  * small. Revisit with a RAM reclaim before scaling the fleet. (uint8
@@ -199,6 +231,53 @@
  * of waves 2+. What stays unchanged is WHO relays: wave 1 by every node, waves
  * 2+ only by forwarders. */
 #define MESH_DREQ_MAX_FORWARDS        2U
+
+/* Airings of the primary's OWN DReq, per wave. The constant above governs
+ * RELAYS; this one governs the origination, and until now the two disagreed:
+ * every node was allowed two copies of a DReq it passed on, while the primary
+ * that started the wave sent exactly one. So the single most consequential
+ * transmission of a wave was the only one in the protocol with no redundancy
+ * left, and the TimeSync and D-Ack comments below, which both describe
+ * themselves as using "the same two-copy scheme as a DReq origination", were
+ * describing something that did not exist. They do now.
+ *
+ * What the lone copy costs when it is lost is the whole wave, not one node's
+ * reception: the primary's transmission is the root of the flood, so nothing
+ * downstream has anything to relay. On wave 1 that is the entire campaign's
+ * "a campaign is running, stay awake" signal to the whole herd; on waves 2+ it
+ * is the only thing that moves the frontier one ring further out. Every other
+ * packet in a campaign now gets two chances - the beacon (cadence), the D-Ack
+ * (MESH_DACK_AIRINGS), the TimeSync (MESH_TIMESYNC_AIRINGS), a relayed DReq
+ * (MESH_DREQ_MAX_FORWARDS). This closes the last single-copy path.
+ *
+ * Mechanism is identical to those: one encode, two enqueues - ordinary jitter
+ * for copy 1, MESH_DREQ_FWD2_DELAY_[MIN,MAX] for copy 2, so the pair cannot
+ * share one congestion window or one fade.
+ *
+ * NO AMPLIFICATION, and this is the part worth being sure of. Both copies
+ * carry the same dreq id, and the receive side is governed by a per-id FORWARD
+ * COUNT (DREQ_bClaimForward), not by "have I seen this". So a node that hears
+ * both copies spends its existing two-relay budget on them instead of on one
+ * primary copy plus one peer's relay: the number of relays it emits is
+ * unchanged. The only added airtime in the whole mesh is the primary's own
+ * extra ~10-byte transmission, once per wave. Nor can copy 2 disturb a node
+ * that already answered copy 1 - MESHNETWORK_vStartBeaconing refuses a restart
+ * for the dreq id it is already beaconing, so the backoff cadence and the
+ * latched trigger RSSI both survive it untouched.
+ *
+ * The one place this needed paying for: a node that hears ONLY copy 2 answers
+ * up to MESH_DREQ_FWD2_DELAY_MAX_MS (2600 ms) later than one that heard copy 1,
+ * and the wave-listen floor has to cover that. Everywhere but the deepest wave
+ * it has seconds of slack; at MESH_DISCOVERY_MIN_WAVE_CAP_MS it had 3 s, so a
+ * ring-5 rescue would have landed 0.4 s inside the floor - a coin flip, and
+ * the deeper the ring the likelier it is to be lost, since the round trip grows
+ * superlinearly while the cap does not. The cap was therefore raised 24 -> 27 s
+ * (and the campaign budget 135 -> 140 s) so the deep rescue keeps the same ~3 s
+ * margin the direct reception has. Raising the cap is the correct knob and the
+ * only one: the base and the per-ring allowance already have slack at every
+ * ring that is not at the cap. */
+#define MESH_DREQ_ORIGIN_AIRINGS      2U
+
 /* 120 (was 128): freed 160 B of .bss for the superOptimise fixes on a part
  * whose RAM was byte-exact full. Still far beyond a realistic per-primary
  * fleet — D-Acks carry 8 ids per 2 s, so even 120 nodes need ~30 s of ack

@@ -409,19 +409,20 @@ static volatile bool bCampaignHeard = false;
 #if (MESH_BEACON_MAX_MS < MESH_BEACON_BASE_MS)
 #  error "MESH_BEACON_MAX_MS must be >= MESH_BEACON_BASE_MS"
 #endif
-/* A wave that may not end before the floor but must end by the ceiling. The
- * floor is scaled by herd depth at run time, so it is the CAP on that scaling
- * that has to leave room for the idle tail underneath the ceiling - otherwise
- * a deep herd's wave would always be cut off by the ceiling before its own
- * floor let it end, and the wave-end reasoning would silently stop applying. */
-#if (MESH_DISCOVERY_WAVE_MAX_MS <= MESH_DISCOVERY_MIN_WAVE_MS)
-#  error "MESH_DISCOVERY_WAVE_MAX_MS must exceed MESH_DISCOVERY_MIN_WAVE_MS"
+/* A wave may not end before its floor, and the un-acked hold that can outlast
+ * that floor must itself be time-boxed. The floor is scaled by herd depth at
+ * run time, so it is the CAP on that scaling that has to leave room for the
+ * idle tail underneath the hold - otherwise the hold would expire before the
+ * floor and quiet conditions it qualifies could even be evaluated, and the
+ * un-acked gate would silently hold nothing. */
+#if (MESH_DISCOVERY_UNACKED_HOLD_MS <= MESH_DISCOVERY_MIN_WAVE_MS)
+#  error "MESH_DISCOVERY_UNACKED_HOLD_MS must exceed MESH_DISCOVERY_MIN_WAVE_MS"
 #endif
 #if (MESH_DISCOVERY_MIN_WAVE_CAP_MS < MESH_DISCOVERY_MIN_WAVE_MS)
 #  error "MESH_DISCOVERY_MIN_WAVE_CAP_MS must be >= MESH_DISCOVERY_MIN_WAVE_MS"
 #endif
-#if ((MESH_DISCOVERY_MIN_WAVE_CAP_MS + MESH_DISCOVERY_IDLE_MS) > MESH_DISCOVERY_WAVE_MAX_MS)
-#  error "Scaled wave floor + idle tail must fit inside MESH_DISCOVERY_WAVE_MAX_MS"
+#if ((MESH_DISCOVERY_MIN_WAVE_CAP_MS + MESH_DISCOVERY_IDLE_MS) > MESH_DISCOVERY_UNACKED_HOLD_MS)
+#  error "Scaled wave floor + idle tail must fit inside MESH_DISCOVERY_UNACKED_HOLD_MS"
 #endif
 
 /* ---- Forward declarations ---- */
@@ -2084,6 +2085,22 @@ bool MESHNETWORK_bStartDiscoveryRound(uint32_t u32DreqId)
 
     if (!MESHNETWORK_bSendPacket(u8Out, u32Len))
         return false;
+    EVTLOG(LOG_TX_DREQ, 1);
+
+    /* Second airing - see MESH_DREQ_ORIGIN_AIRINGS. Same non-overlapping window
+     * as a relayed DReq's copy 2, a D-Ack's and a TimeSync's, so the pair cannot
+     * share one congestion window. Both copies carry the same dreq id and the
+     * receive side counts FORWARDS per id rather than remembering the id, so a
+     * node hearing both spends its existing two-relay budget on them instead of
+     * on a primary copy plus a peer's relay - the relays it emits are unchanged
+     * and the only added airtime in the mesh is this one transmission.
+     *
+     * Only copy 1 gates the return value and the wave clock below: a refused
+     * copy 2 costs redundancy, not correctness, and must not make the caller
+     * think the wave failed to start. */
+    if (MESHNETWORK_bSendPacketDelayed(u8Out, u32Len,
+                                       MESHNETWORK_u32DreqFwdDelayMs(2U)))
+        EVTLOG(LOG_TX_DREQ, 3);   /* 3 = second airing of an origination */
 
     /* Stamped only now, AFTER the DReq is safely queued. It used to be the
      * first line of this function, ahead of two failure returns - so an encode
@@ -2095,7 +2112,6 @@ bool MESHNETWORK_bStartDiscoveryRound(uint32_t u32DreqId)
 
     MESHNETWORK_vStartPrimaryAck();
     DBG_LOG("MeshNetwork: DReq %08X sent\r\n", u32DreqId);
-    EVTLOG(LOG_TX_DREQ, 1);
     return true;
 }
 

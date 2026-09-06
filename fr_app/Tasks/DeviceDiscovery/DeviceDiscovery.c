@@ -320,18 +320,24 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
                     uint32_t u32WaveMs = tNow - u32WaveStart;
 
-                    /* The campaign deadline is checked HERE, not only between
-                     * waves: a wave ends on beacon silence and now also holds
-                     * open while anyone is un-acked, so a single wave is what
-                     * could overrun. Every exit from this loop has to leave the
-                     * ack timer stopped - it is periodic, and one left running
-                     * keeps queueing D-Acks through the fr9 session and into
-                     * the FOTA chunk stream. */
-                    if (u32WaveMs >= MESH_DISCOVERY_WAVE_MAX_MS ||
-                        (osKernelGetTickCount() - u32CampaignStart) >= APP_PRIMARY_CAMPAIGN_MAX_MS)
+                    /* The campaign deadline is the ONE hard stop, and it is
+                     * checked here rather than only between waves because a
+                     * wave can legitimately outlast any per-wave bound while
+                     * the herd is still answering it. Every exit from this loop
+                     * has to leave the ack timer stopped - it is periodic, and
+                     * one left running keeps queueing D-Acks through the fr9
+                     * session and into the FOTA chunk stream.
+                     *
+                     * There used to be a flat per-wave ceiling here too, which
+                     * broke out without consulting tLastBeaconTick at all - so
+                     * a wave still being answered was cut off and the next DReq
+                     * went out over the top of it. See
+                     * MESH_DISCOVERY_UNACKED_HOLD_MS for why that was worse than
+                     * one lost beacon: it re-anchors every mid-cadence node and
+                     * resets the whole herd's beacon backoff at once. */
+                    if ((tNow - u32CampaignStart) >= APP_PRIMARY_CAMPAIGN_MAX_MS)
                     {
-                        bDeadlineHit = ((osKernelGetTickCount() - u32CampaignStart) >=
-                                        APP_PRIMARY_CAMPAIGN_MAX_MS);
+                        bDeadlineHit = true;
                         break;
                     }
 
@@ -372,19 +378,31 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                      * is the direct form of what the idle window used to have
                      * to infer from timing and could not - and it is what lets
                      * the beacon cadence back off (MESH_BEACON_BASE_MS) past
-                     * any idle value we could afford. Bounded by the wave
-                     * ceiling above, because a node whose acks never reach it
-                     * re-beacons and so stays un-acked indefinitely. */
-                    if (u32WaveMs >= u32WaveFloorMs &&
-                        (tNow - tLastBeaconTick) > MESH_DISCOVERY_IDLE_MS &&
-                        !MESHNETWORK_bHasUnackedNeighbors())
+                     * any idle value we could afford.
+                     *
+                     * Of the three, only the un-acked hold can run forever
+                     * (bAcked is cleared on every re-beacon, so a node whose
+                     * acks never reach it re-arms the condition indefinitely),
+                     * so it alone is time-boxed - by
+                     * MESH_DISCOVERY_UNACKED_HOLD_MS, not by a ceiling on the
+                     * whole wave. The QUIET term is deliberately left
+                     * un-boxed: while beacons for this wave are still arriving
+                     * the wave does not end, full stop, because the next DReq
+                     * on top of a herd mid-cadence costs far more than the wait
+                     * (see MESH_DISCOVERY_UNACKED_HOLD_MS). The campaign
+                     * deadline above is what bounds that case. */
+                    bool bQuiet       = (tNow - tLastBeaconTick) > MESH_DISCOVERY_IDLE_MS;
+                    bool bUnackedHold = MESHNETWORK_bHasUnackedNeighbors() &&
+                                        (u32WaveMs < MESH_DISCOVERY_UNACKED_HOLD_MS);
+
+                    if (u32WaveMs >= u32WaveFloorMs && bQuiet && !bUnackedHold)
                         break;
 
                     /* Radio test entered mid-campaign. Bail out rather than
                      * run the waves out: MESHNETWORK_bSendPacket returns false
                      * for the duration of a test, so the DReq never actually
                      * goes out, no beacon can be heard in reply, and every wave
-                     * would sit out its full wave ceiling - eight of them,
+                     * would sit out its full listen floor - six of them,
                      * followed by a logger session that fights the test for the
                      * same Farmranger link and PA0 line. */
                     if (RADIOTESTMODE_bActive())
