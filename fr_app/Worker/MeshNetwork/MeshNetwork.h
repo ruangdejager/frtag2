@@ -14,6 +14,32 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Build-configuration flags. These MUST be defined before anything that tests
+ * them: MESH_DIAG_COUNTERS below selects MESH_MAX_NEIGHBORS, and when this
+ * block sat further down the header the test silently took the production
+ * branch - the diag build compiled, linked on the last 8 bytes of RAM, and
+ * carried a 120-entry table it was supposed to have traded away. */
+/*
+ * Extra per-campaign diagnostic counters for a field-test build. OFF for
+ * production, like MESH_LOG_VERBOSE above - but for a different reason. These
+ * are not verbose (they add one aggregate line per campaign, nothing
+ * per-packet); they cost RAM, and .bss is byte-exact full.
+ *
+ * What they exist to answer, none of which the production stats line can:
+ *   - fwdBeacon vs fwdDreq/fwdAck/fwdTs: "forwarded=" is one lumped number, so
+ *     beacon relay amplification - the term that should stop scaling with herd
+ *     size now the dedupe ring holds 48 - cannot be separated from the rest.
+ *   - dedupeHit: beacons correctly suppressed as already-seen. The direct read
+ *     on whether the 16-bit fold bought real history.
+ *   - bpSkipBeacon: beacon relays refused because the TX queue was already
+ *     deep. The cleanest single measure of node saturation, and deliberately
+ *     NOT in the production tally (see u16StatTxDropped, where counting
+ *     back-pressure would make the number climb when things are working).
+ *
+ * Enabling this costs ~8 B of .bss, which does not fit alongside
+ * MESH_MAX_NEIGHBORS at 120 - see there. */
+// #define MESH_DIAG_COUNTERS
+
 /* ---- Timing constants ---- */
 /* Beacon retry cadence while awaiting a D-Ack. Was one fixed 3500 ms period.
  *
@@ -194,17 +220,61 @@
  * un-acked gate would hold nothing at all: 27000 + 5000 = 32000, so 33000
  * keeps a ~1 s cushion. Asserted in MeshNetwork.c. */
 #define MESH_DISCOVERY_UNACKED_HOLD_MS 33000U
-/* Dedup window. R5 (meshOptimise) raises this to 64 to cut re-forward storms in
- * large fleets, but +128 B does not fit the current RAM budget, so it stays
- * small. Revisit with a RAM reclaim before scaling the fleet. (uint8
- * head/count allow up to 255.)
+/* Dedup window for BEACON and ACK message ids, and the bound on how many times
+ * one beacon can be relayed across the herd. 24 -> 48 slots, at the same 96
+ * bytes, by storing a 16-bit fingerprint per slot instead of the full 32-bit
+ * id (see MESH_FP_FOLD below and ForwardRing_t).
  *
- * 32 -> 24, and now BEACON/ACK ids only: DReq ids moved out to their own store
- * (MESH_DREQ_DEDUPE_SIZE below), so this ring no longer has to hold them and
- * the 8 slots they used to occupy pay for that store exactly. Net zero RAM on
- * a part whose .bss is byte-exact full, and strictly better behaviour — the
- * two id classes can no longer evict one another. */
-#define FORWARD_RING_SIZE             24
+ * Why it had to grow. A beacon relay is gated by role, back-pressure, and this
+ * ring - and unlike every other packet class it has no explicit airing cap
+ * (contrast MESH_DREQ_MAX_FORWARDS, MESH_TIMESYNC_AIRINGS, MESH_DACK_AIRINGS).
+ * The ring IS the cap: "relay each beacon once per node". That only holds while
+ * the id is still in the ring when the next copy arrives.
+ *
+ * At 24 slots it stops holding at herd scale, and the arithmetic is not close.
+ * The slots are shared between received beacon ids, received ack ids, and this
+ * node's own beacon and ack ids. A 40-node herd pushes 80-120 beacon ids plus
+ * the acks through a campaign, and the comment on MESH_DREQ_DEDUPE_SIZE already
+ * records the consequence measured at 28 nodes: an id "is evicted within a
+ * fraction of a second of busy traffic". That is why DReq ids were moved to
+ * their own store; beacon and ack ids never got the same treatment. An evicted
+ * beacon id is re-relayed by the same node when the next copy arrives, so the
+ * per-node bound silently becomes per-node-per-lap.
+ *
+ * That matters more than it looks, because the forwarder population only ever
+ * GROWS during a campaign: MESHNETWORK_bStopBeaconingLocked is the sole path
+ * into NODE_ROLE_FORWARDER and nothing leaves it before vResetNodeRole. So
+ * acking a node does not only silence a beaconer, it promotes a relay. Total
+ * beacon airtime is roughly originations x (1 + forwarders): originations fall
+ * as acks land while forwarders rise, so the product peaks mid-campaign rather
+ * than decaying. At nine nodes one unit already relayed 89 packets and spent
+ * ~70% of the window deaf in CAD, missing its own TimeSync. The ring is the
+ * only thing standing between that and a multiplier that grows with the herd.
+ *
+ * 48 slots is ~3-5 s of history in the busy phase against ~1-2 s at 24, which
+ * is what a relay needs to cover the spread of copies of one beacon (TX jitter
+ * plus carrier sense at each hop).
+ *
+ * R5 (meshOptimise) wanted 64 slots at 32 bits, i.e. +128 B, which never fit
+ * the RAM budget. Folding gets most of that for free instead. */
+#define FORWARD_RING_SIZE             48U
+
+/* 32-bit message id -> 16-bit ring fingerprint.
+ *
+ * Ids are (deviceId16 << 16) | counter16 (MESHNETWORK_u32GenerateGlobalMsgID),
+ * so XOR-ing the halves mixes the device id INTO the stored value. Keeping the
+ * low half alone would have been cheaper to read but collides systematically:
+ * u16MsgCounter is seeded from the RNG per boot, so two devices can sit on
+ * neighbouring counters for a whole deployment and shadow each other's every
+ * packet. Folding makes a collision depend on both halves, i.e. random.
+ *
+ * A collision means a node treats an unseen message as seen: one relay not
+ * made, or on the primary one beacon not recorded. The odds are ~48/65536 (~1
+ * in 1400) for an arrival against a full ring, the node re-beacons regardless
+ * so it is self-healing, and that rate sits far below the CRC and header error
+ * rate already present in the field logs. Halving the stored width to double
+ * the history is a good trade at 1-in-1400; it would not be at 1-in-20. */
+#define MESH_FP_FOLD(id) ((uint16_t)(((uint32_t)(id) >> 16) ^ ((uint32_t)(id) & 0xFFFFU)))
 
 /* DReq ids get their own dedup store rather than sharing the ring above. The
  * ring carries beacon and ack ids too, and one campaign pushes far more of
@@ -280,9 +350,19 @@
 
 /* 120 (was 128): freed 160 B of .bss for the superOptimise fixes on a part
  * whose RAM was byte-exact full. Still far beyond a realistic per-primary
- * fleet — D-Acks carry 8 ids per 2 s, so even 120 nodes need ~30 s of ack
- * airtime per campaign. */
+ * fleet — D-Acks carry MESH_MAX_ACK_IDS_PER_PACKET ids per
+ * MESH_PRIMARY_ACK_INTERVAL_MS (12 per 4 s), so even 120 nodes need ~40 s of
+ * ack airtime per campaign. */
+#ifdef MESH_DIAG_COUNTERS
+/* The diag counters need ~8 B that .bss does not have, so a field-test build
+ * buys them by capping the table lower. 64 still clears a 30-50 node herd with
+ * headroom, and each entry saved is 24 B of .bss plus 24 B of the stack array
+ * DeviceDiscovery allocates. If a test herd ever exceeds 64 this has to be
+ * rethought rather than quietly truncating the union. */
+#define MESH_MAX_NEIGHBORS            64
+#else
 #define MESH_MAX_NEIGHBORS            120
+#endif
 
 /* A beaconing node used to stop (become forwarder) after MESH_MAX_BEACONS_PER_
  * CAMPAIGN (6) beacons, on the theory that it bounded airtime when a D-Ack was
@@ -312,6 +392,46 @@
  * interval. Asserted in MeshNetwork.c. */
 #define MESH_TX_JITTER_MIN_MS         20U
 #define MESH_TX_JITTER_MAX_MS         1500U
+
+/* Ceiling the jitter window GROWS to when the node finds itself in a crowd,
+ * and the step it grows by per DReq copy heard. See
+ * MESHNETWORK_u32GetTxJitterMs.
+ *
+ * A fixed 1500 ms window is sized for a handful of answerers and collapses at
+ * herd scale. 40 nodes answering one DReq is 40 x ~33 ms = ~1.3 s of
+ * transmission offered into a 1.5 s window - ~88% load, and collision
+ * probability climbs roughly with the square of that. Carrier sense keeps it
+ * CORRECT, but it does so by serialising the contention, and carrier sense runs
+ * the chip in CAD rather than RX (LORA_CAD_ONLY, no IRQ_RX_DONE mapped). So the
+ * cost of a too-narrow window is not lost packets, it is DEAFNESS - the
+ * documented cause of one unit missing the primary's TimeSync in 39 of 47
+ * campaigns. Widening the window attacks that directly: fewer nodes attempt at
+ * once, so fewer sit in CAD.
+ *
+ * 4000 is chosen as the largest value that needs no other constant to move.
+ * Both existing invariants still hold with 1000 ms of margin each:
+ *   MESH_BEACON_BASE_MS (5000)   > 4000  - a queued packet cannot slip past
+ *                                         the next beacon
+ *   MESH_DISCOVERY_IDLE_MS (5000) > 4000 - a jittered beacon cannot be
+ *                                         mistaken for silence
+ * Both are asserted in MeshNetwork.c. At 40 nodes this is ~1.3 s into a 4 s
+ * window, ~33% offered load instead of ~88%.
+ *
+ * The density signal is u16StatDReqHeard, not beacons heard, and the choice
+ * matters: on wave 1 every node relays the DReq twice, so a node in a dense
+ * herd hears many copies within the first seconds - BEFORE it answers. A beacon
+ * count only rises after the burst it is supposed to spread. STEP 60 reaches
+ * the ceiling at ~42 DReq copies heard, which is the right order for a 40-node
+ * herd; a lone node stays at 1500 and loses nothing.
+ *
+ * Known limit: the FIRST beacon of an episode is fired immediately on the
+ * trigger, when the local count may still be low, so it is the one transmission
+ * this cannot spread. Beacons 2..n get the full window. Fixing that needs the
+ * primary to advertise herd size in a DReq hint byte - there is room and the
+ * length-gated field pattern is established - but that is a wire change and is
+ * deliberately not done here. */
+#define MESH_TX_JITTER_BUSY_MS        4000U
+#define MESH_TX_JITTER_STEP_MS        60U
 
 /* Send delay for the SECOND forward of a DReq id. REPLACES the normal jitter
  * window above for that one packet (it is not added to it), so the two copies
@@ -376,6 +496,7 @@
  * debugging of the TX queue / dedup behaviour.
  */
 // #define MESH_LOG_VERBOSE
+
 
 /* ---- Packet types (wire, first byte) ---- */
 typedef enum {
@@ -463,10 +584,22 @@ typedef struct {
     int32_t  i32LonUDeg;     /* longitude in microdegrees (10^-6 deg) */
 } MeshPktDBeacon_t;
 
-#define MESH_MAX_ACK_IDS_PER_PACKET 8
+/* 8 -> 12. At 8 ids per MESH_PRIMARY_ACK_INTERVAL_MS the primary can silence
+ * only 2 nodes/s, so a 40-50 node herd needs 20-25 s of ack passes before the
+ * last ring is even addressed - and every node still un-acked is still
+ * beaconing over the top of the ones that are. 12 ids puts a full D-Ack at
+ * 10 + 4*12 = 58 B, still inside MESH_TX_MAX_PACKET_SIZE (64) with the
+ * _Static_assert in MeshNetwork.c holding the line, and cuts the passes by a
+ * third for 16 bytes of wire on a packet that is mostly header anyway. */
+#define MESH_MAX_ACK_IDS_PER_PACKET 12
 typedef struct {
     uint32_t u32AckMsgId;
     uint32_t u32DreqId;
+    /* NOT on the wire. MESHNETWORK_bEncodeDAck never writes it, and the
+     * receiver never looks for it: the acking primary is identified by the top
+     * half of u32DreqId instead. Populated on the send path out of habit. Kept
+     * only so the struct layout is not disturbed; do not start trusting it
+     * without adding it to the encoder AND a length gate on the decoder. */
     uint32_t u32SenderId;
     uint8_t  u8AckCount;
     uint32_t u32AckedIds[MESH_MAX_ACK_IDS_PER_PACKET];
@@ -511,8 +644,11 @@ typedef struct {
 } MeshPktTimeSync_t;
 
 /* ---- Forward ring ---- */
+/* Slots hold a 16-bit FINGERPRINT of the message id, not the id, which is what
+ * buys 48 slots out of the same 96 bytes the old 24 x uint32 occupied - see
+ * FORWARD_RING_SIZE and MESH_FP_FOLD. */
 typedef struct {
-    uint32_t u32Ring[FORWARD_RING_SIZE];
+    uint16_t u16Ring[FORWARD_RING_SIZE];
     uint8_t  u8Head;
     uint8_t  u8Count;
 } ForwardRing_t;
@@ -540,6 +676,11 @@ typedef struct {
     uint8_t  u8FwPatch;        /* sender's VERSION_SW_PATCH from beacon */
     uint8_t  u8MoveState : 1;  /* 0 = moving, 1 = still */
     uint8_t  bGpsValid   : 1;  /* 1 = i32Lat/LonUDeg hold a fix */
+    /* D-Acks this campaign that have LISTED this node, saturating at 3. Free:
+     * it takes two of the six bits left over in the byte the two flags above
+     * already occupy, so sizeof is unchanged and the 24-byte assert still
+     * holds. See MESH_ACK_TRIES_MAX for what it is for. */
+    uint8_t  u8AckTries  : 2;
     bool     bAcked;
     uint16_t u16BestRssiSrcId; /* node whose DReq gave i16Rssi; 0 = not reported
                                 * (older peer, or relayed via an older node) */
@@ -625,7 +766,52 @@ void MESHNETWORK_vFlushTxQueue(bool bKeepTimeSync);
  * the direct signal MESH_DISCOVERY_IDLE_MS used to have to guess at from
  * timing. NEIGHBOR_vAddOrUpdate clears bAcked on every re-beacon, so this also
  * goes true again for a node whose acks are not reaching it. */
+/* How many D-Acks may list a node before the wave-listen loop stops treating
+ * it as a reason to hold the wave open. Bounded by the 2-bit field, so 3 max.
+ *
+ * NEIGHBOR_vAddOrUpdate clears bAcked on every re-beacon - correctly, because a
+ * node that is still beaconing is asking to be acked again. But nothing bounded
+ * that: a node the primary can hear whose acks never reach it, or one beaconing
+ * for a DIFFERENT primary (both primaries in a herd wake on the same UTC slot,
+ * so this is the normal case, not an edge one), re-arms the condition forever.
+ * MESHNETWORK_bHasUnackedNeighbors() was then permanently true and every wave
+ * burned its full MESH_DISCOVERY_UNACKED_HOLD_MS waiting for an ack that cannot
+ * land, which at 30-50 nodes is every wave of every campaign.
+ *
+ * Three tries, then the wave stops waiting for that node. The primary keeps
+ * LISTING it in later acks regardless - that costs 4 bytes in a packet that is
+ * already going out, and one ack that finally lands still silences 20+ beacons.
+ * What the counter bounds is only how long the wave defers to it. */
+#define MESH_ACK_TRIES_MAX            3U
+
 bool MESHNETWORK_bHasUnackedNeighbors(void);
+
+/* Primary: how many unique nodes are in the neighbour table right now. Cheap
+ * enough to poll (no table copy, unlike MESHNETWORK_bGetDiscoveredNeighbors),
+ * which is what the wave loop needs to tell "this wave is still discovering
+ * nodes" from "this wave is hearing the same nodes re-beacon". */
+uint16_t MESHNETWORK_u16GetNeighborCount(void);
+
+/* Beacons heard so far this campaign (packets, duplicates and relays included -
+ * it is incremented ahead of the dedupe). Snapshotting it at each wave boundary
+ * is how the per-wave log line reports beacons-per-wave accurately, rather than
+ * counting the 500 ms polls that noticed a change and undercounting bursts. */
+uint16_t MESHNETWORK_u16GetBeaconsHeard(void);
+
+/* Primary: how many table rows are still un-acked. The bool sibling above
+ * short-circuits and is what the poll loop uses; this one is for the per-wave
+ * log line. */
+uint16_t MESHNETWORK_u16GetUnackedCount(void);
+
+/* Primary: one line naming every row this campaign never managed to ack, with
+ * its ack-try count. Directly measures whether MESH_ACK_TRIES_MAX and the
+ * cross-primary ack are doing their job; call at campaign end. */
+void MESHNETWORK_vLogUnackedNeighbors(void);
+
+/* The TX jitter ceiling currently in force on this node - grows with local DReq
+ * density, see MESH_TX_JITTER_BUSY_MS. Logged in the campaign stats line so the
+ * field logs record the window that produced them. */
+uint32_t MESHNETWORK_u32GetTxJitterCeilingMs(void);
 
 /* Primary: the highest wave number that has discovered anything this campaign,
  * i.e. how many rings deep the herd has PROVEN to be; 0 before anything

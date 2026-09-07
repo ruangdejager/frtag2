@@ -23,6 +23,7 @@
 #include "task.h"
 
 #include <string.h>
+#include <stdio.h>     /* snprintf, for the un-acked roster line */
 
 #include "dbg_log.h"
 #include "DeviceDiscovery.h"
@@ -137,7 +138,7 @@ static uint16_t            u16BasicNeighborCount = 0U;
 
 /* ---- TX queue item ----
  * Item buffer 64 (was 128): the largest mesh frame is a full D-Ack at
- * 10 + 8*4 = 42 B (beacon 27, DReq 9, TimeSync 6); FrKernel responses bypass
+ * 10 + 12*4 = 58 B (beacon 27, DReq 9, TimeSync 11); FrKernel responses bypass
  * this queue entirely. 24 x 64 B saves ~1.5 KB of heap vs 128. */
 #define MESH_TX_QUEUE_LEN        24
 #define MESH_TX_MAX_PACKET_SIZE  64
@@ -198,6 +199,20 @@ _Static_assert(sizeof(MeshDiscoveredNeighbor_t) == 24,
  * error. */
 _Static_assert(10 + 4 * MESH_MAX_ACK_IDS_PER_PACKET <= MESH_TX_MAX_PACKET_SIZE,
                "A full D-Ack no longer fits a mesh TX queue item.");
+/* u8AckTries is two bits, and it is two bits because that is what was spare in
+ * a byte NeighborEntry_t already had - widening it costs 120 bytes of a .bss
+ * that has 8 free. */
+_Static_assert(MESH_ACK_TRIES_MAX <= 3U,
+               "MESH_ACK_TRIES_MAX does not fit NeighborEntry_t.u8AckTries.");
+/* The whole point of folding ids to 16 bits was to double the slot count
+ * WITHOUT spending RAM. If this ever grows, the trade has silently been lost
+ * and the collision risk is being paid for nothing. */
+_Static_assert(sizeof(ForwardRing_t) <= 100,
+               "ForwardRing_t grew past the 96 B the 24-slot 32-bit ring used; "
+               "the 16-bit fold exists to keep 48 slots at that size.");
+/* u8Head/u8Count index the ring as uint8_t. */
+_Static_assert(FORWARD_RING_SIZE <= 255,
+               "FORWARD_RING_SIZE exceeds the uint8_t head/count indices.");
 
 static bool       bNodeBeaconing      = false;
 static uint32_t   u32NodeBeaconDreqId = 0;
@@ -361,6 +376,23 @@ static uint16_t u16StatBeaconsHeard;
 static uint16_t u16StatAcksHeard;
 static uint16_t u16StatMsgsForwarded;
 
+/* Field-test only - see MESH_DIAG_COUNTERS. DIAG_INC(Foo) touches u16DiagFoo,
+ * and expands to nothing when the flag is off, so the names are never
+ * referenced and cost neither RAM nor flash in a production build. */
+#ifdef MESH_DIAG_COUNTERS
+static uint16_t u16DiagFwdBeacon;
+static uint16_t u16DiagFwdDreq;
+static uint16_t u16DiagFwdAck;
+static uint16_t u16DiagFwdTs;
+static uint16_t u16DiagDedupeHit;
+static uint16_t u16DiagBpSkipBeacon;
+#define DIAG_INC(c) do { if (u16Diag##c < UINT16_MAX) u16Diag##c++; } while (0)
+#define DIAG_RESET()                                                           do { u16DiagFwdBeacon = 0U; u16DiagFwdDreq = 0U; u16DiagFwdAck = 0U;            u16DiagFwdTs = 0U; u16DiagDedupeHit = 0U;                                  u16DiagBpSkipBeacon = 0U; } while (0)
+#else
+#define DIAG_INC(c)  do { } while (0)
+#define DIAG_RESET() do { } while (0)
+#endif
+
 /* Mesh-layer packets that never made it onto the air: dropped because the
  * mesh TX queue was full, or discarded by MESHNETWORK_vFlushTxQueue(). Summed
  * with the radio layer's own tally into the campaign stats "txDrop" figure.
@@ -397,6 +429,20 @@ static volatile bool bCampaignHeard = false;
  * they are stated against the base and actually enforced. */
 #if (MESH_BEACON_BASE_MS <= MESH_TX_JITTER_MAX_MS)
 #  error "MESH_BEACON_BASE_MS must exceed MESH_TX_JITTER_MAX_MS"
+#endif
+/* The jitter window is now dynamic, so both invariants have to hold against the
+ * BUSY ceiling, not the quiet-channel value - that is the whole constraint that
+ * picked 4000. Without these two, widening the window would silently let a
+ * queued beacon slip past its next interval, or let a jittered beacon read as
+ * wave silence. */
+#if (MESH_BEACON_BASE_MS <= MESH_TX_JITTER_BUSY_MS)
+#  error "MESH_BEACON_BASE_MS must exceed MESH_TX_JITTER_BUSY_MS"
+#endif
+#if (MESH_DISCOVERY_IDLE_MS <= MESH_TX_JITTER_BUSY_MS)
+#  error "MESH_DISCOVERY_IDLE_MS must exceed MESH_TX_JITTER_BUSY_MS"
+#endif
+#if (MESH_TX_JITTER_BUSY_MS < MESH_TX_JITTER_MAX_MS)
+#  error "MESH_TX_JITTER_BUSY_MS must be >= MESH_TX_JITTER_MAX_MS"
 #endif
 #if (MESH_BEACON_BASE_MS <= MESH_DREQ_FWD2_DELAY_MAX_MS)
 #  error "MESH_BEACON_BASE_MS must exceed MESH_DREQ_FWD2_DELAY_MAX_MS"
@@ -460,16 +506,20 @@ static int16_t read_s16_be(const uint8_t *p)
 /* --------------------------------------------------------------------------
  * Forward ring
  * -------------------------------------------------------------------------- */
+/* Both sides fold through MESH_FP_FOLD, so a false positive is possible and a
+ * false negative is not: an id that was stored always matches itself. See
+ * FORWARD_RING_SIZE for the collision budget and why it is affordable. */
 static bool FORWARD_bHasSeen(uint32_t u32MsgId)
 {
-    bool bFound = false;
+    bool     bFound = false;
+    uint16_t u16Fp  = MESH_FP_FOLD(u32MsgId);
     if (osMutexAcquire(xForwardRingMutex, 100) == osOK)
     {
         for (uint8_t i = 0; i < tForwardRing.u8Count; i++)
         {
-            uint8_t idx = (tForwardRing.u8Head + FORWARD_RING_SIZE -
-                           tForwardRing.u8Count + i) % FORWARD_RING_SIZE;
-            if (tForwardRing.u32Ring[idx] == u32MsgId) { bFound = true; break; }
+            uint8_t idx = (uint8_t)((tForwardRing.u8Head + FORWARD_RING_SIZE -
+                           tForwardRing.u8Count + i) % FORWARD_RING_SIZE);
+            if (tForwardRing.u16Ring[idx] == u16Fp) { bFound = true; break; }
         }
         osMutexRelease(xForwardRingMutex);
     }
@@ -479,8 +529,8 @@ static void FORWARD_vAdd(uint32_t u32MsgId)
 {
     if (osMutexAcquire(xForwardRingMutex, 100) == osOK)
     {
-        tForwardRing.u32Ring[tForwardRing.u8Head] = u32MsgId;
-        tForwardRing.u8Head = (tForwardRing.u8Head + 1) % FORWARD_RING_SIZE;
+        tForwardRing.u16Ring[tForwardRing.u8Head] = MESH_FP_FOLD(u32MsgId);
+        tForwardRing.u8Head = (uint8_t)((tForwardRing.u8Head + 1) % FORWARD_RING_SIZE);
         if (tForwardRing.u8Count < FORWARD_RING_SIZE) tForwardRing.u8Count++;
         osMutexRelease(xForwardRingMutex);
     }
@@ -624,6 +674,7 @@ static void NEIGHBOR_vAddOrUpdate(const MeshPktDBeacon_t *ptBeacon)
             ptNew->i32LatUDeg           = ptBeacon->i32LatUDeg;
             ptNew->i32LonUDeg           = ptBeacon->i32LonUDeg;
             ptNew->bAcked               = false;
+            ptNew->u8AckTries           = 0U;
             u16NeighborCount++;
             tLastBeaconHeardTick = osKernelGetTickCount();
         }
@@ -821,9 +872,21 @@ static uint32_t MESHNETWORK_u32JitterRand(void)
     return x;
 }
 
+/* The jitter CEILING for this node right now: the quiet-channel value, widened
+ * towards MESH_TX_JITTER_BUSY_MS in proportion to how much DReq traffic this
+ * campaign has put on the air around us. Exposed for the campaign stats line so
+ * the field logs record the window that was actually in force. See
+ * MESH_TX_JITTER_BUSY_MS for why the signal is DReq copies and not beacons. */
+uint32_t MESHNETWORK_u32GetTxJitterCeilingMs(void)
+{
+    uint32_t u32Ms = MESH_TX_JITTER_MAX_MS +
+                     ((uint32_t)u16StatDReqHeard * MESH_TX_JITTER_STEP_MS);
+    return (u32Ms > MESH_TX_JITTER_BUSY_MS) ? MESH_TX_JITTER_BUSY_MS : u32Ms;
+}
+
 static uint32_t MESHNETWORK_u32GetTxJitterMs(void)
 {
-    uint32_t u32Range = MESH_TX_JITTER_MAX_MS - MESH_TX_JITTER_MIN_MS;
+    uint32_t u32Range = MESHNETWORK_u32GetTxJitterCeilingMs() - MESH_TX_JITTER_MIN_MS;
     return MESH_TX_JITTER_MIN_MS + (MESHNETWORK_u32JitterRand() % (u32Range + 1));
 }
 
@@ -1021,6 +1084,13 @@ static void MESHNETWORK_vBuildAndQueueAck(void)
                 if (bQueued)
                 {
                     EVTLOG(LOG_TX_ACK, 1);
+                    /* One line per ack, ~1 per MESH_PRIMARY_ACK_INTERVAL_MS and
+                     * primary-only, so the volume is fine. remaining= is what
+                     * says whether ack throughput is keeping up with the herd:
+                     * it should trend to zero inside a campaign. */
+                    DBG_LOG("MeshNetwork: DAck %08X ids=%u remaining=%u\r\n",
+                            (unsigned)tAck.u32AckMsgId, (unsigned)tAck.u8AckCount,
+                            (unsigned)MESHNETWORK_u16GetUnackedCount());
                     /* Second airing - see MESH_DACK_AIRINGS. Same non-
                      * overlapping window as a DReq's copy 2, so the pair cannot
                      * share one congestion window. Only copy 1 gates bAcked
@@ -1043,6 +1113,12 @@ static void MESHNETWORK_vBuildAndQueueAck(void)
                         if (tNeighborTable[i].u32DeviceId == tAck.u32AckedIds[a])
                         {
                             tNeighborTable[i].bAcked = true;
+                            /* Saturating: a node listed more than
+                             * MESH_ACK_TRIES_MAX times has had every chance the
+                             * wave is willing to wait for, and the count past
+                             * that carries no information. */
+                            if (tNeighborTable[i].u8AckTries < MESH_ACK_TRIES_MAX)
+                                tNeighborTable[i].u8AckTries++;
                             break;
                         }
                     }
@@ -1232,6 +1308,7 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
                     DBG("MeshNetwork: DReq wave-1 flood relayed (hop %u, copy %u)\r\n",
                         (unsigned)(u8SenderHopCount + 1), (unsigned)u8FwdOrdinal);
                     u16StatMsgsForwarded++;
+                    DIAG_INC(FwdDreq);
                     EVTLOG(LOG_TX_DREQ, 2);
                 }
             }
@@ -1297,6 +1374,7 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
                     DBG("MeshNetwork: DReq forwarded (copy %u)\r\n",
                         (unsigned)u8FwdOrdinal);
                     u16StatMsgsForwarded++;
+                    DIAG_INC(FwdDreq);
                     EVTLOG(LOG_TX_DREQ, 2);
                 }
             }
@@ -1420,6 +1498,7 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
     /* 1. Deduplicate */
     if (FORWARD_bHasSeen(tBeacon.u32BeaconMsgId))
     {
+        DIAG_INC(DedupeHit);
 #ifdef MESH_LOG_VERBOSE
         DBG("MeshNetwork: Beacon seen before\r\n");
 #endif
@@ -1442,8 +1521,20 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
      * Skipped while the TX queue is already backed up — beacon relays are by
      * far the highest-volume traffic here, and queueing more of them is what
      * drives the backlog that keeps the radio in CAD instead of RX. */
-    if (MESHNETWORK_eGetRole() == NODE_ROLE_FORWARDER &&
-        !MESHNETWORK_bTxBacklogHigh())
+    /* Role read ONCE: MESHNETWORK_eGetRole takes xRoleMutex, and this is the
+     * highest-volume receive path in a campaign - the one whose cost this
+     * change set is trying to bring down. */
+    bool bIsForwarder = (MESHNETWORK_eGetRole() == NODE_ROLE_FORWARDER);
+
+    if (bIsForwarder && MESHNETWORK_bTxBacklogHigh())
+    {
+        /* Counted only in a diag build: a rising back-pressure count is the
+         * mechanism WORKING - it is what stops the queue going deep enough to
+         * hold the radio in CAD - so it has no place in the production tally.
+         * It is still the cleanest measure of how saturated this node is. */
+        DIAG_INC(BpSkipBeacon);
+    }
+    else if (bIsForwarder)
     {
         tBeacon.u8HopCount++;
         uint8_t u8Buf[64];
@@ -1453,6 +1544,7 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
             MESHNETWORK_bSendPacket(u8Buf, u32TempLen);
             DBG("MeshNetwork: Forwarding Beacon\r\n");
             u16StatMsgsForwarded++;
+            DIAG_INC(FwdBeacon);
             EVTLOG(LOG_TX_BEACON, 2);
         }
     }
@@ -1697,6 +1789,7 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
         MESHNETWORK_bSendPacket(pBuf, u32Len);
         DBG("MeshNetwork: Ack forwarded\r\n");
         u16StatMsgsForwarded++;
+        DIAG_INC(FwdAck);
         EVTLOG(LOG_TX_ACK, 2);
     }
 
@@ -1744,10 +1837,16 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
         bGpsEnabled = (u8Flags & MESH_TIMESYNC_FLAG_GPS_ENABLED) ? true                 : false;
     }
 
-    DBG("MeshNetwork: TimeSync: utc=%u interval=%u fwVer=%lu mode=%s gps=%u\r\n",
+    /* DBG -> DBG_LOG, with RSSI. Every copy that reaches this node is now
+     * recorded, which is what makes a missed TimeSync diagnosable: without it
+     * a secondary log cannot distinguish "no copy ever arrived" (a coverage or
+     * deafness problem) from "a copy arrived and the dedupe below dropped it"
+     * (working as intended). The dedupe means the interesting lines are the
+     * ones with no "TimeSync applied" after them. */
+    DBG_LOG("MeshNetwork: TimeSync rx utc=%u interval=%u fwVer=%lu mode=%s gps=%u rssi=%d\r\n",
             u32Utc, tInterval, (unsigned long)u32StagedVer,
             (eMode == DISCOVERY_MODE_BASIC) ? "basic" : "advanced",
-            (unsigned)bGpsEnabled);
+            (unsigned)bGpsEnabled, (int)s16Rssi);
 
     uint32_t u32LogValue;
     FLASHLOG_vEncodeRXLogValue(&u32LogValue, 0, s16Rssi, 0);
@@ -1830,6 +1929,7 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
                                    MESHNETWORK_u32DreqFwdDelayMs(2U));
     DBG("MeshNetwork: TimeSync forwarded\r\n");
     u16StatMsgsForwarded++;
+    DIAG_INC(FwdTs);
     EVTLOG(LOG_TX_TS, 2);
 }
 
@@ -2213,32 +2313,96 @@ static bool MESHNETWORK_bStopBeaconingLocked(uint32_t u32DreqId)
     return true;
 }
 
-/* I1: stop when the D-Ack came from the SAME primary, even if its dreq id is
- * a newer wave than the one this node anchored to. The primary generates a
- * new dreq per wave, so an exact-dreq match leaves a wave-1 beaconer acked
- * during wave 2 beaconing until its cap. Origin (dreq >> 16) is the primary's
- * 16-bit id, so this stays multi-primary safe. */
+/* One line per beaconing episode, at the moment it ends. Replaces a bare
+ * "Stop beaconing (acked)" that said nothing about how much air the episode
+ * cost or who ended it.
+ *
+ * Every value has to be CAPTURED BEFORE the stop, because
+ * MESHNETWORK_bStopBeaconingLocked zeroes u8NodeBeaconSeq and calls
+ * BEST_vReset() - so by the time we are outside the lock and able to log, the
+ * beacon count and the trigger reading are already gone. Hence the parameter
+ * list rather than reading the statics here.
+ *
+ * Reasons: ACKED-BY (a D-Ack listed us - u16By is the primary that sent it, and
+ * on a two-primary herd that is the observable for the cross-primary ack),
+ * CAMPAIGN-END (the window closed with us never acked), REANCHOR (a newer dreq
+ * from the same primary replaced the episode mid-flight). */
+static void MESHNETWORK_vLogBeaconEpisodeEnd(const char *pcReason, uint16_t u16By,
+                                             uint32_t u32Dreq, uint8_t u8Beacons,
+                                             int16_t i16TrigRssi, uint16_t u16TrigSrc)
+{
+    /* interval(n-1) is the gap this episode had reached; interval(0) if it only
+     * ever sent the immediate first beacon. */
+    uint32_t u32LastIv = MESHNETWORK_u32BeaconIntervalMs(
+                             (u8Beacons > 0U) ? (uint8_t)(u8Beacons - 1U) : 0U);
+
+    if (u16By != 0U)
+        DBG_LOG("MeshNetwork: beacon episode end dreq=%08X reason=%s-%04X beacons=%u lastInterval=%lu trigRssi=%d trigSrc=%04X\r\n",
+                (unsigned)u32Dreq, pcReason, (unsigned)u16By, (unsigned)u8Beacons,
+                (unsigned long)u32LastIv, (int)i16TrigRssi, (unsigned)u16TrigSrc);
+    else
+        DBG_LOG("MeshNetwork: beacon episode end dreq=%08X reason=%s beacons=%u lastInterval=%lu trigRssi=%d trigSrc=%04X\r\n",
+                (unsigned)u32Dreq, pcReason, (unsigned)u8Beacons,
+                (unsigned long)u32LastIv, (int)i16TrigRssi, (unsigned)u16TrigSrc);
+}
+
+/* I1: stop on a D-Ack that lists this node, whichever primary sent it and
+ * whatever wave its dreq id belongs to.
+ *
+ * The wave part was the original fix: the primary generates a new dreq per wave,
+ * so an exact-dreq match left a wave-1 beaconer that was acked during wave 2
+ * beaconing on to its cap.
+ *
+ * The PRIMARY part is new. This used to require (dreq >> 16), the acking
+ * primary's 16-bit id, to equal the origin of the dreq this node anchored to -
+ * described at the time as "multi-primary safe". It was the opposite. Both
+ * primaries in a herd wake on the same UTC slot (u64Slot = u64Utc / interval),
+ * so two simultaneous campaigns is the normal case, and a secondary answers
+ * whichever DReq reached it first and then refuses to re-anchor to the other.
+ * Meanwhile the OTHER primary hears that node's beacons and records them -
+ * nothing on the beacon-to-table path is origin-gated - and then acks it under
+ * its own dreq, which the node discarded. Net effect: the node kept beaconing
+ * at a primary that already had it, and that primary carried a table row it
+ * could never silence, for the whole campaign, every campaign.
+ *
+ * Since the two primaries' uploads are merged downstream, being recorded by
+ * either one is the outcome we want, so the ack means what it says - "you have
+ * been recorded, stop transmitting" - regardless of who sent it. A node in
+ * earshot of two primaries now goes quiet on the first ack from either.
+ *
+ * The late-ack branch below keeps its origin comparison: that path only decides
+ * whether to log and whether to suppress a re-arm for the primary this node was
+ * actually talking to, and widening it would claim an ack we cannot attribute. */
 static void MESHNETWORK_vStopBeaconingByOrigin(uint32_t u32DreqId)
 {
-    bool bDoStop  = false;
-    bool bLateAck = false;
+    bool     bDoStop  = false;
+    bool     bLateAck = false;
+    uint32_t u32Dreq  = 0U;
+    uint8_t  u8Beacons = 0U;
+    int16_t  i16Rssi  = 0;
+    uint16_t u16Src   = 0U;
     if (osMutexAcquire(xRoleMutex, 100) == osOK)
     {
-        if (bNodeBeaconing &&
-            (u32NodeBeaconDreqId >> 16) == (u32DreqId >> 16))
+        if (bNodeBeaconing)
         {
+            /* Snapshot for the log line before the stop wipes them. */
+            u32Dreq   = u32NodeBeaconDreqId;
+            u8Beacons = u8NodeBeaconSeq;
+            BEST_vGet(&i16Rssi, &u16Src);
             bNodeAckedThisCampaign = true;
             bDoStop = MESHNETWORK_bStopBeaconingLocked(u32NodeBeaconDreqId);
         }
         else if (!bNodeBeaconing && u32LastBeaconDreqId != 0U &&
                  (u32LastBeaconDreqId >> 16) == (u32DreqId >> 16))
         {
-            /* Ack from the primary we beaconed to, arriving after we already
-             * hit the beacon cap. Congestion is exactly what both delays acks
-             * and burns the beacon budget, so this is the likely case rather
-             * than a rare one — and it used to be dropped on the floor,
+            /* Ack from the primary we beaconed to, arriving after this node
+             * had already stopped (its window closed, or it re-anchored).
+             * Congestion is exactly what delays acks, so this is a likely case
+             * rather than a rare one — and it used to be dropped on the floor,
              * leaving the node convinced it was never heard. It WAS heard:
-             * record that so the next wave doesn't re-beacon for nothing. */
+             * record that so the next wave doesn't re-beacon for nothing.
+             * ("beacon cap" in the old wording here referred to a per-campaign
+             * beacon count that no longer exists — see MeshNetwork.h.) */
             bNodeAckedThisCampaign = true;
             bLateAck               = true;
         }
@@ -2247,11 +2411,16 @@ static void MESHNETWORK_vStopBeaconingByOrigin(uint32_t u32DreqId)
     if (bDoStop)
     {
         osTimerStop(xBeaconTimer);
-        DBG_LOG("MeshNetwork: Stop beaconing (acked), become forwarder\r\n");
+        /* Which primary silenced us is the whole observable for the
+         * cross-primary ack above: on a two-primary herd this shows whether a
+         * node was stopped by the one it answered or by the other one. */
+        MESHNETWORK_vLogBeaconEpisodeEnd("ACKED-BY", (uint16_t)(u32DreqId >> 16),
+                                         u32Dreq, u8Beacons, i16Rssi, u16Src);
     }
     else if (bLateAck)
     {
-        DBG_LOG("MeshNetwork: Late D-Ack after beacon cap - counted, no re-arm\r\n");
+        DBG_LOG("MeshNetwork: Late D-Ack from %04X - counted, no re-arm\r\n",
+                (unsigned)(u32DreqId >> 16));
     }
 }
 
@@ -2259,26 +2428,56 @@ static void MESHNETWORK_vStopBeaconingByOrigin(uint32_t u32DreqId)
  * secondary — the caller doesn't know the node's internal beacon dreq). */
 void MESHNETWORK_vStopBeaconingSelf(void)
 {
-    bool bDoStop = false;
+    bool     bDoStop   = false;
+    uint32_t u32Dreq   = 0U;
+    uint8_t  u8Beacons = 0U;
+    int16_t  i16Rssi   = 0;
+    uint16_t u16Src    = 0U;
     if (osMutexAcquire(xRoleMutex, 100) == osOK)
     {
+        /* Snapshot before the stop clears them - see
+         * MESHNETWORK_vLogBeaconEpisodeEnd. */
+        u32Dreq   = u32NodeBeaconDreqId;
+        u8Beacons = u8NodeBeaconSeq;
+        BEST_vGet(&i16Rssi, &u16Src);
         bDoStop = MESHNETWORK_bStopBeaconingLocked(u32NodeBeaconDreqId);
         osMutexRelease(xRoleMutex);
     }
     if (bDoStop)
     {
         osTimerStop(xBeaconTimer);
-        DBG_LOG("MeshNetwork: Stop beaconing (campaign end), become forwarder\r\n");
+        /* This is the un-acked outcome: the window closed and nobody ever
+         * silenced us. beacons= is then the whole airtime this node spent
+         * unheard, which is the number worth watching at herd scale. */
+        MESHNETWORK_vLogBeaconEpisodeEnd("CAMPAIGN-END", 0U,
+                                         u32Dreq, u8Beacons, i16Rssi, u16Src);
     }
 }
 
 static void MESHNETWORK_vStartBeaconing(uint32_t u32DreqId, uint8_t u8HopCount)
 {
-    bool bDoStart = false;
+    bool     bDoStart      = false;
+    bool     bReanchored   = false;
+    uint32_t u32PrevDreq   = 0U;
+    uint8_t  u8PrevBeacons = 0U;
+    int16_t  i16PrevRssi   = 0;
+    uint16_t u16PrevSrc    = 0U;
     if (osMutexAcquire(xRoleMutex, 100) == osOK)
     {
         if (!(bNodeBeaconing && u32NodeBeaconDreqId == u32DreqId))
         {
+            /* Replacing an episode that was still running (a newer wave from
+             * the same primary). That ended an episode without any stop path,
+             * so it used to leave no trace at all - and it is the one case
+             * where the backoff is deliberately thrown away, so it is worth
+             * being able to count. */
+            if (bNodeBeaconing)
+            {
+                bReanchored     = true;
+                u32PrevDreq     = u32NodeBeaconDreqId;
+                u8PrevBeacons   = u8NodeBeaconSeq;
+                BEST_vGet(&i16PrevRssi, &u16PrevSrc);
+            }
             bNodeBeaconing         = true;
             u32NodeBeaconDreqId    = u32DreqId;
             u8NodeHopCount         = u8HopCount;
@@ -2295,6 +2494,10 @@ static void MESHNETWORK_vStartBeaconing(uint32_t u32DreqId, uint8_t u8HopCount)
         }
         osMutexRelease(xRoleMutex);
     }
+    if (bReanchored)
+        MESHNETWORK_vLogBeaconEpisodeEnd("REANCHOR", 0U, u32PrevDreq,
+                                         u8PrevBeacons, i16PrevRssi, u16PrevSrc);
+
     if (bDoStart)
     {
         /* Periodic retries at interval(0); MESHNETWORK_vArmBeaconTimer takes
@@ -2354,11 +2557,80 @@ bool MESHNETWORK_bHasUnackedNeighbors(void)
     {
         for (uint16_t i = 0; i < u16NeighborCount; i++)
         {
-            if (!tNeighborTable[i].bAcked) { bAny = true; break; }
+            /* Un-acked AND still inside its try budget. Without the second
+             * test a node whose acks can never reach it holds every wave open
+             * for the full MESH_DISCOVERY_UNACKED_HOLD_MS, forever - see
+             * MESH_ACK_TRIES_MAX. */
+            if (!tNeighborTable[i].bAcked &&
+                tNeighborTable[i].u8AckTries < MESH_ACK_TRIES_MAX)
+            {
+                bAny = true;
+                break;
+            }
         }
         osMutexRelease(xNeighborTableMutex);
     }
     return bAny;
+}
+
+uint16_t MESHNETWORK_u16GetBeaconsHeard(void) { return u16StatBeaconsHeard; }
+
+uint16_t MESHNETWORK_u16GetUnackedCount(void)
+{
+    uint16_t u16Count = 0U;
+    if (osMutexAcquire(xNeighborTableMutex, 100) == osOK)
+    {
+        for (uint16_t i = 0; i < u16NeighborCount; i++)
+            if (!tNeighborTable[i].bAcked) u16Count++;
+        osMutexRelease(xNeighborTableMutex);
+    }
+    return u16Count;
+}
+
+void MESHNETWORK_vLogUnackedNeighbors(void)
+{
+    /* Formats into one line rather than one line per node: at 30-50 nodes a
+     * line each would swamp the campaign narrative, and the interesting case
+     * is a SHORT list. Truncates rather than overrunning - if the roster is
+     * long enough to truncate, the count in the header is the real signal. */
+    char     acLine[160];
+    unsigned uLen  = 0U;
+    uint16_t u16N  = 0U;
+    bool     bTrunc = false;
+
+    if (osMutexAcquire(xNeighborTableMutex, 100) != osOK) return;
+    for (uint16_t i = 0; i < u16NeighborCount; i++)
+    {
+        if (tNeighborTable[i].bAcked) continue;
+        u16N++;
+        int iW = snprintf(&acLine[uLen], sizeof(acLine) - uLen, "%04X(t=%u) ",
+                          (unsigned)tNeighborTable[i].u32DeviceId,
+                          (unsigned)tNeighborTable[i].u8AckTries);
+        if (iW <= 0 || (unsigned)iW >= (sizeof(acLine) - uLen)) { bTrunc = true; break; }
+        uLen += (unsigned)iW;
+    }
+    osMutexRelease(xNeighborTableMutex);
+
+    if (u16N == 0U)
+    {
+        DBG_LOG("MeshNetwork: unacked at end: none\r\n");
+        return;
+    }
+    acLine[uLen] = '\0';
+    DBG_LOG("MeshNetwork: unacked at end: %u of %u: %s%s\r\n",
+            (unsigned)u16N, (unsigned)u16NeighborCount, acLine,
+            bTrunc ? "..." : "");
+}
+
+uint16_t MESHNETWORK_u16GetNeighborCount(void)
+{
+    uint16_t u16Count = 0U;
+    if (osMutexAcquire(xNeighborTableMutex, 100) == osOK)
+    {
+        u16Count = u16NeighborCount;
+        osMutexRelease(xNeighborTableMutex);
+    }
+    return u16Count;
 }
 
 uint8_t MESHNETWORK_u8GetMaxDiscoveredWave(void)
@@ -2441,6 +2713,13 @@ void MESHNETWORK_vResetNodeRole(void)
         u8DreqSeenHead  = 0U;
         u8DreqSeenCount = 0U;
         u16DreqFwdCnt   = 0U;   /* forward budgets are per-campaign too */
+        /* And the beacon/ack ring, which until now was only ever cleared at
+         * MESHNETWORK_vInit. Ids do not repeat across campaigns (the counter
+         * only increments), so stale entries could not cause a false "seen" -
+         * they just occupied slots that this campaign's traffic needs, which
+         * is exactly the resource the fold above went to some trouble to buy. */
+        tForwardRing.u8Head  = 0U;
+        tForwardRing.u8Count = 0U;
         osMutexRelease(xForwardRingMutex);
     }
 
@@ -2544,6 +2823,7 @@ void MESHNETWORK_vResetDreqWaveCnt(void)
     u16StatAcksHeard      = 0U;
     u16StatMsgsForwarded  = 0U;
     u16StatTxDropped      = 0U;
+    DIAG_RESET();
 }
 
 /* One-line campaign traffic summary in place of a DBG_LOG per packet —
@@ -2555,13 +2835,27 @@ void MESHNETWORK_vLogCampaignStats(const char *pcTag)
     /* cadTmo: CAD attempts that timed out this campaign — the congestion
      * indicator that used to be one DBG_LOG line per occurrence. Read-and-
      * clear, so each campaign reports only its own. */
-    DBG_LOG("MeshNetwork: %s stats - DReq heard=%u beacons heard=%u acks heard=%u forwarded=%u cadTmo=%u txDrop=%u\r\n",
+    /* dreqHeard/jitterMax record the density signal and the TX jitter window it
+     * produced, so the field logs show whether MESH_TX_JITTER_BUSY_MS actually
+     * widened at scale instead of leaving it to be inferred. */
+    DBG_LOG("MeshNetwork: %s stats - DReq heard=%u beacons heard=%u acks heard=%u forwarded=%u cadTmo=%u txDrop=%u jitterMax=%lu\r\n",
             pcTag, (unsigned)u16StatDReqHeard, (unsigned)u16StatBeaconsHeard,
             (unsigned)u16StatAcksHeard, (unsigned)u16StatMsgsForwarded,
             (unsigned)LORARADIO_u16GetAndClearCadTimeouts(),
             /* Both layers' discards in one figure: mesh-queue drops/flushes
              * plus the radio layer's aged-out and flushed packets. */
-            (unsigned)(u16StatTxDropped + LORARADIO_u16GetAndClearTxStaleDrops()));
+            (unsigned)(u16StatTxDropped + LORARADIO_u16GetAndClearTxStaleDrops()),
+            (unsigned long)MESHNETWORK_u32GetTxJitterCeilingMs());
+
+#ifdef MESH_DIAG_COUNTERS
+    /* Second line rather than a longer first one: the production line is
+     * already at the width a flash-log record wants to be, and these are a
+     * field-test extra that a production log will never carry. */
+    DBG_LOG("MeshNetwork: %s diag - fwdBeacon=%u fwdDreq=%u fwdAck=%u fwdTs=%u dedupeHit=%u bpSkipBeacon=%u\r\n",
+            pcTag, (unsigned)u16DiagFwdBeacon, (unsigned)u16DiagFwdDreq,
+            (unsigned)u16DiagFwdAck, (unsigned)u16DiagFwdTs,
+            (unsigned)u16DiagDedupeHit, (unsigned)u16DiagBpSkipBeacon);
+#endif
 }
 
 /* Small OTA responses (PrepAck/Report) ride the normal jittered mesh TX

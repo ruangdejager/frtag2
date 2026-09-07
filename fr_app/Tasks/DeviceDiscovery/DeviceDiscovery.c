@@ -272,6 +272,24 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             bool     bPrevWaveBarren    = false;
             uint32_t u32CampaignStart   = osKernelGetTickCount();
             DBG_LOG("DeviceDiscovery: Primary starting discovery campaign\r\n");
+            /* The constants that shaped this campaign, recorded once so a
+             * downloaded log can be tied to the build that produced it. Every
+             * number below has been retuned at least once during this work;
+             * without them a campaign's timings cannot be checked against the
+             * rules that were meant to be in force. */
+            DBG_LOG("DeviceDiscovery: campaign cfg v%u.%u.%u waves=%u..%u floor=%u+%u/ring cap=%u idle=%u hold=%u deadline=%u ack=%u/%u jitter=%u..%u\r\n",
+                (unsigned)VERSION_SW_MAJOR, (unsigned)VERSION_SW_MINOR,
+                (unsigned)VERSION_SW_PATCH,
+                (unsigned)APP_PRIMARY_MIN_WAVES, (unsigned)APP_PRIMARY_MAX_WAVES,
+                (unsigned)MESH_DISCOVERY_MIN_WAVE_MS,
+                (unsigned)MESH_DISCOVERY_WAVE_ALLOWANCE_MS,
+                (unsigned)MESH_DISCOVERY_MIN_WAVE_CAP_MS,
+                (unsigned)MESH_DISCOVERY_IDLE_MS,
+                (unsigned)MESH_DISCOVERY_UNACKED_HOLD_MS,
+                (unsigned)APP_PRIMARY_CAMPAIGN_MAX_MS,
+                (unsigned)MESH_PRIMARY_ACK_INTERVAL_MS,
+                (unsigned)MESH_MAX_ACK_IDS_PER_PACKET,
+                (unsigned)MESH_TX_JITTER_MAX_MS, (unsigned)MESH_TX_JITTER_BUSY_MS);
 
             while (!bDiscoveryFinished)
             {
@@ -304,6 +322,22 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
                 uint32_t tLastBeaconTick = MESHNETWORK_u32GetLastBeaconHeardTick();
                 uint32_t u32WaveStart    = osKernelGetTickCount();
+                /* "Is this wave still finding anyone?" - the signal the
+                 * wave-end test below needs, and the one beacon silence stops
+                 * being a proxy for as the herd grows. Tracked on the stack, so
+                 * no new statics. */
+                uint16_t u16PrevCount    = MESHNETWORK_u16GetNeighborCount();
+                uint32_t u32LastNewTick  = u32WaveStart;
+                /* Wave-start baselines for the per-wave log line below. */
+                uint16_t u16WaveUnion0   = u16PrevCount;
+                uint16_t u16WaveBeacons0 = MESHNETWORK_u16GetBeaconsHeard();
+                /* Which rule ended this wave. Recorded at the break rather than
+                 * inferred afterwards - telling QUIET from STALE, or either
+                 * from the hold expiring, is not recoverable from timestamps,
+                 * and it was the thing most missing when reviewing the last
+                 * set of field logs. */
+                const char *pcWaveEnd    = "?";
+                uint32_t u32WaveFloorAtEnd = 0U;
 
                 for (;;)
                 {
@@ -319,6 +353,13 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                     }
 
                     uint32_t u32WaveMs = tNow - u32WaveStart;
+
+                    uint16_t u16NowCount = MESHNETWORK_u16GetNeighborCount();
+                    if (u16NowCount != u16PrevCount)
+                    {
+                        u16PrevCount   = u16NowCount;
+                        u32LastNewTick = tNow;
+                    }
 
                     /* The campaign deadline is the ONE hard stop, and it is
                      * checked here rather than only between waves because a
@@ -338,6 +379,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                     if ((tNow - u32CampaignStart) >= APP_PRIMARY_CAMPAIGN_MAX_MS)
                     {
                         bDeadlineHit = true;
+                        pcWaveEnd    = "DEADLINE";
                         break;
                     }
 
@@ -380,23 +422,55 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                      * the beacon cadence back off (MESH_BEACON_BASE_MS) past
                      * any idle value we could afford.
                      *
-                     * Of the three, only the un-acked hold can run forever
-                     * (bAcked is cleared on every re-beacon, so a node whose
-                     * acks never reach it re-arms the condition indefinitely),
-                     * so it alone is time-boxed - by
-                     * MESH_DISCOVERY_UNACKED_HOLD_MS, not by a ceiling on the
-                     * whole wave. The QUIET term is deliberately left
-                     * un-boxed: while beacons for this wave are still arriving
-                     * the wave does not end, full stop, because the next DReq
-                     * on top of a herd mid-cadence costs far more than the wait
-                     * (see MESH_DISCOVERY_UNACKED_HOLD_MS). The campaign
-                     * deadline above is what bounds that case. */
-                    bool bQuiet       = (tNow - tLastBeaconTick) > MESH_DISCOVERY_IDLE_MS;
-                    bool bUnackedHold = MESHNETWORK_bHasUnackedNeighbors() &&
+                     * Of the three, the un-acked hold is time-boxed by
+                     * MESH_DISCOVERY_UNACKED_HOLD_MS and per-node by
+                     * MESH_ACK_TRIES_MAX, because bAcked is cleared on every
+                     * re-beacon and a node whose acks never reach it would
+                     * otherwise re-arm the condition indefinitely.
+                     *
+                     * STALE is the other half, and it is what makes "do not cut
+                     * off a wave that is still being answered" hold at herd
+                     * scale. Beacon silence is a fine proxy for "the herd has
+                     * finished" at nine nodes; at thirty to fifty it is not,
+                     * because re-beacons from nodes already in the table arrive
+                     * indefinitely and the air never goes quiet for a full
+                     * MESH_DISCOVERY_IDLE_MS. On silence alone a single wave
+                     * would then run to the campaign deadline and starve every
+                     * later wave, so the frontier would never advance - worse
+                     * than the flat ceiling this replaced.
+                     *
+                     * So the wave ends on whichever comes first: the air going
+                     * quiet, or the wave going a whole listen floor without
+                     * turning up a node the table did not already have. The
+                     * floor is the right span to wait because it is already the
+                     * measured round trip to the next ring out - if nothing new
+                     * has answered in that long, the ring behind the last find
+                     * is not answering either. A late deep beacon resets the
+                     * clock and the wave carries on, which is the case that
+                     * matters; noise from known nodes does not. */
+                    bool bQuiet    = (tNow - tLastBeaconTick) > MESH_DISCOVERY_IDLE_MS;
+                    bool bStale    = (tNow - u32LastNewTick)  >= u32WaveFloorMs;
+                    bool bUnacked     = MESHNETWORK_bHasUnackedNeighbors();
+                    bool bUnackedHold = bUnacked &&
                                         (u32WaveMs < MESH_DISCOVERY_UNACKED_HOLD_MS);
 
-                    if (u32WaveMs >= u32WaveFloorMs && bQuiet && !bUnackedHold)
+                    if (u32WaveMs >= u32WaveFloorMs && !bUnackedHold &&
+                        (bQuiet || bStale))
+                    {
+                        /* QUIET: the air actually went silent. STALE: still
+                         * busy, but a whole floor passed with nothing the table
+                         * did not already have. At herd scale expect STALE to
+                         * dominate; at nine nodes it should almost never
+                         * appear, and if it does, something regressed. */
+                        /* Still un-acked rows here means the only reason we
+                         * got past the gate is that the hold timed out - which
+                         * is a different story from the herd having finished,
+                         * so it gets its own name. */
+                        pcWaveEnd = bUnacked ? "HOLD-EXPIRED"
+                                             : (bQuiet ? "QUIET" : "STALE");
+                        u32WaveFloorAtEnd = u32WaveFloorMs;
                         break;
+                    }
 
                     /* Radio test entered mid-campaign. Bail out rather than
                      * run the waves out: MESHNETWORK_bSendPacket returns false
@@ -406,7 +480,29 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                      * followed by a logger session that fights the test for the
                      * same Farmranger link and PA0 line. */
                     if (RADIOTESTMODE_bActive())
+                    {
+                        pcWaveEnd = "RADIOTEST";
                         break;
+                    }
+                }
+
+                /* One line per wave. end= is the rule that fired; new= is how
+                 * many nodes this wave actually added, which is the only
+                 * measure of whether a wave earned its airtime. WAVECAP and
+                 * BARREN are deliberately absent: those end the CAMPAIGN, not
+                 * the wave, and are logged by the branches below. */
+                {
+                    uint16_t u16UnionNow = MESHNETWORK_u16GetNeighborCount();
+                    DBG_LOG("DeviceDiscovery: wave %u/%u dreq=%08X floor=%lu dur=%lu end=%s beacons=%u new=%u union=%u unacked=%u\r\n",
+                        (unsigned)u8WaveCount, (unsigned)APP_PRIMARY_MAX_WAVES,
+                        (unsigned)u32DreqId,
+                        (unsigned long)u32WaveFloorAtEnd,
+                        (unsigned long)(osKernelGetTickCount() - u32WaveStart),
+                        pcWaveEnd,
+                        (unsigned)(MESHNETWORK_u16GetBeaconsHeard() - u16WaveBeacons0),
+                        (unsigned)(u16UnionNow - u16WaveUnion0),
+                        (unsigned)u16UnionNow,
+                        (unsigned)MESHNETWORK_u16GetUnackedCount());
                 }
 
                 if (RADIOTESTMODE_bActive())
@@ -621,6 +717,13 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         LORARADIO_vFlushTxQueue();
 
         MESHNETWORK_vLogCampaignStats("campaign");
+        /* Primary only: who this campaign heard but never managed to silence,
+         * with each one's ack-try count. A short or empty roster is the goal;
+         * a long one with tries=MESH_ACK_TRIES_MAX says the acks are not
+         * reaching those nodes, and a long one with tries=0 says ack
+         * throughput ran out before the campaign did. */
+        if (eDeviceRole == DEVICE_ROLE_PRIMARY)
+            MESHNETWORK_vLogUnackedNeighbors();
         EVTLOG(LOG_DISCOVERY_CMPLT, eDeviceRole);
 
         if (eDeviceRole == DEVICE_ROLE_PRIMARY &&
