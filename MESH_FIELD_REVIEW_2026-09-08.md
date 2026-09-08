@@ -182,3 +182,45 @@ that wave's DReq: `wave %u dreq=%08X newnode=%X off=%lu floor=%lu hops=%u rssi=%
 settles it and costs no `.bss` (all stack). Then build the histogram of `off` per wave index. If no
 new node ever arrives past 16 s, the 4000 step catches nothing. **Run it with the floor left wide**,
 or the observation window is the one being tested rather than the one being defended.
+
+## 10. Confirmed defect: the primary's TX-jitter density signal counts its own echoes
+
+Verified in source at HEAD, 2026-09-08.
+
+`MESHNETWORK_u32GetTxJitterCeilingMs()` (`MeshNetwork.c:902-907`) computes
+
+    ceiling = min(MESH_TX_JITTER_MAX_MS + u16StatDReqHeard * MESH_TX_JITTER_STEP_MS,
+                  MESH_TX_JITTER_BUSY_MS)
+            = min(1500 + 60 * DReqHeard, 4000)   ms
+
+so it saturates at `DReqHeard = 42`.
+
+`u16StatDReqHeard++` sits at `MeshNetwork.c:1259`, which is **above** the self-origin guard
+`if (u32OriginId == LORARADIO_u32GetUniqueId()) return;` at `MeshNetwork.c:1265`. So a primary counts
+its **own** DReqs, echoed back by every relaying node, into its own density signal. For a primary,
+essentially every DReq it hears is its own or the other primary's — measured `DReq heard` on the field
+primary runs to a maximum of **44 per campaign** (avg 11.9), i.e. past the saturation point.
+
+Consequence: the primary drives its jitter ceiling from 1500 ms toward the full 4000 ms on its own
+transmissions, regardless of real herd density. That is the opposite of the stated intent — a density
+signal reflecting "traffic on the air around us". `MESH_PRIMARY_ACK_INTERVAL_MS` is 4000 ms, so a
+saturated jitter window becomes comparable to the entire ack interval, adding up to ~2.5 s of mean
+delay to each D-Ack and potentially bunching them. Delaying the primary's acks prolongs precisely the
+beaconing the jitter exists to de-conflict, since an ack is what stops a tag beaconing.
+
+On a **secondary** the signal is legitimate — a secondary never originates a DReq, so the self-origin
+guard never fires for it and the count is genuine foreign traffic.
+
+**Not yet seen in the field.** The density scaling is a 2.3.6 change; the field primary logged here ran
+2.3.3 with a fixed 1500 ms window, and the deployed units are on 2.3.4. Flashing v2.3.5 introduces
+this behaviour to the field for the first time, so it is a pre-FOTA question, not a post-mortem.
+
+Candidate fix, one line: move the `u16StatDReqHeard++` below the self-origin guard. That also corrects
+the `campaign stats` diagnostic, which today reports a primary's own echoes as "DReq heard" — the
+`DReq heard=44` lines are not measuring what they appear to. It still counts the other primary's
+DReqs, which is real density information. Not applied: unreviewed, and the field-test build is frozen.
+
+Related and unresolved: the "non-overlapping window" claims for DReq copy 2 at `MeshNetwork.c:2236-2242`,
+`MeshNetwork.c:965-968` and `MeshNetwork.h:324` assume the copy-1 jitter window and the copy-2 window
+do not overlap. With the ceiling widening to 4000 ms that assumption needs re-checking against
+`MESH_DREQ_FWD2` — unverified.
