@@ -38,7 +38,7 @@
  *
  * Enabling this costs ~8 B of .bss, which does not fit alongside
  * MESH_MAX_NEIGHBORS at 120 - see there. */
-// #define MESH_DIAG_COUNTERS
+#define MESH_DIAG_COUNTERS
 
 /* ---- Timing constants ---- */
 /* Beacon retry cadence while awaiting a D-Ack. Was one fixed 3500 ms period.

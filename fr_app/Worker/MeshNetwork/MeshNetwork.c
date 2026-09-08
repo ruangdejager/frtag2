@@ -626,6 +626,8 @@ static bool DREQ_bClaimForward(uint32_t u32DreqId, uint8_t *pu8Ordinal)
  * this way. */
 static void NEIGHBOR_vAddOrUpdate(const MeshPktDBeacon_t *ptBeacon)
 {
+    bool bTableFullDrop = false;
+
     if (osMutexAcquire(xNeighborTableMutex, 100) == osOK)
     {
         for (uint16_t i = 0; i < u16NeighborCount; i++)
@@ -678,7 +680,27 @@ static void NEIGHBOR_vAddOrUpdate(const MeshPktDBeacon_t *ptBeacon)
             u16NeighborCount++;
             tLastBeaconHeardTick = osKernelGetTickCount();
         }
+        else
+        {
+            /* Table full: this beacon is dropped and the node is left out of
+             * the union with no other trace. The MESH_MAX_NEIGHBORS comment
+             * says a herd larger than the table "has to be rethought rather
+             * than quietly truncating the union" — without this flag the
+             * truncation was exactly as quiet as a node that never answered,
+             * which is the one reading that would send us hunting the radio
+             * instead of the table size. Matters most on a MESH_DIAG_COUNTERS
+             * build, where the table is 64 rather than 120. */
+            bTableFullDrop = true;
+        }
         osMutexRelease(xNeighborTableMutex);
+
+        /* Logged outside the mutex on purpose: DBG_LOG can block on the UART
+         * or the flash log, and the neighbour mutex is taken on the receive
+         * path for every beacon the campaign hears. */
+        if (bTableFullDrop)
+            DBG_LOG("MeshNetwork: neighbour table FULL (%u) - node %04X dropped from union\r\n",
+                    (unsigned)MESH_MAX_NEIGHBORS,
+                    (unsigned)(ptBeacon->u32DeviceId & 0xFFFFU));
     }
 }
 
@@ -1876,6 +1898,40 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
         return;
     }
 
+    /* Firmware arming is evaluated on EVERY TimeSync that gets this far, not
+     * only the one that sets the clock.
+     *
+     * A tag does not belong to a primary: both primaries wake on the same UTC
+     * slot and each announces whatever image IT has staged. Only one of them
+     * may be holding the new image. While this check lived inside the
+     * "first TimeSync this wake" branch below, a tag that happened to hear the
+     * primary WITHOUT the image first latched bTimeSyncAcceptedThisWake and
+     * then never looked at the other primary's staged version at all - the
+     * announcement it needed arrived and was discarded unread. Re-arming on a
+     * later campaign made that self-healing rather than fatal, but it roughly
+     * halved the arming chances on a two-primary herd, and a tag whose nearer
+     * primary is consistently the imageless one could wait a long time.
+     *
+     * Placed here deliberately: below the UTC dedup (so a repeat of the same
+     * TimeSync cannot re-run it) and below the primary-role guard (primaries
+     * never arm), but ABOVE the once-per-wake gate, because arming is about
+     * "does a newer image exist anywhere" while the clock is about "who told me
+     * the time first". Those are different questions and only one of them wants
+     * to be answered once.
+     *
+     * Idempotent and cheap: FOTA_bAcceptanceArmed() already short-circuits a
+     * second call, and the strict > means an equal or older announcement does
+     * nothing. Nothing here touches the clock, the interval, the mode or the
+     * forward path. */
+#ifdef STORAGE_BACKEND_FLASH
+    if (u32StagedVer > VERSION_u32Get() && !FOTA_bAcceptanceArmed())
+    {
+        DBG_LOG("MeshNetwork: TimeSync offers newer fw v%lu (running v%lu) - auto-arming acceptance\r\n",
+                (unsigned long)u32StagedVer, (unsigned long)VERSION_u32Get());
+        FOTA_vArmAcceptance();
+    }
+#endif
+
     /* Secondary: accept only the first TimeSync this wake cycle.
      * Subsequent TimeSyncs are still forwarded (the mesh keeps
      * propagating during the few seconds the node stays awake) but
@@ -1893,22 +1949,12 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
                 (eMode == DISCOVERY_MODE_BASIC) ? "basic" : "advanced",
                 (unsigned)bGpsEnabled);
 
-#ifdef STORAGE_BACKEND_FLASH
-        /* Auto-arm firmware acceptance straight off the version the
-         * primary just announced — no "tag <ID> fwaccept" needed. Each
-         * campaign re-evaluates this, so a secondary that missed the
-         * actual distribution wake (asleep, out of range, etc.) simply
-         * re-arms on the next TimeSync it hears until it catches up.
-         * Flash-backend only: Fota's OTA storage lives on ext-NOR, which
-         * a MicroSD-backend build doesn't have. */
-        if (u32StagedVer > VERSION_u32Get() && !FOTA_bAcceptanceArmed())
-        {
-            DBG_LOG("MeshNetwork: TimeSync offers newer fw v%lu (running v%lu) - auto-arming acceptance\r\n",
-                    (unsigned long)u32StagedVer, (unsigned long)VERSION_u32Get());
-            FOTA_vArmAcceptance();
-        }
-#endif
-
+        /* Auto-arming firmware acceptance used to live here. It is now done
+         * above, before the once-per-wake gate, so the OTHER primary's
+         * announcement is not discarded unread on a two-primary herd - see
+         * there. Each campaign still re-evaluates it, so a secondary that
+         * missed a distribution wake (asleep, out of range) keeps re-arming on
+         * whatever TimeSync it next hears until it catches up. */
         osThreadId_t xAppTask = DEVICE_DISCOVERY_xGetTaskHandle();
         if (xAppTask != NULL)
             osThreadFlagsSet(xAppTask, DEVICE_DISCOVERY_NOTIFY_TIMESYNC);

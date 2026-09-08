@@ -486,24 +486,59 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                     }
                 }
 
+                const uint16_t u16UnionNow = MESHNETWORK_u16GetNeighborCount();
+
+                /* "Barren" now means this wave added no node the table did not
+                 * already have — not "no beacon was heard".
+                 *
+                 * bBeaconSeenThisWave keys off MESHNETWORK_u32GetLastBeaconHeard
+                 * Tick, and that tick is stamped on a beacon that DEDUPES OUT
+                 * (MeshNetwork.c, inside the FORWARD_bHasSeen early return) as
+                 * well as on a real table insert. So a duplicate relayed copy of
+                 * an already-counted beacon — the exact traffic the beacon-relay
+                 * bound exists to limit, and which rises with herd size — used to
+                 * reset the barren run and keep the campaign extending.
+                 *
+                 * Note what is NOT wrong with the old signal: hearing a beacon
+                 * that another primary's DReq solicited. A tag does not answer a
+                 * specific primary — any primary's DReq starts it beaconing, any
+                 * primary records and acks whatever it hears, and the per-primary
+                 * unions are merged server-side. So a beacon this primary had not
+                 * yet recorded is a real find no matter who asked for it, and the
+                 * union count treats it as one. It is only the DUPLICATE that was
+                 * being miscounted. The union count is also per-primary by
+                 * construction, since it is this primary's own table.
+                 *
+                 * The union count is the honest signal and costs nothing: it is
+                 * only ever incremented on a real insert, under the same mutex
+                 * that stamps the tick, so a wave that added no row genuinely
+                 * discovered nobody. Un-acked nodes are NOT affected by this —
+                 * they hold the WAVE open via bUnackedHold above, which runs
+                 * before any of this, so a node still awaiting its ack cannot be
+                 * cut short by a barren campaign end. */
+                const bool bNoNewThisWave = (u16UnionNow == u16WaveUnion0);
+
                 /* One line per wave. end= is the rule that fired; new= is how
                  * many nodes this wave actually added, which is the only
-                 * measure of whether a wave earned its airtime. WAVECAP and
-                 * BARREN are deliberately absent: those end the CAMPAIGN, not
-                 * the wave, and are logged by the branches below. */
-                {
-                    uint16_t u16UnionNow = MESHNETWORK_u16GetNeighborCount();
-                    DBG_LOG("DeviceDiscovery: wave %u/%u dreq=%08X floor=%lu dur=%lu end=%s beacons=%u new=%u union=%u unacked=%u\r\n",
-                        (unsigned)u8WaveCount, (unsigned)APP_PRIMARY_MAX_WAVES,
-                        (unsigned)u32DreqId,
-                        (unsigned long)u32WaveFloorAtEnd,
-                        (unsigned long)(osKernelGetTickCount() - u32WaveStart),
-                        pcWaveEnd,
-                        (unsigned)(MESHNETWORK_u16GetBeaconsHeard() - u16WaveBeacons0),
-                        (unsigned)(u16UnionNow - u16WaveUnion0),
-                        (unsigned)u16UnionNow,
-                        (unsigned)MESHNETWORK_u16GetUnackedCount());
-                }
+                 * measure of whether a wave earned its airtime. barren= is the
+                 * campaign-end predicate itself, and beacons= is kept beside it
+                 * because the two disagreeing is precisely the dedupe traffic
+                 * described above. WAVECAP and BARREN are deliberately absent
+                 * from end=: those end the CAMPAIGN, not the wave, and are
+                 * logged by the branches below. */
+                DBG_LOG("DeviceDiscovery: wave %u/%u dreq=%08X floor=%lu dur=%lu end=%s beacons=%u new=%u union=%u unacked=%u barren=%u prevBarren=%u beaconSeen=%u\r\n",
+                    (unsigned)u8WaveCount, (unsigned)APP_PRIMARY_MAX_WAVES,
+                    (unsigned)u32DreqId,
+                    (unsigned long)u32WaveFloorAtEnd,
+                    (unsigned long)(osKernelGetTickCount() - u32WaveStart),
+                    pcWaveEnd,
+                    (unsigned)(MESHNETWORK_u16GetBeaconsHeard() - u16WaveBeacons0),
+                    (unsigned)(u16UnionNow - u16WaveUnion0),
+                    (unsigned)u16UnionNow,
+                    (unsigned)MESHNETWORK_u16GetUnackedCount(),
+                    (unsigned)bNoNewThisWave,
+                    (unsigned)bPrevWaveBarren,
+                    (unsigned)bBeaconSeenThisWave);
 
                 if (RADIOTESTMODE_bActive())
                 {
@@ -518,21 +553,33 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                     MESHNETWORK_vStopPrimaryAck();
                 }
                 /* A single barren wave no longer ends the campaign: the frontier
-                 * advances one ring per wave, deep answers arrive late (a ring-5
-                 * beacon measured 21 s behind its DReq, past that wave's floor),
-                 * and one wave's lone beacon can be lost to a collision — so "no
-                 * beacon this wave" has meant "nobody answered in time" as often
-                 * as "nobody is there". End only on TWO barren waves in a row
-                 * (past APP_PRIMARY_MIN_WAVES), or the wave cap. A tight herd
-                 * still ends promptly: each productive wave resets the run, and
-                 * once the herd is truly mapped two silent waves follow. */
-                else if ((!bBeaconSeenThisWave && bPrevWaveBarren &&
+                 * advances one ring per wave, deep answers can arrive late (past
+                 * that wave's floor), and one wave's lone beacon can be lost to a
+                 * collision — so "this wave found nobody new" has meant "nobody
+                 * answered in time" as often as "nobody is there". End only on
+                 * TWO barren waves in a row (past APP_PRIMARY_MIN_WAVES), or the
+                 * wave cap. A tight herd still ends promptly: each productive
+                 * wave resets the run, and once the herd is truly mapped two
+                 * barren waves follow.
+                 *
+                 * The two rules do not stack below the floor: because the AND
+                 * already requires u8WaveCount >= MIN_WAVES (3), the earliest
+                 * barren end is still wave 3 and it needs waves 2 AND 3 both
+                 * barren — identical to the old single-barren rule for that
+                 * case. The rule only buys a retry from wave 4 onward; it does
+                 * not protect the direct-earshot rings.
+                 *
+                 * "Barren" is bNoNewThisWave (no new union row), NOT "no beacon
+                 * heard" — see where it is derived above for why the beacon tick
+                 * was the wrong signal. */
+                else if ((bNoNewThisWave && bPrevWaveBarren &&
                           u8WaveCount >= APP_PRIMARY_MIN_WAVES) ||
                          u8WaveCount >= APP_PRIMARY_MAX_WAVES)
                 {
                     if (u8WaveCount >= APP_PRIMARY_MAX_WAVES)
-                        DBG_LOG("DeviceDiscovery: Primary wave cap (%u) reached\r\n",
-                            APP_PRIMARY_MAX_WAVES);
+                        DBG_LOG("DeviceDiscovery: Primary wave cap (%u) reached barren=%u prevBarren=%u\r\n",
+                            APP_PRIMARY_MAX_WAVES,
+                            (unsigned)bNoNewThisWave, (unsigned)bPrevWaveBarren);
                     else
                         DBG_LOG("DeviceDiscovery: Primary ending - two barren waves after %u waves\r\n",
                             (unsigned)u8WaveCount);
@@ -544,7 +591,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                     DBG_LOG("DeviceDiscovery: Primary extending discovery with new DReq wave\r\n");
                 }
 
-                bPrevWaveBarren = !bBeaconSeenThisWave;
+                bPrevWaveBarren = bNoNewThisWave;
             }
         }
         else
