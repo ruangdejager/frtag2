@@ -73,8 +73,26 @@
  * above it, ending now also requires TWO barren waves in a row (see
  * DeviceDiscovery.c). A single quiet wave at the frontier - a deep node whose
  * one beacon that wave was lost to a collision - no longer ends a campaign that
- * has been steadily pushing outward. */
-#define APP_PRIMARY_MIN_WAVES              3U
+ * has been steadily pushing outward.
+ *
+ * Field-confirmed 2026-09-09, a 9-node static test herd: three campaigns
+ * (11:15, 11:45, 12:45) ended at the earliest point the wave2+wave3-both-
+ * barren pair is legal, dropping 241F/221D/2D94 (2D94 alone routinely
+ * first-answers wave 3-4, hops 4-7) a few seconds before they would have
+ * answered. Discovery took 70-73 s those cycles (3-wave floor 12+16+20=48 s
+ * + overhead) versus the usual 96-147 s - a dropped ring, not a fast
+ * campaign.
+ *
+ * The wave2+wave3 pair is legal at any MIN_WAVES <= 3, so raising past 3 is
+ * what closes that gap (pushes the earliest legal pair to wave3+wave4).
+ * MIN_WAVES=2 below does NOT do that: it is unchanged from the original 3
+ * for the wave2+wave3 pair, and additionally legalises wave1+wave2, which
+ * is the direct-earshot pathological case ("0 neighbours, 3 s", above) this
+ * floor exists to block in the first place. Set to 2 anyway, 2026-09-09, at
+ * Ruan's explicit call after this tradeoff was raised - not a fix for the
+ * 11:15/11:45/12:45 loss above; revisit if that pattern recurs at the
+ * 30-node field mesh. */
+#define APP_PRIMARY_MIN_WAVES              2U
 
 /* Deadline for the primary's wave loop, measured from campaign start.
  *

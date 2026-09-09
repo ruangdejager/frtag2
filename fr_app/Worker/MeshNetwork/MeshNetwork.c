@@ -1256,13 +1256,22 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
 
     DBG("MeshNetwork: DReq: dreq=%08X origin=%04X hop=%u from=%04X rssi=%d\r\n",
         u32DreqId, u32OriginId, u8SenderHopCount, u16ImmSenderId, s16Rssi);
-    u16StatDReqHeard++;
 
     uint32_t u32LogValue;
     FLASHLOG_vEncodeRXLogValue(&u32LogValue, (uint16_t)u32OriginId, s16Rssi, u8WaveCnt);
     EVTLOG(LOG_RX_DREQ, u32LogValue);
 
     if (u32OriginId == LORARADIO_u32GetUniqueId()) return;
+
+    /* Density signal for MESHNETWORK_u32GetTxJitterCeilingMs(): must count only
+     * foreign traffic. Counting above the self-origin guard let a primary
+     * count its own DReqs, echoed back by every relaying node, into its own
+     * "how busy is the air around me" signal - so the primary's jitter ceiling
+     * grew off its own transmissions instead of real herd density (confirmed
+     * defect, 2026-09-08 field review: primary DReq-heard routinely exceeds
+     * the ceiling's saturation point of 42). On a secondary this guard never
+     * fires, so the count there was already genuine foreign traffic. */
+    u16StatDReqHeard++;
 
     /* Hop 0 is the sole marker for "heard the primary directly" (see the wave-1
      * block below), so a uint8_t that wrapped 255->0 would present a deep relay
