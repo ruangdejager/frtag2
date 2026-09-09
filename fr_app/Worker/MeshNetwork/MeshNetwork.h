@@ -485,6 +485,54 @@
  * primary transmission (~30 ms) per ack. Total airings stay bounded at 2. */
 #define MESH_DACK_AIRINGS             2U
 
+/* Quiet air, measured at the primary, that arms the 2.1.3 compatibility
+ * keep-alive. TEMPORARY - see the removal note at the end.
+ *
+ * Why it is needed. A 2.1.3 secondary ends its wake on 10 s of radio silence
+ * whenever it is not beaconing (APP_SECONDARY_SILENCE_MS, applied without the
+ * MESHNETWORK_bCampaignHeard() hold that only exists from 2.3.x). Nothing in
+ * 2.1.3 covers a wave-listen floor, because 2.1.3 had no floor: it ended a
+ * wave on a 7 s idle window and never sat quiet for longer than that. Under
+ * this release a wave that turns up nobody new AND has nothing un-acked
+ * transmits nothing at all for its whole floor - MESH_DISCOVERY_MIN_WAVE_MS
+ * plus MESH_DISCOVERY_WAVE_ALLOWANCE_MS per proven ring, so >= 12 s from the
+ * moment ring 1 is on the table and up to MESH_DISCOVERY_MIN_WAVE_CAP_MS.
+ *
+ * What makes that expensive rather than merely wasteful is WHERE the silence
+ * falls. A campaign ends on two consecutive barren waves, and barren means "no
+ * new rows", so the quiet stretch sits immediately before the TimeSync - the
+ * one packet carrying the clock and the staged firmware version a secondary
+ * needs to auto-arm (see MESHNETWORK_vHandleTimeSync). The tags most likely to
+ * sleep through that advertisement are therefore in the primary's own direct
+ * earshot, which is exactly the population an OTA distribute session can
+ * serve, since OtaPrep/OtaChunk are direct and never mesh-forwarded.
+ *
+ * Why the keep-alive is an EMPTY D-ACK, and not a new packet type. A new type
+ * would not work at all: 2.1.3 stamps u32LastDiscoveryPktTick inside the
+ * individual handlers and never in the RX loop, so an unrecognised first byte
+ * reaches `default:`, logs "Unknown pkt type" and keeps nothing awake. A
+ * 10-byte D-Ack is the one frame whose 2.1.3 handler does exactly what is
+ * wanted, in this order: stamps the tick (the tag stays awake), then dedups on
+ * u32AckMsgId and returns - so it is never forwarded - and with u8AckCount == 0
+ * the "am I in this ack" loop body cannot execute even on a node meeting the
+ * id for the first time. Nothing else in the packet is read.
+ *
+ * Why 3000 against a 4000 ms MESH_PRIMARY_ACK_INTERVAL_MS: the keep-alive rides
+ * the ack tick, so the first one lands at most QUIET + INTERVAL = 7 s after the
+ * last packet the herd could have heard, and every 4 s after that (the
+ * primary's own transmissions do not stamp its RX tick, so every subsequent
+ * tick re-qualifies). Both are under 2.1.3's 10 s with margin for the radio
+ * layer's carrier sense, which only backs off on a busy channel - and a busy
+ * channel is one the secondary is hearing anyway. The invariant is asserted in
+ * MeshNetwork.c against APP_SECONDARY_SILENCE_MS.
+ *
+ * REMOVE THIS, its assert, MESHNETWORK_vQueueKeepAlive and the else branch in
+ * MESHNETWORK_vBuildAndQueueAck once no 2.1.3 unit is left in the field. It
+ * buys a 2.3.x secondary nothing - that one holds to TimeSync or the 205 s
+ * APP_DISCOVERY_WINDOW_TIMEOUT_MS on its own - and it spends airtime in the
+ * quiet spans the deep-wave floors exist to provide. */
+#define MESH_KEEPALIVE_QUIET_MS       3000U
+
 /*
  * Per-packet verbose text logging. During a campaign every node hears every
  * neighbour's (re)transmissions, so the per-packet plumbing lines — the

@@ -386,8 +386,14 @@ static uint16_t u16DiagFwdAck;
 static uint16_t u16DiagFwdTs;
 static uint16_t u16DiagDedupeHit;
 static uint16_t u16DiagBpSkipBeacon;
+/* Empty D-Acks aired purely to hold a 2.1.3 secondary awake - see
+ * MESH_KEEPALIVE_QUIET_MS. Diag-only deliberately: it measures how much quiet
+ * a campaign actually contains, which is the number that says whether the
+ * compat keep-alive can be dropped again, and it has no business in a
+ * production line that will outlive the mixed fleet. */
+static uint16_t u16DiagKeepAlive;
 #define DIAG_INC(c) do { if (u16Diag##c < UINT16_MAX) u16Diag##c++; } while (0)
-#define DIAG_RESET()                                                           do { u16DiagFwdBeacon = 0U; u16DiagFwdDreq = 0U; u16DiagFwdAck = 0U;            u16DiagFwdTs = 0U; u16DiagDedupeHit = 0U;                                  u16DiagBpSkipBeacon = 0U; } while (0)
+#define DIAG_RESET()                                                           do { u16DiagFwdBeacon = 0U; u16DiagFwdDreq = 0U; u16DiagFwdAck = 0U;            u16DiagFwdTs = 0U; u16DiagDedupeHit = 0U;                                  u16DiagBpSkipBeacon = 0U; u16DiagKeepAlive = 0U; } while (0)
 #else
 #define DIAG_INC(c)  do { } while (0)
 #define DIAG_RESET() do { } while (0)
@@ -469,6 +475,16 @@ static volatile bool bCampaignHeard = false;
 #endif
 #if ((MESH_DISCOVERY_MIN_WAVE_CAP_MS + MESH_DISCOVERY_IDLE_MS) > MESH_DISCOVERY_UNACKED_HOLD_MS)
 #  error "Scaled wave floor + idle tail must fit inside MESH_DISCOVERY_UNACKED_HOLD_MS"
+#endif
+/* The compat keep-alive rides the primary ack tick, so the WORST gap it can
+ * leave is one quiet threshold plus one whole tick - and that sum is what has
+ * to stay under the silence window a 2.1.3 secondary ends its wake on. The
+ * constant compared against is this release's own APP_SECONDARY_SILENCE_MS,
+ * which is unchanged from 2.1.3 (10 s) and is the only version of it available
+ * at compile time; if it is ever retuned, re-derive the keep-alive against the
+ * FIELD units' value, not ours. See MESH_KEEPALIVE_QUIET_MS. */
+#if ((MESH_KEEPALIVE_QUIET_MS + MESH_PRIMARY_ACK_INTERVAL_MS) >= APP_SECONDARY_SILENCE_MS)
+#  error "Keep-alive quiet + one ack tick must stay under APP_SECONDARY_SILENCE_MS"
 #endif
 
 /* ---- Forward declarations ---- */
@@ -1061,6 +1077,70 @@ static void MESHNETWORK_vBeaconTimerCallback(void *arg)
         osThreadFlagsSet(xMeshTxTaskHandle, MESH_TX_FLAG_BEACON);
 }
 
+/* Counter half of the keep-alive's message id. One FIXED id per device for
+ * every keep-alive it ever sends - not a fresh id per packet - and that is the
+ * whole of what makes this packet unforwardable. The receive side dedups on
+ * u32AckMsgId, so once the first keep-alive has put this id in a node's forward
+ * ring, every later one is suppressed before it can be relayed.
+ *
+ * It survives longest on the units that matter. 2.3.x clears the beacon/ack
+ * ring at every campaign start (see the reset in MESHNETWORK_vResetNodeRole),
+ * so a 2.3.x node may relay the first keep-alive of each campaign - one 10-byte
+ * frame per node per campaign, bounded. 2.1.3 only ever cleared that ring in
+ * MESHNETWORK_vInit, so on a 2.1.3 node the id stays "seen" until ordinary
+ * traffic evicts it from its 32 slots - and eviction needs traffic, which is
+ * precisely what the quiet span that triggers a keep-alive does not have.
+ *
+ * 0xFFFF keeps the id well formed for MESH_FP_FOLD, since ids are
+ * (deviceId16 << 16) | counter16 (MESHNETWORK_u32GenerateGlobalMsgID) and the
+ * fold mixes both halves. u16MsgCounter is RNG-seeded per boot and can in
+ * principle reach 0xFFFF and collide with a real packet of ours; the cost is
+ * one suppressed relay of that one packet, at ~1/65536 per campaign, which is
+ * far below the header/CRC error rate already in the field logs. */
+#define MESH_KEEPALIVE_COUNTER  0xFFFFU
+
+/* Air one empty D-Ack for the sole purpose of resetting a 2.1.3 secondary's
+ * silence clock. Runs in the MeshTx task context, off the primary ack tick.
+ * See MESH_KEEPALIVE_QUIET_MS for why this packet has the shape it does. */
+static void MESHNETWORK_vQueueKeepAlive(void)
+{
+    MeshPktDAck_t tAck;
+    memset(&tAck, 0, sizeof(tAck));
+    tAck.u32AckMsgId = ((LORARADIO_u32GetUniqueId() & 0xFFFFU) << 16) |
+                       MESH_KEEPALIVE_COUNTER;
+    /* Names this campaign so the frame is not obviously synthetic in a sniffer
+     * log; no receiver reads it on a zero-id ack (2.1.3 dedups out before the
+     * ack list is consulted, and an empty list has nothing to consult). */
+    tAck.u32DreqId   = u32NodeBeaconDreqId;
+    tAck.u32SenderId = LORARADIO_u32GetUniqueId();
+    tAck.u8AckCount  = 0U;      /* the load-bearing field: no ids, no effect */
+
+    uint8_t u8Buf[MESH_TX_MAX_PACKET_SIZE];
+    size_t  u32Len = 0;
+    if (!MESHNETWORK_bEncodeDAck(&tAck, u8Buf, sizeof(u8Buf), &u32Len))
+        return;
+
+    /* Delay 0, not the ordinary jitter. The entire value of this packet is a
+     * BOUNDED gap, and it is only ever sent after the primary has heard nothing
+     * for MESH_KEEPALIVE_QUIET_MS - so there is no peer transmission to
+     * de-correlate from, and up to MESH_TX_JITTER_BUSY_MS of jitter would eat
+     * the margin the interval was chosen to leave. */
+    if (!MESHNETWORK_bSendPacketDelayed(u8Buf, u32Len, 0U))
+        return;
+
+    /* Same reason a real ack does this beside its encode: if this frame comes
+     * back to us via a peer, we must not re-air it ourselves. */
+    FORWARD_vAdd(tAck.u32AckMsgId);
+    DIAG_INC(KeepAlive);
+
+    /* DBG, not DBG_LOG: at one per ack tick through a 27 s floor this would be
+     * tens of flash-log records per campaign, and the aggregate is already
+     * carried by keepAlive= on the diag line. */
+    DBG("MeshNetwork: keep-alive %08X aired (quiet %lu ms)\r\n",
+        (unsigned)tAck.u32AckMsgId,
+        (unsigned long)(osKernelGetTickCount() - u32LastDiscoveryPktTick));
+}
+
 /* Build a primary D-Ack from the neighbor table and hand it to the TX queue.
  * Runs in the MeshTx task context (NOT the timer callback). */
 static void MESHNETWORK_vBuildAndQueueAck(void)
@@ -1086,6 +1166,10 @@ static void MESHNETWORK_vBuildAndQueueAck(void)
                 tAck.u32AckedIds[u8Added++] = tNeighborTable[i].u32DeviceId;
         }
         tAck.u8AckCount = u8Added;
+        /* Read under the lock that guards it rather than after the release, so
+         * the keep-alive gate below cannot see a count a concurrent insert is
+         * halfway through changing. */
+        const bool bAnyKnown = (u16NeighborCount > 0U);
         osMutexRelease(xNeighborTableMutex);
 
         if (tAck.u8AckCount > 0)
@@ -1147,6 +1231,24 @@ static void MESHNETWORK_vBuildAndQueueAck(void)
                 }
                 osMutexRelease(xNeighborTableMutex);
             }
+        }
+        /* Nothing to ack. That used to end the tick silently, and under this
+         * release's wave floors that silence can run past the 10 s a 2.1.3
+         * secondary ends its wake on - taking with it the TimeSync that carries
+         * the staged firmware version. Air an empty D-Ack instead: it resets
+         * that clock and is dropped by the dedup before it can be forwarded.
+         * See MESH_KEEPALIVE_QUIET_MS for the full argument.
+         *
+         * Gated on two things. bAnyKnown, because with an empty table there is
+         * no tag known to be in earshot to hold awake, and a campaign that
+         * hears nothing should stay off the air. And the quiet threshold, so a
+         * tick that lands while the herd is still talking - when the secondary
+         * is being kept awake by real traffic anyway - adds nothing. */
+        else if (bAnyKnown &&
+                 (osKernelGetTickCount() - u32LastDiscoveryPktTick) >=
+                     MESH_KEEPALIVE_QUIET_MS)
+        {
+            MESHNETWORK_vQueueKeepAlive();
         }
     }
 }
@@ -2906,10 +3008,11 @@ void MESHNETWORK_vLogCampaignStats(const char *pcTag)
     /* Second line rather than a longer first one: the production line is
      * already at the width a flash-log record wants to be, and these are a
      * field-test extra that a production log will never carry. */
-    DBG_LOG("MeshNetwork: %s diag - fwdBeacon=%u fwdDreq=%u fwdAck=%u fwdTs=%u dedupeHit=%u bpSkipBeacon=%u\r\n",
+    DBG_LOG("MeshNetwork: %s diag - fwdBeacon=%u fwdDreq=%u fwdAck=%u fwdTs=%u dedupeHit=%u bpSkipBeacon=%u keepAlive=%u\r\n",
             pcTag, (unsigned)u16DiagFwdBeacon, (unsigned)u16DiagFwdDreq,
             (unsigned)u16DiagFwdAck, (unsigned)u16DiagFwdTs,
-            (unsigned)u16DiagDedupeHit, (unsigned)u16DiagBpSkipBeacon);
+            (unsigned)u16DiagDedupeHit, (unsigned)u16DiagBpSkipBeacon,
+            (unsigned)u16DiagKeepAlive);
 #endif
 }
 
