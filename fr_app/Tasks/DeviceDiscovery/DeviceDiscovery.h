@@ -18,16 +18,172 @@
 
 /* ---- Discovery timing ---- */
 #define APP_WAKEUP_BUFFER_MS                (5  * 1000)   /* buffer after sync wake-up   */
-#define APP_DISCOVERY_WINDOW_TIMEOUT_MS     (180 * 1000)  /* hard cap on a campaign      */
+#define APP_DISCOVERY_WINDOW_TIMEOUT_MS     (205 * 1000)  /* hard cap on a campaign      */
 
 /* Secondary campaign-end (R3): once the mesh has been silent (no discovery
  * packet from any primary) for this long AND the node is not beaconing, end the
- * campaign instead of waiting out the 180 s hard cap. Polled at this cadence. */
+ * campaign instead of waiting out the 205 s hard cap. Polled at this cadence. */
 #define APP_SECONDARY_SILENCE_MS           (10 * 1000)   /* radio-silence end window    */
 #define APP_SECONDARY_POLL_MS              250U          /* secondary wait poll cadence */
 
-/* Primary issues at most this many DReq waves per campaign (R8). */
-#define APP_PRIMARY_MAX_WAVES              5U
+/* Ceiling on DReq waves per campaign. Each wave advances the discovery frontier
+ * by one ring (only acked nodes relay, so wave N reaches depth N), which makes
+ * this the maximum discoverable herd depth.
+ *
+ * Stays at 6, now with a budget that can actually run all six. The wave-listen
+ * floor scales with proven depth (MESH_DISCOVERY_WAVE_ALLOWANCE_MS: 8 s at
+ * ring 1 climbing 4 s/ring to the 27 s cap by ring 5), because the round trip
+ * out to the frontier and back is superlinear (measured: 2, 3, 4, 8, 21 s to
+ * rings 1-5). Summing the worst-case per-wave cost (scaled floor + one idle
+ * tail):
+ *
+ *     wave   1    2    3    4    5    6      -> cumulative
+ *     ms   13k  17k  21k  25k  29k  32k        137k
+ *
+ * All six now fit under APP_PRIMARY_CAMPAIGN_MAX_MS (140 s) with ~3 s to spare;
+ * that budget - and the secondary window it sits under - was raised so wave 6
+ * is reachable for the deep herd instead of the campaign ending mid wave-5 the
+ * way 110 s + an 18 s floor cap did (241F, ring 5, missed its wave by 5 s and
+ * the barren wave ended the campaign). A 7-ring herd still needs more than
+ * this; 6 is the ceiling the current budget honestly funds. The
+ * MESH_WAVE_BUDGET_MS assert below makes any future disagreement between the
+ * wave count and the budget a build error instead of a wave that silently never
+ * runs. Costs little on a tight herd - the primary still ends a campaign once
+ * two waves in a row turn up no new beacon (APP_PRIMARY_MIN_WAVES plus the
+ * two-consecutive-barren rule in DeviceDiscovery.c), and the field herd
+ * (4 rings) finishes by wave 4 in ~76 s with margin. */
+#define APP_PRIMARY_MAX_WAVES              6U
+
+/* Floor on DReq waves per campaign. A barren wave used to end the campaign
+ * outright, which reads as "nobody is out there" but in the field also meant
+ * "nobody answered in time": one campaign ended after ONE wave and 3 seconds
+ * with 0 neighbours, while a 1-hop secondary was mid-cadence and two others
+ * were relaying that very DReq (the primary's own stats line for it says
+ * "DReq heard=3 beacons heard=0"). A DReq is one packet on a channel this
+ * change set exists to decongest; three attempts at it cost little and remove
+ * a whole-campaign failure mode.
+ *
+ * Scope this claim honestly: waves 2+ are relayed only by nodes that have been
+ * ACKED (see MESHNETWORK_vHandleDReq), and a wave that heard no beacon
+ * produced no acks and therefore no forwarders - so the forced waves are a
+ * retry of the DIRECT earshot ring, not a way to reach the deep herd on a
+ * silent wave 1. That is exactly what the 3 s campaign lost.
+ *
+ * MIN_WAVES is only the floor below which no barren wave may end the campaign;
+ * above it, ending now also requires TWO barren waves in a row (see
+ * DeviceDiscovery.c). A single quiet wave at the frontier - a deep node whose
+ * one beacon that wave was lost to a collision - no longer ends a campaign that
+ * has been steadily pushing outward.
+ *
+ * Field-confirmed 2026-09-09, a 9-node static test herd: three campaigns
+ * (11:15, 11:45, 12:45) ended at the earliest point the wave2+wave3-both-
+ * barren pair is legal, dropping 241F/221D/2D94 (2D94 alone routinely
+ * first-answers wave 3-4, hops 4-7) a few seconds before they would have
+ * answered. Discovery took 70-73 s those cycles (3-wave floor 12+16+20=48 s
+ * + overhead) versus the usual 96-147 s - a dropped ring, not a fast
+ * campaign.
+ *
+ * The wave2+wave3 pair is legal at any MIN_WAVES <= 3, so raising past 3 is
+ * what closes that gap (pushes the earliest legal pair to wave3+wave4).
+ * MIN_WAVES=2 below does NOT do that: it is unchanged from the original 3
+ * for the wave2+wave3 pair, and additionally legalises wave1+wave2, which
+ * is the direct-earshot pathological case ("0 neighbours, 3 s", above) this
+ * floor exists to block in the first place. Set to 2 anyway, 2026-09-09, at
+ * Ruan's explicit call after this tradeoff was raised - not a fix for the
+ * 11:15/11:45/12:45 loss above; revisit if that pattern recurs at the
+ * 30-node field mesh. */
+#define APP_PRIMARY_MIN_WAVES              2U
+
+/* Deadline for the primary's wave loop, measured from campaign start.
+ *
+ * The wave loop had no time bound at all - only the wave COUNT was capped, and
+ * a wave ends on beacon silence, so a herd that keeps beaconing could hold the
+ * primary past the point where its TimeSync is any use. It has to be a
+ * deadline on the wave loop specifically, not on the whole wake, because
+ * TimeSync is not sent at campaign end: the fr9 logger session runs first
+ * (connect, AT+LOG with up to 3 attempts, AT+TSREQ, AT+SETREQ) and that is
+ * ~55 s of blocking AT timeouts in the worst case.
+ *
+ * Both roles start their campaign clock after the same APP_WAKEUP_BUFFER_MS,
+ * so the secondaries' windows close at campaign_start + APP_DISCOVERY_WINDOW_
+ * TIMEOUT_MS (205 s). 140 s leaves ~10 s of margin on top of that worst-case
+ * fr9 budget, so the TimeSync is queued while the herd is still listening even
+ * on a bad wake.
+ *
+ * 110 -> 135 s (window 180 -> 205 s in lockstep, so the fr9/TimeSync margin is
+ * unchanged): 135 s is what six waves at the deep-scaled floor now cost
+ * (MESH_WAVE_BUDGET_MS = 134 s). The pair moved together on purpose - raising
+ * the wave budget without moving the window would push TimeSync past the point
+ * secondaries stop listening. The cost is real: an in-footprint node the
+ * primary never acks stays awake up to 25 s longer per campaign (an
+ * out-of-range node still bails at APP_SECONDARY_SILENCE_MS, unaffected).
+ *
+ * 135 -> 140 s, and this time the window did NOT move with it: the extra 5 s
+ * comes out of the fr9/TimeSync margin (15 -> 10 s) instead. That is the
+ * cheaper side to spend. The fr9 margin is only consumed on a wake that has
+ * already hit the worst case - three failed AT+LOG attempts and a full
+ * AT+SETREQ timeout - whereas raising APP_DISCOVERY_WINDOW_TIMEOUT_MS costs
+ * every un-acked secondary 5 s more radio-on in EVERY campaign, on a
+ * solar-charged tag. Ten seconds on top of an already-pathological 55 s fr9
+ * session is enough; if it ever proves not to be, move the window rather than
+ * trimming the wave budget back, because the budget is what funds wave 6.
+ *
+ * What bought the 5 s: MESH_DISCOVERY_MIN_WAVE_CAP_MS 24 -> 27 s, so the
+ * deepest wave can still hear a ring-5 node whose only surviving copy of the
+ * DReq was the second airing (MESH_DREQ_ORIGIN_AIRINGS). */
+#define APP_PRIMARY_CAMPAIGN_MAX_MS        (140 * 1000)
+
+_Static_assert(APP_PRIMARY_MIN_WAVES <= APP_PRIMARY_MAX_WAVES,
+               "APP_PRIMARY_MIN_WAVES exceeds APP_PRIMARY_MAX_WAVES");
+_Static_assert(APP_PRIMARY_CAMPAIGN_MAX_MS < APP_DISCOVERY_WINDOW_TIMEOUT_MS,
+               "The primary must finish its waves before the secondaries' "
+               "campaign window closes, with room for the fr9 session.");
+
+/* Worst-case time to run every wave: each of APP_PRIMARY_MAX_WAVES waves can run
+ * to its depth-scaled listen floor plus one idle tail before it ends, so the
+ * whole loop costs SUM_{k=1..N}(floor(k) + IDLE), where
+ * floor(k) = min(MIN_WAVE + (k-1)*ALLOWANCE, MIN_WAVE_CAP). The floor ramps
+ * linearly until it saturates at the cap, so the sum splits into the ramp and a
+ * flat tail; RAMP_STEPS is how many ALLOWANCE steps fit before the cap, so the
+ * floor first reaches the cap at wave (RAMP_STEPS + 1).
+ *
+ * This exists so the wave count and the campaign budget cannot silently
+ * disagree: raise APP_PRIMARY_MAX_WAVES past what the budget can run (or make a
+ * wave more expensive) and this becomes a build error, not a wave that never
+ * fires. See the table at APP_PRIMARY_MAX_WAVES.
+ *
+ * It models the QUIET case, which is the one the wave count depends on: a wave
+ * that stops being answered costs its floor plus one idle tail. A wave still
+ * being answered deliberately has no per-wave bound at all (see
+ * MESH_DISCOVERY_UNACKED_HOLD_MS - cutting one off mid-answer resets the whole
+ * mid-cadence herd's beacon backoff), so it can exceed its modelled cost and
+ * APP_PRIMARY_CAMPAIGN_MAX_MS is what bounds it. So this assert guarantees the
+ * wave COUNT is fundable on a quiet campaign, not that six waves always fit -
+ * which is the right guarantee, because a campaign that runs out of budget
+ * while the herd is still answering is spending it on exactly what it is
+ * for. */
+#define MESH_WAVE_FLOOR_RAMP_STEPS \
+    ((MESH_DISCOVERY_MIN_WAVE_CAP_MS - MESH_DISCOVERY_MIN_WAVE_MS) / \
+     MESH_DISCOVERY_WAVE_ALLOWANCE_MS)
+
+#define MESH_WAVE_BUDGET_MS ( \
+    ( (APP_PRIMARY_MAX_WAVES <= (MESH_WAVE_FLOOR_RAMP_STEPS + 1U)) \
+      ? ( APP_PRIMARY_MAX_WAVES * MESH_DISCOVERY_MIN_WAVE_MS \
+          + MESH_DISCOVERY_WAVE_ALLOWANCE_MS \
+            * (APP_PRIMARY_MAX_WAVES * (APP_PRIMARY_MAX_WAVES - 1U) / 2U) ) \
+      : ( (MESH_WAVE_FLOOR_RAMP_STEPS + 1U) * MESH_DISCOVERY_MIN_WAVE_MS \
+          + MESH_DISCOVERY_WAVE_ALLOWANCE_MS \
+            * (MESH_WAVE_FLOOR_RAMP_STEPS * (MESH_WAVE_FLOOR_RAMP_STEPS + 1U) / 2U) \
+          + (APP_PRIMARY_MAX_WAVES - (MESH_WAVE_FLOOR_RAMP_STEPS + 1U)) \
+            * MESH_DISCOVERY_MIN_WAVE_CAP_MS ) ) \
+    + APP_PRIMARY_MAX_WAVES * MESH_DISCOVERY_IDLE_MS )
+
+_Static_assert(MESH_WAVE_BUDGET_MS <= APP_PRIMARY_CAMPAIGN_MAX_MS,
+               "APP_PRIMARY_MAX_WAVES cannot all run inside "
+               "APP_PRIMARY_CAMPAIGN_MAX_MS at the depth-scaled wave floor + "
+               "idle tail. Lower APP_PRIMARY_MAX_WAVES or the per-wave cost, or "
+               "(last resort, costs fr9/TimeSync margin) raise the campaign "
+               "budget.");
 
 /* Secondary, flash backend only: once armed (see MESHNETWORK_vHandleTimeSync
  * auto-arm off the staged-fw version carried in TimeSync), how long to keep
@@ -42,7 +198,16 @@
 /* GPS pre-trigger lead time: how many seconds before each scheduled wake the
  * wake-schedule task asks the GPS module for a fresh fix. The dispatcher runs
  * asynchronously; the AppTask never blocks waiting for it. */
-#define DEVICE_DISCOVERY_GPS_PRETRIGGER_S   180U          /* 3 minutes              */
+/* 180 -> 150 s. A beacon may only carry a fix younger than
+ * MESH_GPS_FIX_MAX_AGE_S (300 s), and the fix is taken by this pre-trigger, so
+ * a 180 s lead left beacons GPS-valid only until about wake+120 s - the field
+ * logs catch a tag flipping to gps=0 at wake+147 s mid-campaign, and its row
+ * in the primary's union then carries Lat:0 Lon:0. Since this change set
+ * deliberately lets a campaign run longer to find the deep tags, the fix has
+ * to stay valid longer, and making it FRESHER at wake is the way to do that
+ * without widening the staleness gate. 150 s still clears the 120 s TTFF
+ * timeout the GPS session runs with (observed TTFF here: 8-34 s). */
+#define DEVICE_DISCOVERY_GPS_PRETRIGGER_S   150U          /* 2.5 minutes            */
 
 /* Basic-mode primary passive-listen cadence + duration. Independent of
  * WakeupInterval: the primary opens a 60 s RX window every 15 min and

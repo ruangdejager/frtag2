@@ -41,11 +41,16 @@ static volatile uint32_t wr_addr;
 static osMessageQueueId_t logQueue      = NULL;
 static osThreadId_t       logTaskHandle = NULL;
 
-typedef enum { TX_ORIGIN = 1, TX_FORWARDER } DreqType;
+/* TX_REPEAT: a SECOND airing of a packet this node originated - the primary
+ * airs each TimeSync twice (see MESH_TIMESYNC_AIRINGS), and without a distinct
+ * value the log could not show whether the repeat went out. Every value used
+ * with LOG_TX_* must have an entry here: TxTypeStr is indexed directly. */
+typedef enum { TX_ORIGIN = 1, TX_FORWARDER, TX_REPEAT } DreqType;
 
 static const char *TxTypeStr[] = {
     [TX_ORIGIN]    = "ORIGIN",
-    [TX_FORWARDER] = "FORWARDER"
+    [TX_FORWARDER] = "FORWARDER",
+    [TX_REPEAT]    = "REPEAT"
 };
 
 /* Packed log record — 8 bytes total */
