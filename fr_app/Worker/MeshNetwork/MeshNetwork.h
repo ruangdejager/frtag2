@@ -57,7 +57,7 @@
  *   interval(n) = min(BASE + n * STEP, MAX),  n = beacons already sent
  * so the first answers to a DReq are still prompt (that is when the primary is
  * listening and an ack is most likely) and the tail of an unheard node decays
- * to MAX instead of hammering. Same 171 s window: ~17 beacons instead of 48.
+ * to MAX instead of hammering. Same 171 s window: ~20 beacons instead of 48.
  * n resets to 0 every time beaconing (re-)starts - a new wave, a re-anchor
  * onto a newer dreq, or a re-arm - so each wave gets a fast first beacon; see
  * MESHNETWORK_vStartBeaconing.
@@ -67,12 +67,12 @@
  * still cannot slip past the NEXT beacon - the invariant the old single
  * constant carried. MAX is NOT bounded by MESH_DISCOVERY_IDLE_MS and cannot
  * be: the gap the primary observes is the period plus both ends' jitter and
- * carrier sense, up to ~6.5 s more, so no affordable idle window covers a 12 s
+ * carrier sense, up to ~6.5 s more, so no affordable idle window covers a 9 s
  * cadence. Wave end therefore no longer relies on beacon silence alone - see
  * MESH_DISCOVERY_IDLE_MS below. */
 #define MESH_BEACON_BASE_MS           5000U
-#define MESH_BEACON_STEP_MS           2000U
-#define MESH_BEACON_MAX_MS            12000U
+#define MESH_BEACON_STEP_MS           1000U
+#define MESH_BEACON_MAX_MS            9000U
 
 /* Primary D-Ack cadence. 2000 -> 4000: every tick emits one D-Ack carrying up
  * to MESH_MAX_ACK_IDS_PER_PACKET ids, but the sniffer logs show the packet was
