@@ -52,6 +52,58 @@ bool     FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count
  * parser change is needed there. */
 bool     FARMRANGER_bLogBasicData(MeshBasicNeighbor_t *neighbors, uint16_t count);
 
+/* ---- Binary discovery upload (AT+BLOG) ----------------------------------
+ *
+ * Replaces the CSV upload above on an fr9 that supports it. Roughly half the
+ * bytes, and a CRC-16 so a corrupted transfer is detected rather than logged.
+ *
+ * The fr9 no longer merely counts records and streams the bytes into its log:
+ * it decodes them, keeps them, and POSTs the campaign to the server as CBOR.
+ * That is what makes this worth changing - discovery data used to reach the
+ * server only by being scraped back out of an uploaded syslog.
+ *
+ * Wire format, and it is a CONTRACT - the fr9's tag_disc.h documents the same
+ * layout and has to be changed in step:
+ *
+ *     tag: AT+BLOG=<payload_len>,<primaryVerMMmmpp>,<crc16hex>\r\n
+ *     fr9: Logger ready\r\n
+ *     tag: <payload_len> raw bytes
+ *     fr9: OK\r\n on a length and CRC match, ERR\r\n otherwise
+ *
+ * Payload header, 8 bytes, little-endian, then <count> records:
+ *
+ *     u8   format version   (FR_BLOG_FORMAT_VER)
+ *     u8   record type      (FR_BLOG_TYPE_ADVANCED | FR_BLOG_TYPE_BASIC)
+ *     u16  record count
+ *     u32  this primary's own device id (LORARADIO_u32GetUniqueId())
+ *
+ * Both record variants are FR_BLOG_RECORD_BYTES; the type selects the decode.
+ * Fields are written one at a time, little-endian, and NOT memcpy'd out of
+ * MeshDiscoveredNeighbor_t / MeshBasicNeighbor_t. Those layouts are
+ * hand-packed RAM optimisations with a _Static_assert on their size (see
+ * MeshNetwork.h); they must not quietly become a wire format that the next
+ * change to the RAM budget then breaks on both boards at once.
+ *
+ * Flags byte: bit0 = MoveState, bit1 = GpsValid.
+ * ------------------------------------------------------------------------- */
+#define FR_BLOG_FORMAT_VER      1U
+#define FR_BLOG_TYPE_ADVANCED   0U
+#define FR_BLOG_TYPE_BASIC      1U
+#define FR_BLOG_HDR_BYTES       8U
+#define FR_BLOG_RECORD_BYTES    22U
+
+/* True when the fr9's ready line advertised binary-upload support ("RDY,B").
+ * Meaningful only after a successful FARMRANGER_bDeviceOn(); false before
+ * that, and false against any fr9 on firmware older than 9.13.0. */
+bool     FARMRANGER_bLoggerSupportsBinary(void);
+
+/* Binary equivalents of FARMRANGER_bLogData / bLogBasicData. Same retry
+ * policy, same pacing, same verdict handling. Returns false only when all
+ * FR_LOG_ATTEMPTS failed, at which point the caller should fall back to the
+ * CSV path rather than lose the campaign. */
+bool     FARMRANGER_bBLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count);
+bool     FARMRANGER_bBLogBasicData(MeshBasicNeighbor_t *neighbors, uint16_t count);
+
 /* ---- Firmware-file pull (OTA acquire, see Worker/OtaUpdate) ----
  * Protocol (tag is master): AT+FWREQ queries what the logger holds, answered
  * with "FW,<verMMmmpp>,<fileBytes>,<xor8hex>" — the xor8 is the logger's own

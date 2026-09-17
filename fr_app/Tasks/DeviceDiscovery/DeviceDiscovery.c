@@ -807,7 +807,16 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                  * TimeSync TX. */
                 (void)DEVICE_DISCOVERY_bBasicLogAndClear("boundary");
 
-                DEVICE_DISCOVERY_DRIVER_bConnectLogger();
+                /* Reconnect for the timestamp/settings round trip - the flush
+                 * above disconnects when it is done. Logged rather than acted
+                 * on: the two requests below already degrade gracefully (the
+                 * timestamp returns 0, the settings keep their previous
+                 * values), and this line is what distinguishes "the fr9 never
+                 * answered" from "it answered something unparseable". */
+                if (!DEVICE_DISCOVERY_DRIVER_bConnectLogger())
+                {
+                    DBG_LOG("DeviceDiscovery: boundary reconnect FAILED (no RDY)\r\n");
+                }
 
                 uint64_t now = DEVICE_DISCOVERY_DRIVER_u64RequestTS();
                 if (now > 0)
@@ -895,13 +904,58 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             }
             else
             {
-                /* ---- Logger connection + upload (fr9 Farmranger board) ---- */
-                DEVICE_DISCOVERY_DRIVER_bConnectLogger();
+                /* ---- Logger connection + upload (fr9 Farmranger board) ----
+                 *
+                 * The connect result is now checked. It used to be discarded,
+                 * and that was worth fixing while touching this: without "RDY"
+                 * the fr9 is not in a session at all, and the whole campaign
+                 * was streamed into a dead link before anything noticed - only
+                 * the upload's own timeouts eventually said so. The binary
+                 * path makes the check unavoidable anyway, because it needs
+                 * the CONTENT of the ready line, not just its arrival.
+                 *
+                 * Only the upload is skipped on failure. The requests below
+                 * are left to fail on their own timeouts exactly as they do
+                 * today; turning a dead link into an early exit from the whole
+                 * session is a bigger behavioural change than belongs here. */
+                bool bLoggerUp = DEVICE_DISCOVERY_DRIVER_bConnectLogger();
+                bool bLogOk    = false;
 
-                DBG_LOG("DeviceDiscovery %X: Logger connected.\r\n",
-                    LORARADIO_u32GetUniqueId());
+                if (!bLoggerUp)
+                {
+                    DBG_LOG("DeviceDiscovery %X: Logger connect FAILED (no RDY) - upload skipped.\r\n",
+                        LORARADIO_u32GetUniqueId());
+                }
+                else
+                {
+                    DBG_LOG("DeviceDiscovery %X: Logger connected (%s upload).\r\n",
+                        LORARADIO_u32GetUniqueId(),
+                        DEVICE_DISCOVERY_bLoggerBinary() ? "binary" : "csv");
 
-                if (DEVICE_DISCOVERY_bSendDiscoveryData(tNeighbors, u16NeighborCount))
+                    if (DEVICE_DISCOVERY_bLoggerBinary())
+                    {
+                        bLogOk = DEVICE_DISCOVERY_bSendDiscoveryDataBin(tNeighbors, u16NeighborCount);
+
+                        /* Safety net for a mis-detect, nothing more. The ready
+                         * line said this fr9 speaks AT+BLOG, so all three
+                         * attempts failing means something other than
+                         * capability is wrong - but the campaign is worth one
+                         * try over the path that is certain to be understood
+                         * before it is given up on. */
+                        if (!bLogOk)
+                        {
+                            DBG_LOG("DeviceDiscovery %X: binary upload failed - falling back to csv.\r\n",
+                                LORARADIO_u32GetUniqueId());
+                            bLogOk = DEVICE_DISCOVERY_bSendDiscoveryData(tNeighbors, u16NeighborCount);
+                        }
+                    }
+                    else
+                    {
+                        bLogOk = DEVICE_DISCOVERY_bSendDiscoveryData(tNeighbors, u16NeighborCount);
+                    }
+                }
+
+                if (bLogOk)
                     DBG_LOG("DeviceDiscovery %X: Log SUCCESS.\r\n", LORARADIO_u32GetUniqueId());
                 else
                 {
@@ -1585,8 +1639,31 @@ static bool DEVICE_DISCOVERY_bBasicLogAndClear(const char *pacReason)
             tBasic[i].bGpsValid ? (unsigned long)tBasic[i].u32GpsAgeS : 0UL);
     }
 
-    DEVICE_DISCOVERY_DRIVER_bConnectLogger();
-    bool bOk = FARMRANGER_bLogBasicData(tBasic, u16Count);
+    bool bOk = false;
+
+    /* Connect result checked here too - see the note at the advanced-mode
+     * upload. Without "RDY" there is nothing on the other end to upload to,
+     * and the binary path needs the content of that line to know whether it
+     * can be used at all. */
+    if (!DEVICE_DISCOVERY_DRIVER_bConnectLogger())
+    {
+        DBG_LOG("DeviceDiscovery %X: basic-mode %s log skipped - no RDY.\r\n",
+                LORARADIO_u32GetUniqueId(), pacReason);
+    }
+    else if (DEVICE_DISCOVERY_bLoggerBinary())
+    {
+        bOk = FARMRANGER_bBLogBasicData(tBasic, u16Count);
+        if (!bOk)
+        {
+            DBG_LOG("DeviceDiscovery: basic-mode binary upload failed - falling back to csv.\r\n");
+            bOk = FARMRANGER_bLogBasicData(tBasic, u16Count);
+        }
+    }
+    else
+    {
+        bOk = FARMRANGER_bLogBasicData(tBasic, u16Count);
+    }
+
     DBG_LOG("DeviceDiscovery %X: basic-mode %s log %s.\r\n",
             LORARADIO_u32GetUniqueId(), pacReason, bOk ? "SUCCESS" : "FAILED");
 
