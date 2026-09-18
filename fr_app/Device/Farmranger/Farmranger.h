@@ -70,12 +70,28 @@ bool     FARMRANGER_bLogBasicData(MeshBasicNeighbor_t *neighbors, uint16_t count
  *     tag: <payload_len> raw bytes
  *     fr9: OK\r\n on a length and CRC match, ERR\r\n otherwise
  *
- * Payload header, 8 bytes, little-endian, then <count> records:
+ * Payload header, FR_BLOG_HDR_BYTES bytes, little-endian, then <count> records:
  *
- *     u8   format version   (FR_BLOG_FORMAT_VER)
- *     u8   record type      (FR_BLOG_TYPE_ADVANCED | FR_BLOG_TYPE_BASIC)
+ *     u8   format version    (FR_BLOG_FORMAT_VER)
+ *     u8   record type       (FR_BLOG_TYPE_ADVANCED | FR_BLOG_TYPE_BASIC)
  *     u16  record count
  *     u32  this primary's own device id (LORARADIO_u32GetUniqueId())
+ *     u32  discovery duration, seconds — wall time from this wake's first
+ *          DBG_LOG to "Discovery complete" (see DeviceDiscovery.c's
+ *          u32CampaignStartMs). 0 on the basic-mode upload: a boundary flush
+ *          can carry several listen windows' worth of accumulated neighbours
+ *          from wakes long since finished, so there is no one campaign left
+ *          to time by the point it is sent — 0 means "not measured", the same
+ *          convention primaryVersion==0 and rssiSrc==0 already use elsewhere
+ *          on this wire.
+ *
+ * v1 (FR_BLOG_FORMAT_VER before this change) had no duration field and a
+ * 8-byte header; v2 appends it rather than inserting it, so v1's first 8
+ * bytes are unchanged. There is no fr9 firmware in the field that spoke v1,
+ * so no decode branch on the version byte was added for it — the fr9 simply
+ * rejects anything that isn't exactly the version it expects (see
+ * TAGDISC_bAcceptPayload), same as it always has. The two sides are paired
+ * hardware and must be flashed together regardless.
  *
  * Both record variants are FR_BLOG_RECORD_BYTES; the type selects the decode.
  * Fields are written one at a time, little-endian, and NOT memcpy'd out of
@@ -86,10 +102,10 @@ bool     FARMRANGER_bLogBasicData(MeshBasicNeighbor_t *neighbors, uint16_t count
  *
  * Flags byte: bit0 = MoveState, bit1 = GpsValid.
  * ------------------------------------------------------------------------- */
-#define FR_BLOG_FORMAT_VER      1U
+#define FR_BLOG_FORMAT_VER      2U
 #define FR_BLOG_TYPE_ADVANCED   0U
 #define FR_BLOG_TYPE_BASIC      1U
-#define FR_BLOG_HDR_BYTES       8U
+#define FR_BLOG_HDR_BYTES       12U
 #define FR_BLOG_RECORD_BYTES    22U
 
 /* True when the fr9's ready line advertised binary-upload support ("RDY,B").
@@ -100,8 +116,14 @@ bool     FARMRANGER_bLoggerSupportsBinary(void);
 /* Binary equivalents of FARMRANGER_bLogData / bLogBasicData. Same retry
  * policy, same pacing, same verdict handling. Returns false only when all
  * FR_LOG_ATTEMPTS failed, at which point the caller should fall back to the
- * CSV path rather than lose the campaign. */
-bool     FARMRANGER_bBLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count);
+ * CSV path rather than lose the campaign.
+ *
+ * u32DurationS: whole-discovery wall time in seconds, the caller's own
+ * measurement (Farmranger.c has no notion of when a campaign started). The
+ * basic variant carries no such parameter — see the FR_BLOG_HDR_BYTES note
+ * above for why it always sends 0. */
+bool     FARMRANGER_bBLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count,
+                              uint32_t u32DurationS);
 bool     FARMRANGER_bBLogBasicData(MeshBasicNeighbor_t *neighbors, uint16_t count);
 
 /* ---- Firmware-file pull (OTA acquire, see Worker/OtaUpdate) ----

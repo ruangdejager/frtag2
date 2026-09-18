@@ -326,7 +326,11 @@ _Static_assert(MESH_WAVE_BUDGET_MS <= APP_PRIMARY_CAMPAIGN_MAX_MS,
  * what gets POSTed to the server, rather than only scraped back out of an
  * uploaded syslog. See the wire-format block in Farmranger.h. */
 #define DEVICE_DISCOVERY_bLoggerBinary()                     FARMRANGER_bLoggerSupportsBinary()
-#define DEVICE_DISCOVERY_bSendDiscoveryDataBin(items, size)  FARMRANGER_bBLogData(items, size)
+/* durationS: whole-discovery wall time in seconds, measured by the caller
+ * (DeviceDiscovery.c's u32CampaignStartMs) — not something Farmranger.c has
+ * any way to know on its own. */
+#define DEVICE_DISCOVERY_bSendDiscoveryDataBin(items, size, durationS) \
+    FARMRANGER_bBLogData(items, size, durationS)
 
 /* ---- Production sleep state ---- */
 typedef enum {

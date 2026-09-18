@@ -863,13 +863,17 @@ static void FARMRANGER_vPut32(uint8_t *p, uint32_t v)
     p[3] = (uint8_t)((v >> 24) & 0xFFU);
 }
 
-/* Payload header: version, record type, count, this primary's device id. */
-static void FARMRANGER_vPackHeader(uint8_t *hdr, uint8_t u8Type, uint16_t count)
+/* Payload header: version, record type, count, this primary's device id,
+ * discovery duration (0 when the caller has none to report — see the
+ * FR_BLOG_HDR_BYTES note in Farmranger.h). */
+static void FARMRANGER_vPackHeader(uint8_t *hdr, uint8_t u8Type, uint16_t count,
+                                   uint32_t u32DurationS)
 {
     hdr[0] = (uint8_t)FR_BLOG_FORMAT_VER;
     hdr[1] = u8Type;
     FARMRANGER_vPut16(&hdr[2], count);
     FARMRANGER_vPut32(&hdr[4], LORARADIO_u32GetUniqueId());
+    FARMRANGER_vPut32(&hdr[8], u32DurationS);
 }
 
 /* Advanced record, FR_BLOG_RECORD_BYTES bytes. Field order is the wire
@@ -973,7 +977,8 @@ static bool FARMRANGER_bBLogVerdict(void)
 /* One AT+BLOG attempt. `u16Len` and `u16Crc` come from the single pass the
  * caller already made over the table, so an attempt never re-folds the CRC. */
 static bool FARMRANGER_bBLogAttempt(const MeshDiscoveredNeighbor_t *neighbors,
-                                    uint16_t count, uint16_t u16Len, uint16_t u16Crc)
+                                    uint16_t count, uint16_t u16Len, uint16_t u16Crc,
+                                    uint32_t u32DurationS)
 {
     uint8_t  au8Chunk[FR_BLOG_RECS_PER_CHUNK * FR_BLOG_RECORD_BYTES];
     uint8_t  au8Hdr[FR_BLOG_HDR_BYTES];
@@ -1002,7 +1007,7 @@ static bool FARMRANGER_bBLogAttempt(const MeshDiscoveredNeighbor_t *neighbors,
     }
 
     /* Step 2: header, then the records in paced chunks. */
-    FARMRANGER_vPackHeader(au8Hdr, (uint8_t)FR_BLOG_TYPE_ADVANCED, count);
+    FARMRANGER_vPackHeader(au8Hdr, (uint8_t)FR_BLOG_TYPE_ADVANCED, count, u32DurationS);
     if (!FARMRANGER_bBLogSendChunk(au8Hdr, (uint16_t)FR_BLOG_HDR_BYTES))
         return false;
 
@@ -1049,7 +1054,9 @@ static bool FARMRANGER_bBLogBasicAttempt(const MeshBasicNeighbor_t *neighbors,
         return false;
     }
 
-    FARMRANGER_vPackHeader(au8Hdr, (uint8_t)FR_BLOG_TYPE_BASIC, count);
+    /* 0: no meaningful single-campaign duration for a boundary flush — see
+     * the FR_BLOG_HDR_BYTES note in Farmranger.h. */
+    FARMRANGER_vPackHeader(au8Hdr, (uint8_t)FR_BLOG_TYPE_BASIC, count, 0UL);
     if (!FARMRANGER_bBLogSendChunk(au8Hdr, (uint16_t)FR_BLOG_HDR_BYTES))
         return false;
 
@@ -1073,7 +1080,8 @@ static bool FARMRANGER_bBLogBasicAttempt(const MeshBasicNeighbor_t *neighbors,
     return FARMRANGER_bBLogVerdict();
 }
 
-bool FARMRANGER_bBLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
+bool FARMRANGER_bBLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count,
+                          uint32_t u32DurationS)
 {
     uint8_t  au8Hdr[FR_BLOG_HDR_BYTES];
     uint8_t  au8Rec[FR_BLOG_RECORD_BYTES];
@@ -1086,7 +1094,7 @@ bool FARMRANGER_bBLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
      * the whole payload. */
     u16Len = (uint16_t)(FR_BLOG_HDR_BYTES + (count * FR_BLOG_RECORD_BYTES));
 
-    FARMRANGER_vPackHeader(au8Hdr, (uint8_t)FR_BLOG_TYPE_ADVANCED, count);
+    FARMRANGER_vPackHeader(au8Hdr, (uint8_t)FR_BLOG_TYPE_ADVANCED, count, u32DurationS);
     u16Crc = CRC16_u16CcittUpdate(CRC16_CCITT_INIT, au8Hdr, (uint16_t)FR_BLOG_HDR_BYTES);
 
     for (uint16_t i = 0; i < count; i++)
@@ -1100,7 +1108,7 @@ bool FARMRANGER_bBLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
      * silence timeout, so each attempt is self-contained. */
     for (uint8_t u8Attempt = 1U; u8Attempt <= FR_LOG_ATTEMPTS; u8Attempt++)
     {
-        if (FARMRANGER_bBLogAttempt(neighbors, count, u16Len, u16Crc))
+        if (FARMRANGER_bBLogAttempt(neighbors, count, u16Len, u16Crc, u32DurationS))
         {
             if (u8Attempt > 1U)
                 DBG_LOG("BLogData: upload OK on attempt %u\r\n", u8Attempt);
@@ -1127,7 +1135,7 @@ bool FARMRANGER_bBLogBasicData(MeshBasicNeighbor_t *neighbors, uint16_t count)
 
     u16Len = (uint16_t)(FR_BLOG_HDR_BYTES + (count * FR_BLOG_RECORD_BYTES));
 
-    FARMRANGER_vPackHeader(au8Hdr, (uint8_t)FR_BLOG_TYPE_BASIC, count);
+    FARMRANGER_vPackHeader(au8Hdr, (uint8_t)FR_BLOG_TYPE_BASIC, count, 0UL);
     u16Crc = CRC16_u16CcittUpdate(CRC16_CCITT_INIT, au8Hdr, (uint16_t)FR_BLOG_HDR_BYTES);
 
     for (uint16_t i = 0; i < count; i++)

@@ -215,6 +215,16 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         osDelay(APP_WAKEUP_BUFFER_MS);
         EVTLOG(LOG_DISCOVERY_START, eDeviceRole);
 
+        /* Wall time for the whole discovery, wake to "complete" below — not to
+         * be confused with either role branch's own internal u32CampaignStart
+         * (those exist purely to enforce that branch's own deadline). This one
+         * spans everything: wave loop or basic listen window, whichever role
+         * runs. Read again once we reach "Discovery complete" and handed to
+         * the fr9 in the AT+BLOG header, so the server finally knows how long
+         * a round actually took instead of estimating it from log arrival
+         * times. */
+        uint32_t u32CampaignStartMs = osKernelGetTickCount();
+
         /* The primary's discovery campaign always runs — a staged image
          * pending distribution used to skip it entirely (an "OTA distribution
          * slot" that sent OtaPrep where the DReq would have gone), which
@@ -747,6 +757,12 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         DBG_LOG("DeviceDiscovery %X: Discovery complete.\r\n",
             LORARADIO_u32GetUniqueId());
 
+        /* Whole-discovery duration, wake to here — see u32CampaignStartMs
+         * above. Passed to the fr9 in the AT+BLOG header (advanced mode only;
+         * see the call site below for why basic mode sends 0 instead). */
+        uint32_t u32CampaignDurationS =
+            (osKernelGetTickCount() - u32CampaignStartMs) / 1000U;
+
         /* Drop whatever mesh traffic is still queued for TX. The campaign it
          * belonged to is over, so sending it is pointless — and on a
          * heavy-forwarding node the radio task would otherwise spend minutes
@@ -934,7 +950,8 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
                     if (DEVICE_DISCOVERY_bLoggerBinary())
                     {
-                        bLogOk = DEVICE_DISCOVERY_bSendDiscoveryDataBin(tNeighbors, u16NeighborCount);
+                        bLogOk = DEVICE_DISCOVERY_bSendDiscoveryDataBin(tNeighbors, u16NeighborCount,
+                            u32CampaignDurationS);
 
                         /* Safety net for a mis-detect, nothing more. The ready
                          * line said this fr9 speaks AT+BLOG, so all three
