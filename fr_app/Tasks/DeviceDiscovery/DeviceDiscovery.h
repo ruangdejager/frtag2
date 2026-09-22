@@ -320,13 +320,12 @@ _Static_assert(MESH_WAVE_BUDGET_MS <= APP_PRIMARY_CAMPAIGN_MAX_MS,
 #define DEVICE_DISCOVERY_DRIVER_vDisconnectLogger()          FARMRANGER_vDeviceOff()
 #define DEVICE_DISCOVERY_DRIVER_u64RequestTS()               FARMRANGER_u64RequestTimestamp()
 #define DEVICE_DISCOVERY_DRIVER_bRequestSettings(pi, pm, pg) FARMRANGER_bRequestSettings((pi), (pm), (pg))
-#define DEVICE_DISCOVERY_bSendDiscoveryData(items, size)     FARMRANGER_bLogData(items, size)
-/* Binary upload (AT+BLOG), used when the fr9's ready line advertised support.
- * Same campaign, about half the bytes, CRC-checked - and on the fr9 side it is
- * what gets POSTed to the server, rather than only scraped back out of an
- * uploaded syslog. See the wire-format block in Farmranger.h. */
-#define DEVICE_DISCOVERY_bLoggerBinary()                     FARMRANGER_bLoggerSupportsBinary()
-/* durationS: whole-discovery wall time in seconds, measured by the caller
+/* AT+LOG (CSV) removed — primary speaks AT+BLOG only now.
+ * Binary upload (AT+BLOG): same campaign, about half the bytes, CRC-checked -
+ * and on the fr9 side it is what gets POSTed to the server, rather than only
+ * scraped back out of an uploaded syslog. See the wire-format block in
+ * Farmranger.h.
+ * durationS: whole-discovery wall time in seconds, measured by the caller
  * (DeviceDiscovery.c's u32CampaignStartMs) — not something Farmranger.c has
  * any way to know on its own. */
 #define DEVICE_DISCOVERY_bSendDiscoveryDataBin(items, size, durationS) \

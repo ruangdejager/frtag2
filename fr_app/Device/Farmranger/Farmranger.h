@@ -43,19 +43,12 @@ uint64_t FARMRANGER_u64RequestTimestamp(void);
 bool     FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
                                      bool    *pbBasicMode,
                                      bool    *pbGpsEnabled);
-bool     FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count);
-
-/* Basic-mode variant: uploads the primary's accumulated MeshBasicNeighbor_t
- * RAM store to fr9 (same AT+LOG framing, different per-row column set —
- * see FARMRANGER_iFormatBasicRow). Called at each WakeupInterval boundary
- * in basic mode. fr9 side treats the payload as opaque bytes so no
- * parser change is needed there. */
-bool     FARMRANGER_bLogBasicData(MeshBasicNeighbor_t *neighbors, uint16_t count);
+/* AT+LOG (CSV) upload removed — primary speaks AT+BLOG only now. */
 
 /* ---- Binary discovery upload (AT+BLOG) ----------------------------------
  *
- * Replaces the CSV upload above on an fr9 that supports it. Roughly half the
- * bytes, and a CRC-16 so a corrupted transfer is detected rather than logged.
+ * The only upload path. Roughly half the bytes of the old CSV framing, and
+ * a CRC-16 so a corrupted transfer is detected rather than logged.
  *
  * The fr9 no longer merely counts records and streams the bytes into its log:
  * it decodes them, keeps them, and POSTs the campaign to the server as CBOR.
@@ -113,10 +106,9 @@ bool     FARMRANGER_bLogBasicData(MeshBasicNeighbor_t *neighbors, uint16_t count
  * that, and false against any fr9 on firmware older than 9.13.0. */
 bool     FARMRANGER_bLoggerSupportsBinary(void);
 
-/* Binary equivalents of FARMRANGER_bLogData / bLogBasicData. Same retry
- * policy, same pacing, same verdict handling. Returns false only when all
- * FR_LOG_ATTEMPTS failed, at which point the caller should fall back to the
- * CSV path rather than lose the campaign.
+/* Sole discovery upload path. Same retry policy, same pacing, same verdict
+ * handling the old CSV path used. Returns false when all FR_LOG_ATTEMPTS
+ * failed — there is no CSV fallback, so that campaign is lost.
  *
  * u32DurationS: whole-discovery wall time in seconds, the caller's own
  * measurement (Farmranger.c has no notion of when a campaign started). The
@@ -196,11 +188,11 @@ typedef struct {
 
 /* Upload measured beacons to the fr9 for logging to its flash — in practice
  * one at a time, as each beacon is heard. Same handshake/pacing/verdict
- * contract as FARMRANGER_bLogData against the fr9's AT+RTLOG handler, but a
+ * contract as FARMRANGER_bBLogData against the fr9's AT+RTLOG handler, but a
  * SINGLE attempt: the caller is expected to be keeping up with a live 5 s
  * beacon stream, so recovery is its decision, not ours (see the note on the
  * implementation). The caller owns the connect/disconnect
- * (FARMRANGER_bDeviceOn / FARMRANGER_vDeviceOff), exactly as for AT+LOG; the
+ * (FARMRANGER_bDeviceOn / FARMRANGER_vDeviceOff), exactly as for AT+BLOG; the
  * radio test opens and drops a session per beacon. */
 bool FARMRANGER_bLogRadioTestData(const FarmrangerRtBeacon_t *pBeacons,
                                   uint16_t u16Count);

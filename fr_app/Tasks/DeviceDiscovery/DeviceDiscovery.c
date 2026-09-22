@@ -944,32 +944,11 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 }
                 else
                 {
-                    DBG_LOG("DeviceDiscovery %X: Logger connected (%s upload).\r\n",
-                        LORARADIO_u32GetUniqueId(),
-                        DEVICE_DISCOVERY_bLoggerBinary() ? "binary" : "csv");
+                    DBG_LOG("DeviceDiscovery %X: Logger connected (binary upload).\r\n",
+                        LORARADIO_u32GetUniqueId());
 
-                    if (DEVICE_DISCOVERY_bLoggerBinary())
-                    {
-                        bLogOk = DEVICE_DISCOVERY_bSendDiscoveryDataBin(tNeighbors, u16NeighborCount,
-                            u32CampaignDurationS);
-
-                        /* Safety net for a mis-detect, nothing more. The ready
-                         * line said this fr9 speaks AT+BLOG, so all three
-                         * attempts failing means something other than
-                         * capability is wrong - but the campaign is worth one
-                         * try over the path that is certain to be understood
-                         * before it is given up on. */
-                        if (!bLogOk)
-                        {
-                            DBG_LOG("DeviceDiscovery %X: binary upload failed - falling back to csv.\r\n",
-                                LORARADIO_u32GetUniqueId());
-                            bLogOk = DEVICE_DISCOVERY_bSendDiscoveryData(tNeighbors, u16NeighborCount);
-                        }
-                    }
-                    else
-                    {
-                        bLogOk = DEVICE_DISCOVERY_bSendDiscoveryData(tNeighbors, u16NeighborCount);
-                    }
+                    bLogOk = DEVICE_DISCOVERY_bSendDiscoveryDataBin(tNeighbors, u16NeighborCount,
+                        u32CampaignDurationS);
                 }
 
                 if (bLogOk)
@@ -1618,7 +1597,7 @@ static void DEVICE_DISCOVERY_vSendTS(void)
  * DEVICE_DISCOVERY_bBasicLogAndClear
  *
  * Snapshot the basic-mode RAM store, connect to Farmranger, upload via
- * FARMRANGER_bLogBasicData, clear the store, disconnect. Nothing else —
+ * FARMRANGER_bBLogBasicData, clear the store, disconnect. Nothing else —
  * no timestamp sync, no AT+SETREQ, no TimeSync TX. Shared by both:
  *   - the mid-cycle HWM auto-flush (fires whenever the store hits
  *     DEVICE_DISCOVERY_BASIC_HWM inside a listen window), and
@@ -1667,18 +1646,9 @@ static bool DEVICE_DISCOVERY_bBasicLogAndClear(const char *pacReason)
         DBG_LOG("DeviceDiscovery %X: basic-mode %s log skipped - no RDY.\r\n",
                 LORARADIO_u32GetUniqueId(), pacReason);
     }
-    else if (DEVICE_DISCOVERY_bLoggerBinary())
-    {
-        bOk = FARMRANGER_bBLogBasicData(tBasic, u16Count);
-        if (!bOk)
-        {
-            DBG_LOG("DeviceDiscovery: basic-mode binary upload failed - falling back to csv.\r\n");
-            bOk = FARMRANGER_bLogBasicData(tBasic, u16Count);
-        }
-    }
     else
     {
-        bOk = FARMRANGER_bLogBasicData(tBasic, u16Count);
+        bOk = FARMRANGER_bBLogBasicData(tBasic, u16Count);
     }
 
     DBG_LOG("DeviceDiscovery %X: basic-mode %s log %s.\r\n",

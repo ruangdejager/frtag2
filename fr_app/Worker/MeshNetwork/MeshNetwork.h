@@ -896,9 +896,9 @@ void MESHNETWORK_vSendBasicBeacon(void);
 /* Basic-mode primary RAM store: one entry per unique DeviceId, updated
  * on each MeshPktType_BasicBeacon received during the 15-min listen
  * window (newer BeaconMsgId wins, older is ignored). Flushed to the fr9
- * at each WakeupInterval boundary via FARMRANGER_bLogBasicData and then
+ * at each WakeupInterval boundary via FARMRANGER_bBLogBasicData and then
  * cleared. Column set differs from the advanced-mode neighbor table (no
- * hops / wave / RSSI, has GPS-age) so it uses its own struct + row
+ * hops / wave / RSSI, has GPS-age) so it uses its own struct + record
  * format on the Farmranger side. */
 /* Field order + the u8MoveState/bGpsValid bitfields keep this at 24 bytes
  * (vs. 28 with naive ordering) — same tight-packing this file already
