@@ -424,7 +424,7 @@ void GPS_vRequestFix(bool bAutoShutdownIn, uint32_t u32TtffTimeoutS, bool bForce
      * mirrored into MeshNetwork's bCurrentGpsEnabled. When disabled we
      * skip every GPS peripheral touch (no power-on, no dispatcher kick).
      * Cached last-known fix keeps aging in place; callers that need
-     * position (basic-mode beacons) read it via GPS_bGetLastKnownFix and
+     * position (LoRaWAN-mode reports) read it via GPS_bGetLastKnownFix and
      * stamp its age.
      *
      * bForce overrides the gate for callers that MUST have a fix even
@@ -992,6 +992,11 @@ uint32_t GPS_u32GetLastFixAgeSeconds(void)
     if (!bHasEverFixed) return UINT32_MAX;
     uint64_t u64Now = RTC_u64GetUTC();
     return (u64Now > u64LastFixUtc) ? (uint32_t)(u64Now - u64LastFixUtc) : 0U;
+}
+
+bool GPS_bIsActive(void)
+{
+    return eState != GPS_STATE_IDLE;
 }
 
 /* --------------------------------------------------------------------------

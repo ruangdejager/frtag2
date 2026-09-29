@@ -640,7 +640,7 @@ void LORARADIO_vEnterDeepSleep(void)
 {
     /* Refuse while someone holds the radio awake. The chip is a shared
      * resource with several owners on different tasks — DeviceDiscovery's
-     * campaign tail, its basic-beacon path and its sleep-mode entry all call
+     * campaign tail and its sleep-mode entry, and the LoRaWAN session, all call
      * this — and a caller finishing ITS work is not evidence that the radio is
      * idle. The radio range test found this the hard way: entering it from a
      * FrKernel session released the AppTask's "waiting for release" hold, and

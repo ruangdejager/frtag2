@@ -45,7 +45,7 @@ void SETTINGS_vSetByteAtOffset(uint32_t offset, uint8_t value)
 void SETTINGS_vResetByteAtOffset(uint32_t offset)
 {
     *(uint8_t *)((uint8_t *)&currentSettings + offset) =
-        *(uint8_t *)((uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset);
+        *(const uint8_t *)((const uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset);
 }
 
 /* ---- uint16_t ------------------------------------------------------------ */
@@ -62,7 +62,7 @@ void SETTINGS_vSetShortAtOffset(uint32_t offset, uint16_t value)
 void SETTINGS_vResetShortAtOffset(uint32_t offset)
 {
     *(uint16_t *)((uint8_t *)&currentSettings + offset) =
-        *(uint16_t *)((uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset);
+        *(const uint16_t *)((const uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset);
 }
 
 /* ---- uint32_t ------------------------------------------------------------ */
@@ -79,7 +79,7 @@ void SETTINGS_vSetWordAtOffset(uint32_t offset, uint32_t extra, uint32_t value)
 void SETTINGS_vResetWordAtOffset(uint32_t offset, uint32_t extra)
 {
     *(uint32_t *)((uint8_t *)&currentSettings + offset + extra) =
-        *(uint32_t *)((uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset + extra);
+        *(const uint32_t *)((const uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset + extra);
 }
 
 /* ---- strings ------------------------------------------------------------- */
@@ -114,7 +114,7 @@ bool SETTINGS_bCheckStringAtOffset(uint32_t offset, size_t length_at_offset, boo
 
 void SETTINGS_vResetStringAtOffset(uint32_t offset, size_t length)
 {
-    uint8_t *source = (uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset;
+    const uint8_t *source = (const uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset;
     uint8_t *dest   = (uint8_t *)&currentSettings + offset;
     memset(dest, 0, length);
     memcpy(dest, source, length);
@@ -134,7 +134,7 @@ bool SETTINGS_bGetBoolAtOffset(uint32_t offset, uint32_t extra)
 void SETTINGS_vResetBoolAtOffset(uint32_t offset, uint32_t extra)
 {
     *(bool *)((uint8_t *)&currentSettings + offset + extra) =
-        *(bool *)((uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset + extra);
+        *(const bool *)((const uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset + extra);
 }
 
 /* ---- struct pointer ------------------------------------------------------ */

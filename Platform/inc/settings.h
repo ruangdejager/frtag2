@@ -16,7 +16,7 @@
 
 typedef Settings_EE settings_struct_t;
 
-extern Settings_EE settings_def;
+extern const Settings_EE settings_def;
 
 #define SETTINGS_CONF_DEFAULT_STRUCT    settings_def
 

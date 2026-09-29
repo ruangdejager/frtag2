@@ -33,7 +33,7 @@ uint32_t TIMER_IF_Convert_Tick2ms(uint32_t tick);
 
 void     TIMER_IF_DelayMs(uint32_t delay);
 
-/* stm32_systime.c back-end (stub — systime not used in this project) */
+/* stm32_systime.c back-end (seconds since boot; see timer_if.c) */
 uint32_t TIMER_IF_GetTime(uint16_t *subSeconds);
 void     TIMER_IF_BkUp_Write_Seconds(uint32_t Seconds);
 uint32_t TIMER_IF_BkUp_Read_Seconds(void);

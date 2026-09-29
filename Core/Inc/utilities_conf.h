@@ -28,6 +28,10 @@ extern "C" {
 
 #define UTILS_MEMSET8(dest, value, size) memset((dest),(value),(size))
 
+/* Used by the LoRaWAN middleware (LoRaMacCrypto.c) for its AES/CMAC
+ * block buffers. */
+#define ALIGN(n)                         __attribute__((aligned(n)))
+
 /******************************************************************************
  * UTIL_ADV_TRACE configuration (required by Utilities/trace/adv_trace)
  ******************************************************************************/

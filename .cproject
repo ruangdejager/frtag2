@@ -86,6 +86,11 @@
 									<listOptionValue builtIn="false" value="../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM3"/>
 									<listOptionValue builtIn="false" value="../Middlewares/Third_Party/SubGHz_Phy"/>
 									<listOptionValue builtIn="false" value="../Middlewares/Third_Party/SubGHz_Phy/stm32_radio_driver"/>
+									<listOptionValue builtIn="false" value="../Middlewares/Third_Party/LoRaWAN/Mac"/>
+									<listOptionValue builtIn="false" value="../Middlewares/Third_Party/LoRaWAN/Mac/Region"/>
+									<listOptionValue builtIn="false" value="../Middlewares/Third_Party/LoRaWAN/Crypto"/>
+									<listOptionValue builtIn="false" value="../Middlewares/Third_Party/LoRaWAN/Utilities"/>
+									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/fr_app/Worker/LoRaWan}&quot;"/>
 									<listOptionValue builtIn="false" value="../SubGHz_Phy/App"/>
 									<listOptionValue builtIn="false" value="../SubGHz_Phy/Target"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/fr_app}&quot;"/>
@@ -237,6 +242,11 @@
 									<listOptionValue builtIn="false" value="../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM3"/>
 									<listOptionValue builtIn="false" value="../Middlewares/Third_Party/SubGHz_Phy"/>
 									<listOptionValue builtIn="false" value="../Middlewares/Third_Party/SubGHz_Phy/stm32_radio_driver"/>
+									<listOptionValue builtIn="false" value="../Middlewares/Third_Party/LoRaWAN/Mac"/>
+									<listOptionValue builtIn="false" value="../Middlewares/Third_Party/LoRaWAN/Mac/Region"/>
+									<listOptionValue builtIn="false" value="../Middlewares/Third_Party/LoRaWAN/Crypto"/>
+									<listOptionValue builtIn="false" value="../Middlewares/Third_Party/LoRaWAN/Utilities"/>
+									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/fr_app/Worker/LoRaWan}&quot;"/>
 									<listOptionValue builtIn="false" value="../SubGHz_Phy/App"/>
 									<listOptionValue builtIn="false" value="../SubGHz_Phy/Target"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/fr_app}&quot;"/>

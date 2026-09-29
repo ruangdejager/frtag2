@@ -703,7 +703,16 @@ TimerEvent_t RxTimeoutTimer;
 
 static void RadioInit( RadioEvents_t *events )
 {
-    RadioEvents = events;
+    /* frtag2 local change: NULL keeps the events already registered. The
+     * mesh driver (LoraRadio_Driver.c) takes the DIO callback over with its
+     * own SUBGRF_Init() on every mesh wake, and LoRaMac only calls Radio.Init
+     * once, from LoRaMacInitialization. Radio.Init(NULL) is how LoRaWan.c
+     * hands the radio back to this driver - and to LoRaMac's events - at the
+     * start of each uplink session. */
+    if( events != NULL )
+    {
+        RadioEvents = events;
+    }
 
     SubgRf.RxContinuous = false;
     SubgRf.TxTimeout = 0;

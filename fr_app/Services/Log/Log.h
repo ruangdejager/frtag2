@@ -14,11 +14,20 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Log partition: the upper 272 KB of the 512 KB device. The lower region
- * (0x00000-0x3BFFF) belongs to the OTA image scratchpad + metadata — see
- * fr_app/Worker/Fota/Fota_Config.h for the full partition map. */
+/* Log partition: 0x3C000-0x7EFFF, 268 KB of the 512 KB device. The lower
+ * region (0x00000-0x3BFFF) belongs to the OTA image scratchpad + metadata —
+ * see fr_app/Worker/Fota/Fota_Config.h for the full partition map (whose
+ * "text log" line still says 0x7FFFF: that file is a byte-identical copy of
+ * the bootloader's, and the bootloader never touches this region).
+ *
+ * The last sector, 0x7F000-0x7FFFF, was taken from the log in v2.5.0 for the
+ * LoRaWAN DevNonce record (fr_app/Worker/LoRaWan/LoRaWan.c). LOG_vErase leaves
+ * it alone; LOG_vEraseAll (chip erase) does not - after a "tag flash
+ * eraseall" the tag restarts its DevNonce at 0, and TTN will refuse its joins
+ * until the device's used DevNonces are reset in the TTN console. */
 #define LOG_FLASH_START_ADDR    0x03C000UL
-#define LOG_FLASH_END_ADDR      0x080000UL
+#define LORAWAN_NVM_FLASH_ADDR  0x07F000UL
+#define LOG_FLASH_END_ADDR      LORAWAN_NVM_FLASH_ADDR
 #define LOG_FLASH_SIZE_BYTES    (LOG_FLASH_END_ADDR - LOG_FLASH_START_ADDR)
 
 void     LOG_vInit(void);

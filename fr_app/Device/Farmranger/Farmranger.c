@@ -418,14 +418,16 @@ uint64_t FARMRANGER_u64RequestTimestamp(void)
  * every wake, in one AT round trip. Response wire format on the fr9 side
  * (see FRTAG_vSetReqHandler in fr9_application/fr_app/src/frtag.c):
  *
- *     "<interval_min>,<basic_mode>,<gps_enabled>\r\n"
+ *     "<interval_min>,<lorawan_mode>,<gps_enabled>\r\n"
  *
- * where basic_mode and gps_enabled are 0 or 1. Any bogus/short response
+ * where lorawan_mode and gps_enabled are 0 or 1 (the mode field used to mean
+ * basic mode; fr9 still answers 1 for its codes 62/63, which v2.5.0 reads as
+ * LoRaWAN mode - see DiscoveryMode_e). Any bogus/short response
  * leaves the outputs untouched and returns false; caller keeps its
  * previous defaults (safe cold-boot behavior).
  * -------------------------------------------------------------------------- */
 bool FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
-                                 bool    *pbBasicMode,
+                                 bool    *pbLoRaWanMode,
                                  bool    *pbGpsEnabled)
 {
     char respBuf[32] = {0};
@@ -458,14 +460,14 @@ bool FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
     if (endptr == p) return false;
 
     if (pu8Interval)  *pu8Interval  = (uint8_t)ulInterval;
-    if (pbBasicMode)  *pbBasicMode  = (ulMode != 0UL);
+    if (pbLoRaWanMode) *pbLoRaWanMode = (ulMode != 0UL);
     if (pbGpsEnabled) *pbGpsEnabled = (ulGps  != 0UL);
     return true;
 }
 
 /* --------------------------------------------------------------------------
  * AT+LOG (CSV) upload removed — primary now speaks AT+BLOG only. See
- * FARMRANGER_bBLogData / FARMRANGER_bBLogBasicData below.
+ * FARMRANGER_bBLogData below.
  * -------------------------------------------------------------------------- */
 
 /* Inter-row pacing for the binary upload (ms). The fr9 receives into a
@@ -563,21 +565,6 @@ static void FARMRANGER_vPackRow(uint8_t *rec, const MeshDiscoveredNeighbor_t *n)
     /* bit0 carries u8MoveState as-is (0 = moving, 1 = still). Not inverted
      * into a "moving" boolean anywhere along the way - the fr9 renders this
      * straight back into the Move column it has always printed. */
-    rec[21] = (uint8_t)((n->u8MoveState ? 0x01U : 0x00U)
-                      | (n->bGpsValid  ? 0x02U : 0x00U));
-}
-
-/* Basic record, same width, different fields - and no hops/wave, because
- * basic mode runs no mesh campaign. */
-static void FARMRANGER_vPackBasicRow(uint8_t *rec, const MeshBasicNeighbor_t *n)
-{
-    FARMRANGER_vPut32(&rec[0],  n->u32DeviceId);
-    FARMRANGER_vPut32(&rec[4],  (uint32_t)(n->bGpsValid ? n->i32LatUDeg : 0));
-    FARMRANGER_vPut32(&rec[8],  (uint32_t)(n->bGpsValid ? n->i32LonUDeg : 0));
-    FARMRANGER_vPut32(&rec[12], n->bGpsValid ? n->u32GpsAgeS : 0UL);
-    FARMRANGER_vPut16(&rec[16], n->u16BatMv);
-    FARMRANGER_vPut16(&rec[18], (uint16_t)n->i16Rssi);
-    rec[20] = n->u8FwPatch;
     rec[21] = (uint8_t)((n->u8MoveState ? 0x01U : 0x00U)
                       | (n->bGpsValid  ? 0x02U : 0x00U));
 }
@@ -702,54 +689,6 @@ static bool FARMRANGER_bBLogAttempt(const MeshDiscoveredNeighbor_t *neighbors,
     return FARMRANGER_bBLogVerdict();
 }
 
-static bool FARMRANGER_bBLogBasicAttempt(const MeshBasicNeighbor_t *neighbors,
-                                         uint16_t count, uint16_t u16Len, uint16_t u16Crc)
-{
-    /* Parallel to FARMRANGER_bBLogAttempt for the same reason
-     * bLogBasicAttempt is parallel to bLogAttempt: the two column sets should
-     * be free to drift without either path growing a function pointer. */
-    uint8_t  au8Chunk[FR_BLOG_RECS_PER_CHUNK * FR_BLOG_RECORD_BYTES];
-    uint8_t  au8Hdr[FR_BLOG_HDR_BYTES];
-    char     cmd[48];
-    char     respBuf[32] = {0};
-
-    snprintf(cmd, sizeof(cmd), "AT+BLOG=%u,%lu,%04X\r\n",
-             (unsigned)u16Len, (unsigned long)VERSION_u32Get(), (unsigned)u16Crc);
-
-    if (!FARMRANGER_bATSend(cmd, FARMRANGER_bParseLoggerReady,
-                            respBuf, sizeof(respBuf), respBuf, 3000))
-    {
-        EVTLOG(LOG_FRLOG_ERROR, 1);
-        DBG_LOG("BLogData: No 'Logger ready' (basic Step 1 fail).\r\n");
-        return false;
-    }
-
-    /* 0: no meaningful single-campaign duration for a boundary flush — see
-     * the FR_BLOG_HDR_BYTES note in Farmranger.h. */
-    FARMRANGER_vPackHeader(au8Hdr, (uint8_t)FR_BLOG_TYPE_BASIC, count, 0UL);
-    if (!FARMRANGER_bBLogSendChunk(au8Hdr, (uint16_t)FR_BLOG_HDR_BYTES))
-        return false;
-
-    for (uint16_t i = 0; i < count; )
-    {
-        uint16_t u16InChunk = 0;
-
-        while ((u16InChunk < FR_BLOG_RECS_PER_CHUNK) && (i < count))
-        {
-            FARMRANGER_vPackBasicRow(&au8Chunk[u16InChunk * FR_BLOG_RECORD_BYTES],
-                                     &neighbors[i]);
-            u16InChunk++;
-            i++;
-        }
-
-        if (!FARMRANGER_bBLogSendChunk(au8Chunk,
-                (uint16_t)(u16InChunk * FR_BLOG_RECORD_BYTES)))
-            return false;
-    }
-
-    return FARMRANGER_bBLogVerdict();
-}
-
 bool FARMRANGER_bBLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count,
                           uint32_t u32DurationS)
 {
@@ -793,44 +732,6 @@ bool FARMRANGER_bBLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count,
     }
 
     DBG_LOG("BLogData: all %u attempts failed\r\n", FR_LOG_ATTEMPTS);
-    return false;
-}
-
-bool FARMRANGER_bBLogBasicData(MeshBasicNeighbor_t *neighbors, uint16_t count)
-{
-    uint8_t  au8Hdr[FR_BLOG_HDR_BYTES];
-    uint8_t  au8Rec[FR_BLOG_RECORD_BYTES];
-    uint16_t u16Len;
-    uint16_t u16Crc;
-
-    u16Len = (uint16_t)(FR_BLOG_HDR_BYTES + (count * FR_BLOG_RECORD_BYTES));
-
-    FARMRANGER_vPackHeader(au8Hdr, (uint8_t)FR_BLOG_TYPE_BASIC, count, 0UL);
-    u16Crc = CRC16_u16CcittUpdate(CRC16_CCITT_INIT, au8Hdr, (uint16_t)FR_BLOG_HDR_BYTES);
-
-    for (uint16_t i = 0; i < count; i++)
-    {
-        FARMRANGER_vPackBasicRow(au8Rec, &neighbors[i]);
-        u16Crc = CRC16_u16CcittUpdate(u16Crc, au8Rec, (uint16_t)FR_BLOG_RECORD_BYTES);
-    }
-
-    for (uint8_t u8Attempt = 1U; u8Attempt <= FR_LOG_ATTEMPTS; u8Attempt++)
-    {
-        if (FARMRANGER_bBLogBasicAttempt(neighbors, count, u16Len, u16Crc))
-        {
-            if (u8Attempt > 1U)
-                DBG_LOG("BLogData: basic upload OK on attempt %u\r\n", u8Attempt);
-            return true;
-        }
-
-        if (u8Attempt < FR_LOG_ATTEMPTS)
-        {
-            DBG_LOG("BLogData: basic attempt %u failed, retrying...\r\n", u8Attempt);
-            osDelay(FR_LOG_RETRY_DELAY_MS);
-        }
-    }
-
-    DBG_LOG("BLogData: basic all %u attempts failed\r\n", FR_LOG_ATTEMPTS);
     return false;
 }
 

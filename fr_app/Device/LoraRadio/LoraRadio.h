@@ -148,7 +148,7 @@ void LORARADIO_vWakeUp(void);
 /* Hold the radio out of deep sleep, or release that hold.
  *
  * The chip has several owners on different tasks (DeviceDiscovery's campaign
- * tail, its basic-beacon path, its sleep-mode entry), and each of them calls
+ * tail, its sleep-mode entry, the LoRaWAN session), and each of them calls
  * LORARADIO_vEnterDeepSleep() when ITS work is done — which is not the same as
  * the radio being idle. A long-running user of the radio that outlives those
  * owners takes this for its duration; while it is held,

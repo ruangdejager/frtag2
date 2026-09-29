@@ -137,7 +137,20 @@ extern SUBGHZ_HandleTypeDef hsubghz;
 #define RADIO_MEMCPY8( dest, src, size )        UTIL_MEM_cpy_8( dest, src, size )
 
 /* USER CODE BEGIN EM */
-
+/* Radio IRQ deferral (frtag2). By default radio.c runs RadioIrqProcess()
+ * straight from the SUBGHZ ISR, and in there LoRaMac's TX-done handler arms
+ * its RX-window timers - which on this project are FreeRTOS software timers
+ * (Core/Src/timer_if.c) and must not be started from an ISR. These hooks are
+ * ST's own seam for moving that work to a task: the ISR only latches the IRQ
+ * and wakes the LoRaWAN session loop (fr_app/Worker/LoRaWan/LoRaWan.c), which
+ * then calls RadioIrqProcess() from task context.
+ *
+ * The mesh never takes this path: LoraRadio_Driver.c registers its own DIO
+ * callback with SUBGRF_Init() and never goes through radio.c. */
+void LORAWAN_vRegisterRadioIrqProcess(void (*pfnProcess)(void));
+void LORAWAN_vRadioIrqFromIsr(void);
+#define RADIO_IRQ_PROCESS_INIT()   LORAWAN_vRegisterRadioIrqProcess(RadioIrqProcess)
+#define RADIO_IRQ_PROCESS()        LORAWAN_vRadioIrqFromIsr()
 /* USER CODE END EM */
 
 /* Exported functions prototypes ---------------------------------------------*/

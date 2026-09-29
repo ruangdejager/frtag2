@@ -46,33 +46,6 @@
 #define MESH_BEACON_FLAG_GPS_VALID  0x02U   /* bit1: 1 = lat/lon present   */
 #define MESH_BEACON_FLAG_RSSI_SRC   0x04U   /* bit2: 1 = best-RSSI src id present */
 
-/* ---- BasicBeacon flags byte (byte 11) ---- */
-#define MESH_BBEACON_FLAG_STILL      0x01U   /* bit0: 1 = still, 0 = moving */
-#define MESH_BBEACON_FLAG_GPS_VALID  0x02U   /* bit1: 1 = lat/lon+age valid */
-
-/* BasicBeacon on-wire sizes.
- *
- * Layout:
- *   [0]      type
- *   [1..4]   DeviceId
- *   [5..8]   BeaconMsgId
- *   [9..10]  BatMv
- *   [11]     flags (STILL, GPS_VALID)
- *   [12]     u8FwPatch
- *   [13..16] i32LatUDeg    (only if GPS_VALID)
- *   [17..20] i32LonUDeg    (only if GPS_VALID)
- *   [21..24] u32GpsAgeS    (only if GPS_VALID)
- */
-#define MESH_BBEACON_LEN_BASE       13U
-#define MESH_BBEACON_LEN_GPS        25U
-
-/* Basic-mode primary RAM store — one entry per unique DeviceId, replaced
- * on receive only when the incoming BeaconMsgId is strictly newer. Cap
- * (MESH_MAX_BASIC_NEIGHBORS) lives in MeshNetwork.h since callers stack-
- * allocate a copy for MESHNETWORK_bGetBasicNeighbors. */
-static MeshBasicNeighbor_t tBasicNeighborTable[MESH_MAX_BASIC_NEIGHBORS];
-static uint16_t            u16BasicNeighborCount = 0U;
-
 /* DBeacon on-wire sizes.
  *
  * Layout:
@@ -265,7 +238,7 @@ static const uint8_t u8CurrentWakeupIntervalMin[] = {
 
 /* ---- Discovery mode + GPS-enable state ----
  * Safe cold-boot defaults: full mesh campaign and GPS active — matches
- * behaviour before the basic-mode feature. Overwritten by the first
+ * behaviour before the mode setting existed. Overwritten by the first
  * incoming TimeSync (secondary) or the first AT+SETREQ response (primary). */
 static DiscoveryMode_e eCurrentDiscoveryMode = DISCOVERY_MODE_ADVANCED;
 static bool            bCurrentGpsEnabled    = true;
@@ -282,7 +255,6 @@ static const char * const MeshPktTypeStr[] = {
     [MeshPktType_OtaChunk]   = "OtaChunk",
     [MeshPktType_OtaPoll]    = "OtaPoll",
     [MeshPktType_OtaReport]  = "OtaReport",
-    [MeshPktType_BasicBeacon] = "BasicBeacon"
 };
 
 /* ---- Misc state ---- */
@@ -638,8 +610,7 @@ static bool DREQ_bClaimForward(uint32_t u32DreqId, uint8_t *pu8Ordinal)
  * -------------------------------------------------------------------------- */
 /* Takes the decoded beacon rather than a field-per-parameter list: at eleven
  * scalars the old signature was one positional mistake away from silently
- * swapping two same-typed fields, and BASIC_vAddOrUpdate below already works
- * this way. */
+ * swapping two same-typed fields. */
 static void NEIGHBOR_vAddOrUpdate(const MeshPktDBeacon_t *ptBeacon)
 {
     bool bTableFullDrop = false;
@@ -796,37 +767,6 @@ static bool MESHNETWORK_bEncodeDBeacon(const MeshPktDBeacon_t *ptBeacon,
     return true;
 }
 
-static bool MESHNETWORK_bEncodeBasicBeacon(const MeshPktBasicBeacon_t *ptBB,
-                                            uint8_t *pBuf,
-                                            size_t u32BufLen,
-                                            size_t *pu32Written)
-{
-    size_t u32Needed = ptBB->bGpsValid ? MESH_BBEACON_LEN_GPS
-                                        : MESH_BBEACON_LEN_BASE;
-    if (u32BufLen < u32Needed) return false;
-
-    pBuf[0] = (uint8_t)MeshPktType_BasicBeacon;
-    write_u32_be(&pBuf[1], ptBB->u32DeviceId);
-    write_u32_be(&pBuf[5], ptBB->u32BeaconMsgId);
-    write_u16_be(&pBuf[9], ptBB->u16BatMv);
-
-    uint8_t u8Flags = 0U;
-    if (ptBB->u8MoveState != 0U) u8Flags |= MESH_BBEACON_FLAG_STILL;
-    if (ptBB->bGpsValid)         u8Flags |= MESH_BBEACON_FLAG_GPS_VALID;
-    pBuf[11] = u8Flags;
-    pBuf[12] = ptBB->u8FwPatch;
-
-    if (ptBB->bGpsValid)
-    {
-        write_u32_be(&pBuf[13], (uint32_t)ptBB->i32LatUDeg);
-        write_u32_be(&pBuf[17], (uint32_t)ptBB->i32LonUDeg);
-        write_u32_be(&pBuf[21], ptBB->u32GpsAgeS);
-    }
-
-    *pu32Written = u32Needed;
-    return true;
-}
-
 static bool MESHNETWORK_bEncodeDAck(const MeshPktDAck_t *ptAck,
                                      uint8_t *pBuf,
                                      size_t u32BufLen,
@@ -850,7 +790,10 @@ static bool MESHNETWORK_bEncodeDAck(const MeshPktDAck_t *ptAck,
  * before the flag existed — so bumping the packet from 10 -> 11 bytes
  * is backward-compatible in both directions. */
 #define MESH_TIMESYNC_FLAG_GPS_ENABLED   0x01U
-#define MESH_TIMESYNC_FLAG_BASIC_MODE    0x02U
+/* bit1 was BASIC_MODE until v2.5.0; LoRaWAN mode took over the same wire
+ * value, so a v2.4.x primary configured for "basic" and a v2.5 one for
+ * "LoRaWAN" send the same flags byte. See DiscoveryMode_e. */
+#define MESH_TIMESYNC_FLAG_LORAWAN_MODE  0x02U
 #define MESH_TIMESYNC_LEN                11U
 
 static bool MESHNETWORK_bEncodeTimeSync(const MeshPktTimeSync_t *ptTS,
@@ -865,7 +808,7 @@ static bool MESHNETWORK_bEncodeTimeSync(const MeshPktTimeSync_t *ptTS,
     write_u32_be(&pBuf[6], ptTS->u32StagedFwVersion);
     uint8_t u8Flags = 0U;
     if (ptTS->bGpsEnabled)                       u8Flags |= MESH_TIMESYNC_FLAG_GPS_ENABLED;
-    if (ptTS->eMode == DISCOVERY_MODE_BASIC)     u8Flags |= MESH_TIMESYNC_FLAG_BASIC_MODE;
+    if (ptTS->eMode == DISCOVERY_MODE_LORAWAN)   u8Flags |= MESH_TIMESYNC_FLAG_LORAWAN_MODE;
     pBuf[10] = u8Flags;
     *pu32Written = MESH_TIMESYNC_LEN;
     return true;
@@ -1683,192 +1626,6 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
     }
 }
 
-/* Basic-mode primary RAM store update: newer-BeaconMsgId-wins. Called
- * on every MeshPktType_BasicBeacon received during a listen window. */
-static void BASIC_vAddOrUpdate(const MeshPktBasicBeacon_t *ptBB)
-{
-    if (osMutexAcquire(xNeighborTableMutex, 100) != osOK) return;
-
-    for (uint16_t i = 0U; i < u16BasicNeighborCount; i++)
-    {
-        if (tBasicNeighborTable[i].u32DeviceId == ptBB->u32DeviceId)
-        {
-            /* Wrap-safe compare: only accept a strictly-newer msgid. A
-             * repeated same-msgid is a duplicate we heard on the air a
-             * second time - drop silently. */
-            if ((int32_t)(ptBB->u32BeaconMsgId - tBasicNeighborTable[i].u32BeaconMsgId) <= 0)
-            {
-                osMutexRelease(xNeighborTableMutex);
-                return;
-            }
-            tBasicNeighborTable[i].u32BeaconMsgId = ptBB->u32BeaconMsgId;
-            tBasicNeighborTable[i].u16BatMv       = ptBB->u16BatMv;
-            tBasicNeighborTable[i].u8MoveState    = ptBB->u8MoveState;
-            tBasicNeighborTable[i].u8FwPatch      = ptBB->u8FwPatch;
-            /* Best-RSSI-wins: keep the strongest (least-negative) reading
-             * heard across all beacons from this device — a single weak
-             * reception due to obstruction or a distant antenna angle
-             * shouldn't overwrite a known-good one. Multi-beacon RX in
-             * one cycle only helps when we retain the best sample. */
-            if (ptBB->i16Rssi > tBasicNeighborTable[i].i16Rssi)
-                tBasicNeighborTable[i].i16Rssi = ptBB->i16Rssi;
-            if (ptBB->bGpsValid)
-            {
-                tBasicNeighborTable[i].bGpsValid  = true;
-                tBasicNeighborTable[i].i32LatUDeg = ptBB->i32LatUDeg;
-                tBasicNeighborTable[i].i32LonUDeg = ptBB->i32LonUDeg;
-                tBasicNeighborTable[i].u32GpsAgeS = ptBB->u32GpsAgeS;
-            }
-            osMutexRelease(xNeighborTableMutex);
-            return;
-        }
-    }
-
-    if (u16BasicNeighborCount < MESH_MAX_BASIC_NEIGHBORS)
-    {
-        MeshBasicNeighbor_t *e = &tBasicNeighborTable[u16BasicNeighborCount++];
-        e->u32DeviceId    = ptBB->u32DeviceId;
-        e->u32BeaconMsgId = ptBB->u32BeaconMsgId;
-        e->u16BatMv       = ptBB->u16BatMv;
-        e->i16Rssi        = ptBB->i16Rssi;
-        e->u8MoveState    = ptBB->u8MoveState;
-        e->u8FwPatch      = ptBB->u8FwPatch;
-        e->bGpsValid      = ptBB->bGpsValid;
-        e->i32LatUDeg     = ptBB->i32LatUDeg;
-        e->i32LonUDeg     = ptBB->i32LonUDeg;
-        e->u32GpsAgeS     = ptBB->u32GpsAgeS;
-    }
-    /* Table full — drop silently. Small cap deliberate; bump the
-     * MESH_MAX_BASIC_NEIGHBORS #define if the deployment grows. */
-    osMutexRelease(xNeighborTableMutex);
-}
-
-static void MESHNETWORK_vHandleBasicBeacon(const uint8_t *pBuf,
-                                            size_t u32Len,
-                                            int16_t s16Rssi)
-{
-    if (u32Len < MESH_BBEACON_LEN_BASE) return;
-
-    u32LastDiscoveryPktTick = osKernelGetTickCount();
-
-    MeshPktBasicBeacon_t tBB;
-    tBB.u32DeviceId    = read_u32_be(&pBuf[1]);
-    tBB.u32BeaconMsgId = read_u32_be(&pBuf[5]);
-    tBB.u16BatMv       = read_u16_be(&pBuf[9]);
-    uint8_t u8Flags    = pBuf[11];
-    tBB.u8MoveState    = (u8Flags & MESH_BBEACON_FLAG_STILL) ? 1U : 0U;
-    tBB.u8FwPatch      = pBuf[12];
-    tBB.bGpsValid      = false;
-    tBB.i32LatUDeg     = 0;
-    tBB.i32LonUDeg     = 0;
-    tBB.u32GpsAgeS     = 0U;
-    tBB.i16Rssi        = s16Rssi;
-
-    if ((u8Flags & MESH_BBEACON_FLAG_GPS_VALID) &&
-        (u32Len >= MESH_BBEACON_LEN_GPS))
-    {
-        tBB.bGpsValid  = true;
-        tBB.i32LatUDeg = (int32_t)read_u32_be(&pBuf[13]);
-        tBB.i32LonUDeg = (int32_t)read_u32_be(&pBuf[17]);
-        tBB.u32GpsAgeS = read_u32_be(&pBuf[21]);
-    }
-
-    DBG_LOG("MeshNetwork: BasicBeacon: dev=%08X msgid=%08X bat=%u rssi=%d move=%u gps=%u ageS=%lu fwp=%u\r\n",
-        tBB.u32DeviceId, tBB.u32BeaconMsgId, tBB.u16BatMv, tBB.i16Rssi,
-        tBB.u8MoveState, tBB.bGpsValid, (unsigned long)tBB.u32GpsAgeS, tBB.u8FwPatch);
-    u16StatBeaconsHeard++;
-
-    /* Only the primary keeps a RAM store — secondaries do nothing with a
-     * peer basic beacon (no forwarding in basic mode by design). */
-    if (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY)
-    {
-        BASIC_vAddOrUpdate(&tBB);
-        /* The wave clock is an ADVANCED-mode concept, so only stamp it when
-         * this primary is actually running a basic-mode listen. A secondary
-         * that has not yet heard the TimeSync carrying a flip back to advanced
-         * keeps basic-beaconing every 2-8 s straight across the advanced
-         * campaign's start; counting those as wave activity would keep every
-         * wave alive for nodes that never enter the neighbour table and are
-         * never uploaded - a full-length campaign that finds nothing. */
-        if (MESHNETWORK_eGetDiscoveryMode() == DISCOVERY_MODE_BASIC)
-            tLastBeaconHeardTick = osKernelGetTickCount();
-    }
-}
-
-void MESHNETWORK_vSendBasicBeacon(void)
-{
-    MeshPktBasicBeacon_t tBB;
-    tBB.u32DeviceId    = LORARADIO_u32GetUniqueId();
-    tBB.u32BeaconMsgId = MESHNETWORK_u32GenerateGlobalMsgID();
-    tBB.u16BatMv       = BAT_u16GetVoltage();
-    tBB.u8MoveState    = (MOVE_eGetState() == MOVE_STATE_STILL) ? 1U : 0U;
-    tBB.u8FwPatch      = (uint8_t)VERSION_SW_PATCH;
-    tBB.bGpsValid      = false;
-    tBB.i32LatUDeg     = 0;
-    tBB.i32LonUDeg     = 0;
-    tBB.u32GpsAgeS     = 0U;
-    tBB.i16Rssi        = 0;
-
-    /* Cached last-known fix has no max-age gate here (unlike DBeacon's
-     * MESH_GPS_FIX_MAX_AGE_S): basic mode explicitly ships whatever age
-     * we've got - the primary logs the age alongside so the operator can
-     * judge freshness themselves. If the fix cache is empty (cold boot,
-     * never fixed), skip GPS altogether. */
-    gnss_coord_deg_t tLat, tLon;
-    uint32_t u32AgeS = UINT32_MAX;
-    if (GPS_bGetLastKnownFix(&tLat, &tLon, &u32AgeS))
-    {
-        tBB.bGpsValid  = true;
-        tBB.i32LatUDeg = tLat.i32MicroDeg;
-        tBB.i32LonUDeg = tLon.i32MicroDeg;
-        tBB.u32GpsAgeS = u32AgeS;
-    }
-
-    uint8_t u8Buf[MESH_BBEACON_LEN_GPS];
-    size_t  u32Len = 0;
-    if (!MESHNETWORK_bEncodeBasicBeacon(&tBB, u8Buf, sizeof(u8Buf), &u32Len))
-        return;
-
-    DBG_LOG("MeshNetwork: Sending BasicBeacon msgid=%08X bat=%u move=%u fwp=%u gps=%u ageS=%lu\r\n",
-        tBB.u32BeaconMsgId, tBB.u16BatMv, tBB.u8MoveState, tBB.u8FwPatch,
-        tBB.bGpsValid, (unsigned long)tBB.u32GpsAgeS);
-    EVTLOG(LOG_TX_BEACON, 3);
-    MESHNETWORK_bSendPacket(u8Buf, u32Len);
-}
-
-bool MESHNETWORK_bGetBasicNeighbors(MeshBasicNeighbor_t *pBuffer,
-                                     uint16_t u16MaxEntries,
-                                     uint16_t *pu16ActualEntries)
-{
-    if (osMutexAcquire(xNeighborTableMutex, 200) != osOK)
-    {
-        *pu16ActualEntries = 0U;
-        return false;
-    }
-    uint16_t u16Count = (u16BasicNeighborCount < u16MaxEntries)
-                        ? u16BasicNeighborCount : u16MaxEntries;
-    for (uint16_t i = 0U; i < u16Count; i++)
-        pBuffer[i] = tBasicNeighborTable[i];
-    *pu16ActualEntries = u16Count;
-    osMutexRelease(xNeighborTableMutex);
-    return true;
-}
-
-void MESHNETWORK_vClearBasicNeighbors(void)
-{
-    if (osMutexAcquire(xNeighborTableMutex, 200) != osOK) return;
-    memset(tBasicNeighborTable, 0, sizeof(tBasicNeighborTable));
-    u16BasicNeighborCount = 0U;
-    osMutexRelease(xNeighborTableMutex);
-}
-
-uint16_t MESHNETWORK_u16GetBasicNeighborCount(void)
-{
-    /* Plain read of a uint16_t — atomic on Cortex-M4; no mutex needed just
-     * to log a count. */
-    return u16BasicNeighborCount;
-}
-
 static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
                                      size_t u32Len,
                                      int16_t s16Rssi)
@@ -1958,7 +1715,7 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
     WakeupInterval tInterval    = (WakeupInterval)pBuf[5];
     uint32_t       u32StagedVer = read_u32_be(&pBuf[6]);
 
-    /* Optional flags byte at [10] — absent from pre-basicDiscovery peers
+    /* Optional flags byte at [10] — absent from pre-mode-flag peers
      * (10-byte TimeSync). Missing flags decode as advanced + gps enabled,
      * matching the behaviour of nodes that never had this feature. */
     DiscoveryMode_e eMode       = DISCOVERY_MODE_ADVANCED;
@@ -1966,8 +1723,8 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
     if (u32Len >= MESH_TIMESYNC_LEN)
     {
         uint8_t u8Flags = pBuf[10];
-        eMode       = (u8Flags & MESH_TIMESYNC_FLAG_BASIC_MODE)  ? DISCOVERY_MODE_BASIC : DISCOVERY_MODE_ADVANCED;
-        bGpsEnabled = (u8Flags & MESH_TIMESYNC_FLAG_GPS_ENABLED) ? true                 : false;
+        eMode       = (u8Flags & MESH_TIMESYNC_FLAG_LORAWAN_MODE) ? DISCOVERY_MODE_LORAWAN : DISCOVERY_MODE_ADVANCED;
+        bGpsEnabled = (u8Flags & MESH_TIMESYNC_FLAG_GPS_ENABLED)  ? true                   : false;
     }
 
     /* DBG -> DBG_LOG, with RSSI. Every copy that reaches this node is now
@@ -1978,7 +1735,7 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
      * ones with no "TimeSync applied" after them. */
     DBG_LOG("MeshNetwork: TimeSync rx utc=%u interval=%u fwVer=%lu mode=%s gps=%u rssi=%d\r\n",
             u32Utc, tInterval, (unsigned long)u32StagedVer,
-            (eMode == DISCOVERY_MODE_BASIC) ? "basic" : "advanced",
+            (eMode == DISCOVERY_MODE_LORAWAN) ? "lorawan" : "advanced",
             (unsigned)bGpsEnabled, (int)s16Rssi);
 
     uint32_t u32LogValue;
@@ -2057,7 +1814,7 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
         bTimeSyncAcceptedThisWake = true;
         DBG_LOG("MeshNetwork: TimeSync applied: %u interval=%u mode=%s gps=%u\r\n",
                 u32Utc, tInterval,
-                (eMode == DISCOVERY_MODE_BASIC) ? "basic" : "advanced",
+                (eMode == DISCOVERY_MODE_LORAWAN) ? "lorawan" : "advanced",
                 (unsigned)bGpsEnabled);
 
         /* Auto-arming firmware acceptance used to live here. It is now done
@@ -2162,8 +1919,10 @@ void MESHNETWORK_vParserTask(void *pvParameters)
             case MeshPktType_DBeacon:
                 MESHNETWORK_vHandleDBeacon(tRx.buffer, tRx.length, tRx.rssi);
                 break;
-            case MeshPktType_BasicBeacon:
-                MESHNETWORK_vHandleBasicBeacon(tRx.buffer, tRx.length, tRx.rssi);
+            case MeshPktType_Reserved11:
+                /* A v2.4.x basic-mode beacon from an un-upgraded tag. Nobody
+                 * collects these any more; drop it without the "unknown type"
+                 * log line every such tag in earshot would otherwise cost. */
                 break;
             case MeshPktType_DAck:
                 MESHNETWORK_vHandleDAck(tRx.buffer, tRx.length, tRx.rssi);
@@ -2421,7 +2180,7 @@ void MESHNETWORK_vSendTimeSync(uint32_t u32UtcTimestamp,
     }
     DBG_LOG("MeshNetwork: TimeSync sent %u interval=%u fwVer=%lu mode=%s gps=%u\r\n",
         u32UtcTimestamp, tWakeupInterval, (unsigned long)u32StagedFwVersion,
-        (eMode == DISCOVERY_MODE_BASIC) ? "basic" : "advanced",
+        (eMode == DISCOVERY_MODE_LORAWAN) ? "lorawan" : "advanced",
         (unsigned)bGpsEnabled);
 }
 
@@ -2815,7 +2574,7 @@ uint8_t        MESHNETWORK_u8GetWakeupInterval(void) { return u8CurrentWakeupInt
 
 void MESHNETWORK_vSetDiscoveryMode(DiscoveryMode_e eMode)
 {
-    if (eMode == DISCOVERY_MODE_ADVANCED || eMode == DISCOVERY_MODE_BASIC)
+    if (eMode == DISCOVERY_MODE_ADVANCED || eMode == DISCOVERY_MODE_LORAWAN)
         eCurrentDiscoveryMode = eMode;
 }
 DiscoveryMode_e MESHNETWORK_eGetDiscoveryMode(void) { return eCurrentDiscoveryMode; }

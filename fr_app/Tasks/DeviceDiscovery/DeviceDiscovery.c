@@ -35,8 +35,9 @@
 #include "Debug.h"
 #include "FrKernel.h"
 #include "RadioTestMode.h"   /* R&D radio link/range test gates */
+#include "LoRaWan.h"
 
-#include <stdlib.h>   /* rand() / srand() — basic-mode beacon jitter */
+#include <stdlib.h>   /* srand() */
 
 /* STORAGE_BACKEND_FLASH comes from build_config.h (included above). */
 #ifdef STORAGE_BACKEND_FLASH
@@ -69,13 +70,27 @@ static volatile ProductionState_e eProductionState = PRODUCTION_READY;
  * reachable exit and clears it. */
 static volatile bool bSolarWakeDisabled = false;
 
+/* True from the moment the AppTask picks up an event until it is back
+ * waiting for the next one. The wake-schedule task will not start a LoRaWAN
+ * report while this is set: the AppTask is the one that would run it, and
+ * a wake or kernel session it is still in the middle of may own the radio. */
+static volatile bool bAppTaskBusy = false;
+
+/* LoRaWAN mode: UTC second by which the pending report must have STARTED
+ * (the uplink slot's boundary minus LORAWAN_UPLINK_DEADLINE_LEAD_S). Set by
+ * the wake-schedule task with DISCOVERY_LORAWAN_UPLINK_BIT; the AppTask
+ * drops a report it only gets to after this, since by then the mesh wake is
+ * about to take the radio back. 32-bit on purpose: written by one task and
+ * read by another, and a uint64_t is two separate stores on this core. UTC
+ * seconds fit in 32 bits until 2106. */
+static volatile uint32_t u32LoRaWanDeadlineUtc = 0U;
+
 /* ---- Forward declarations ---- */
 #ifdef ENABLE_LOW_POWER_RECOVERY
 static void DEVICE_DISCOVERY_vRecoveryMode(void);
 #endif
 static void DEVICE_DISCOVERY_vEnterSleepMode(bool bAllowSolarWake);
 static void DEVICE_DISCOVERY_vSendTS(void);
-static bool DEVICE_DISCOVERY_bBasicLogAndClear(const char *pacReason);
 static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters);
 
 /* --------------------------------------------------------------------------
@@ -86,10 +101,9 @@ void DEVICE_DISCOVERY_vInit(void)
     xDiscoveryEventFlags = osEventFlagsNew(NULL);
     configASSERT(xDiscoveryEventFlags != NULL);
 
-    /* Seed rand() from the LoRa unique id so basic-mode beacon jitter
-     * differs from one node to the next on the very first roll (same
-     * boot moment, different id -> different sequence). Used only for
-     * the basic-mode 5..15 s beacon spacing; no security implications. */
+    /* Seed rand() from the LoRa unique id so jitter drawn from it differs
+     * from one node to the next (same boot moment, different id -> different
+     * sequence). No security implications. */
     srand((unsigned int)LORARADIO_u32GetUniqueId());
 
     static const osThreadAttr_t app_attr = {
@@ -122,7 +136,15 @@ void DEVICE_DISCOVERY_vInit(void)
     if (eDeviceRole == DEVICE_ROLE_PRIMARY)
         DBG_LOG("DeviceDiscovery: Device Role = PRIMARY\r\n");
     else
-        DBG_LOG("DeviceDiscovery: Device Role = SECONDARY\r\n");
+    {
+        /* Logged at every boot, whatever the mode: it is what a tag has to be
+         * registered in TTN under before LoRaWAN mode can do anything. */
+        uint8_t au8Eui[8];
+        LORAWAN_vGetDevEui(au8Eui);
+        DBG_LOG("DeviceDiscovery: Device Role = SECONDARY, LoRaWAN DevEUI=%02X%02X%02X%02X%02X%02X%02X%02X\r\n",
+            au8Eui[0], au8Eui[1], au8Eui[2], au8Eui[3],
+            au8Eui[4], au8Eui[5], au8Eui[6], au8Eui[7]);
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -137,10 +159,60 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         /* ----------------------------------------------------------------
          * Wait for wake-up: scheduled discovery or kernel wakeup (shake)
          * ---------------------------------------------------------------- */
+        bAppTaskBusy = false;
         uint32_t u32Flags = osEventFlagsWait(xDiscoveryEventFlags,
-                                             DISCOVERY_WAKEUP_BIT | DISCOVERY_KERNEL_BIT | DISCOVERY_BASIC_BEACON_BIT,
+                                             DISCOVERY_WAKEUP_BIT | DISCOVERY_KERNEL_BIT | DISCOVERY_LORAWAN_UPLINK_BIT,
                                              osFlagsWaitAny,
                                              osWaitForever);
+        bAppTaskBusy = true;
+
+        /* --- LoRaWAN-mode report (SECONDARY) ---
+         * One LoRaWAN session between two mesh wakes: attach the radio to the
+         * LoRaWAN MAC, join or send the report, hand the radio back to the
+         * mesh asleep, release the lock the schedule task took. No campaign,
+         * no mesh RX. Handled ahead of everything below because it shares
+         * nothing with a wake. */
+        bool bLoRaWanReport = ((u32Flags & osFlagsError) == 0U) &&
+                              ((u32Flags & DISCOVERY_LORAWAN_UPLINK_BIT) != 0U);
+        if (bLoRaWanReport &&
+            ((u32Flags & (DISCOVERY_WAKEUP_BIT | DISCOVERY_KERNEL_BIT)) == 0U))
+        {
+            HAL_UART_vInit();
+            DEBUG_vInit();
+
+            uint64_t u64Now      = RTC_u64GetUTC();
+            uint64_t u64Deadline = (uint64_t)u32LoRaWanDeadlineUtc;
+            if (u64Now > u64Deadline)
+            {
+                DBG_LOG("DeviceDiscovery: LoRaWAN report dropped - %lu s past its slot deadline\r\n",
+                    (unsigned long)(u64Now - u64Deadline));
+            }
+            else if (RADIOTESTMODE_bActive() || FRKERNEL_bIsConnected())
+            {
+                DBG_LOG("DeviceDiscovery: LoRaWAN report skipped - radio in use\r\n");
+            }
+            else
+            {
+                /* Everything up to 5 s before the mesh wake is ours; the
+                 * session caps itself at LORAWAN_SESSION_MAX_MS anyway. */
+                uint32_t u32BudgetMs =
+                    (uint32_t)(u64Deadline - u64Now) * 1000U +
+                    (LORAWAN_UPLINK_DEADLINE_LEAD_S - 5U) * 1000U;
+                (void)LORAWAN_bSendReport(u32BudgetMs);
+            }
+
+            SYSTEM_vSleepLockRelease();
+            continue;
+        }
+        if (bLoRaWanReport)
+        {
+            /* The same wait also returned a wake or kernel event - one
+             * osEventFlagsWait consumes every flag it reports. The wake owns
+             * the radio from here, so the report is dropped; its sleep lock
+             * still has to be given back. */
+            DBG_LOG("DeviceDiscovery: LoRaWAN report dropped - coincided with a wake\r\n");
+            SYSTEM_vSleepLockRelease();
+        }
 
         /* Multi-primary: arm the "first TimeSync only" gate for this
          * wake cycle. Subsequent TimeSyncs from other primaries during
@@ -165,24 +237,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         if (RADIOTESTMODE_bActive())
         {
             DBG_LOG("DeviceDiscovery: radio test active - skipping campaign\r\n");
-            SYSTEM_vSleepLockRelease();
-            continue;
-        }
-        bool bBasicBeaconWake = ((u32Flags & osFlagsError) == 0U) &&
-                                ((u32Flags & DISCOVERY_BASIC_BEACON_BIT) != 0U);
-
-        /* --- Basic-mode 10 s beacon-only wake (SECONDARY) ---
-         * Very short TX-only path: bring the radio out of sleep (already
-         * done by the wake-schedule task before it set our flag), TX one
-         * BasicBeacon, put the radio back to sleep, release the sleep
-         * lock. No campaign, no RX, no logger, no GPS. */
-        if (bBasicBeaconWake)
-        {
-            HAL_UART_vInit();
-            DEBUG_vInit();
-            MESHNETWORK_vSendBasicBeacon();
-            osDelay(200);            /* let the TX finish on the wire */
-            LORARADIO_vEnterDeepSleep();
             SYSTEM_vSleepLockRelease();
             continue;
         }
@@ -215,10 +269,16 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         osDelay(APP_WAKEUP_BUFFER_MS);
         EVTLOG(LOG_DISCOVERY_START, eDeviceRole);
 
+        /* The mode this wake runs under. Read once: the primary's own
+         * AT+SETREQ below can change it mid-wake, and a secondary's TimeSync
+         * can too, but what this wake does - campaign or not, upload or not -
+         * follows the mode it woke into. */
+        const DiscoveryMode_e eWakeMode = MESHNETWORK_eGetDiscoveryMode();
+
         /* Wall time for the whole discovery, wake to "complete" below — not to
          * be confused with either role branch's own internal u32CampaignStart
          * (those exist purely to enforce that branch's own deadline). This one
-         * spans everything: wave loop or basic listen window, whichever role
+         * spans everything: wave loop or TimeSync wait, whichever role
          * runs. Read again once we reach "Discovery complete" and handed to
          * the fr9 in the AT+BLOG header, so the server finally knows how long
          * a round actually took instead of estimating it from log arrival
@@ -239,37 +299,13 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
          * so freshly-armed secondaries are still awake for it — see the
          * "wait for OtaPrep" window on the secondary side below. */
         if (eDeviceRole == DEVICE_ROLE_PRIMARY &&
-            MESHNETWORK_eGetDiscoveryMode() == DISCOVERY_MODE_BASIC)
+            eWakeMode == DISCOVERY_MODE_LORAWAN)
         {
-            /* Basic-mode primary: passive 60 s RX window. No DReq campaign,
-             * no beacon TX, no forwarding. Incoming BasicBeacons are merged
-             * into the RAM store by the parser (MESHNETWORK_vHandleBasicBeacon).
-             * The RX window runs every DEVICE_DISCOVERY_BASIC_LISTEN_PERIOD_S
-             * (15 min), independent of WakeupInterval; the accumulated store
-             * is flushed to fr9 in the post-campaign block below only on
-             * WakeupInterval boundaries. */
-            DBG_LOG("DeviceDiscovery: Primary basic-mode listen (%u ms)\r\n",
-                (unsigned)DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_MS);
-            /* Poll for HWM every 250 ms during the listen window instead
-             * of a plain osDelay(WINDOW_MS). Beacons still arrive via
-             * the parser task in the background; if the store hits
-             * BASIC_HWM (28) before the window ends we flush mid-cycle
-             * so the remaining ~4 slots can accept further devices
-             * arriving during the ~1 s flush. Without this, the 33rd+
-             * unique device is silently dropped until the WakeupInterval
-             * boundary flush. */
-            {
-                uint32_t u32WaitedMs = 0U;
-                while (u32WaitedMs < DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_MS)
-                {
-                    if (MESHNETWORK_u16GetBasicNeighborCount() >= DEVICE_DISCOVERY_BASIC_HWM)
-                        (void)DEVICE_DISCOVERY_bBasicLogAndClear("HWM");
-                    osDelay(250);
-                    u32WaitedMs += 250U;
-                }
-            }
-            DBG_LOG("DeviceDiscovery: basic listen end - %u unique nodes in RAM store\r\n",
-                (unsigned)MESHNETWORK_u16GetBasicNeighborCount());
+            /* LoRaWAN-mode primary: no campaign. The tags report straight to
+             * TTN; this wake exists only for the fr9 round trip below (time,
+             * settings) and the TimeSync + firmware distribution that follow
+             * it, so go straight there. */
+            DBG_LOG("DeviceDiscovery: Primary LoRaWAN mode - no campaign, TimeSync only\r\n");
         }
         else if (eDeviceRole == DEVICE_ROLE_PRIMARY)
         {
@@ -606,20 +642,12 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         }
         else
         {
-            /* Basic mode: this big-interval wake coincides with a primary
-             * listen boundary. If WakeupInterval == the 15 min listen
-             * period, EVERY primary listen lands on a secondary big wake —
-             * so TX one beacon here too, otherwise the primary would never
-             * hear this secondary (the surrounding TX-window beacons are
-             * suppressed while this wake holds the sleep lock). Harmless in
-             * the larger-interval case (just one extra beacon the primary
-             * also hears). The RX wait below then catches the primary's
-             * TimeSync for RTC + any mode/interval/gps change. */
-            if (MESHNETWORK_eGetDiscoveryMode() == DISCOVERY_MODE_BASIC)
-                MESHNETWORK_vSendBasicBeacon();
-
-            DBG_LOG("DeviceDiscovery %X: Secondary waiting for timesync.\r\n",
-                LORARADIO_u32GetUniqueId());
+            /* In LoRaWAN mode this wake is only here to catch the primary's
+             * TimeSync (RTC + any mode/interval/gps change + staged firmware)
+             * - the report itself went out over LoRaWAN before the wake. */
+            DBG_LOG("DeviceDiscovery %X: Secondary waiting for timesync (%s).\r\n",
+                LORARADIO_u32GetUniqueId(),
+                (eWakeMode == DISCOVERY_MODE_LORAWAN) ? "lorawan" : "advanced");
 
             osThreadFlagsClear(DEVICE_DISCOVERY_NOTIFY_TIMESYNC |
                                DEVICE_DISCOVERY_NOTIFY_OTA);
@@ -701,10 +729,23 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                  *
                  * A node that truly hears nothing keeps the old behaviour
                  * unchanged, so out-of-range units cost no extra power — which
-                 * is why the flood is worth its airtime. */
-                if (!MESHNETWORK_bIsBeaconing() &&
-                    !MESHNETWORK_bCampaignHeard() &&
-                    (uint32_t)(u32Now - u32SilenceRef) >= APP_SECONDARY_SILENCE_MS)
+                 * is why the flood is worth its airtime.
+                 *
+                 * LoRaWAN mode sends nothing for silence to be measured
+                 * against - no DReq, no beacons, only the TimeSync this wait
+                 * is for - so a fixed wait replaces the silence rule there.
+                 * See APP_LORAWAN_TIMESYNC_WAIT_MS. A DReq heard anyway (an
+                 * advanced-mode primary in range) falls back to the advanced
+                 * rules above: stay for its campaign. */
+                if (eWakeMode == DISCOVERY_MODE_LORAWAN)
+                {
+                    if (!MESHNETWORK_bCampaignHeard() &&
+                        (uint32_t)(u32Now - u32CampaignStart) >= APP_LORAWAN_TIMESYNC_WAIT_MS)
+                        break;   /* no TimeSync in the LoRaWAN wait window */
+                }
+                else if (!MESHNETWORK_bIsBeaconing() &&
+                         !MESHNETWORK_bCampaignHeard() &&
+                         (uint32_t)(u32Now - u32SilenceRef) >= APP_SECONDARY_SILENCE_MS)
                     break;   /* radio silence, nothing heard, not beaconing */
             }
 
@@ -758,8 +799,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             LORARADIO_u32GetUniqueId());
 
         /* Whole-discovery duration, wake to here — see u32CampaignStartMs
-         * above. Passed to the fr9 in the AT+BLOG header (advanced mode only;
-         * see the call site below for why basic mode sends 0 instead). */
+         * above. Passed to the fr9 in the AT+BLOG header. */
         uint32_t u32CampaignDurationS =
             (osKernelGetTickCount() - u32CampaignStartMs) / 1000U;
 
@@ -789,88 +829,22 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             MESHNETWORK_vLogUnackedNeighbors();
         EVTLOG(LOG_DISCOVERY_CMPLT, eDeviceRole);
 
-        if (eDeviceRole == DEVICE_ROLE_PRIMARY &&
-            MESHNETWORK_eGetDiscoveryMode() == DISCOVERY_MODE_BASIC)
+        if (eDeviceRole == DEVICE_ROLE_PRIMARY)
         {
-            /* Basic-mode flush schedule: the RAM store is uploaded to fr9
-             * only at each WakeupInterval boundary. In between (basic
-             * listen wakes on the 15 min BASIC_LISTEN_PERIOD_S cadence
-             * that don't happen to land on a boundary), just keep the
-             * store and sleep. Boundary detection: seconds-into-current-
-             * interval < the listen period; anything larger means we're
-             * partway between boundaries. */
-            uint32_t u32Interval = (uint32_t)MESHNETWORK_u8GetWakeupInterval() * 60U;
-            uint64_t u64Utc      = RTC_u64GetUTC();
-            uint32_t u32Phase    = (uint32_t)(u64Utc % (uint64_t)u32Interval);
-            bool bIsFlushBoundary = (u32Phase < DEVICE_DISCOVERY_BASIC_LISTEN_PERIOD_S);
+            /* LoRaWAN mode ran no campaign and has nothing to upload - the
+             * tags' reports went to TTN. The rest of the fr9 session (time,
+             * settings, TimeSync, firmware) runs the same in both modes. */
+            const bool bUpload = (eWakeMode == DISCOVERY_MODE_ADVANCED);
 
-            if (!bIsFlushBoundary)
-            {
-                DBG_LOG("DeviceDiscovery: basic-mode listen-only wake (phase=%lus of %lus, no flush)\r\n",
-                    (unsigned long)u32Phase, (unsigned long)u32Interval);
-                osDelay(1000);
-                /* Fall through: no logger connect, no upload, no clear —
-                 * the store keeps accumulating until the next WakeupInterval
-                 * boundary landing. */
-            }
-            else
-            {
-                /* WakeupInterval boundary flush: shared log-and-release
-                 * (may be a no-op if the store's already been flushed
-                 * mid-cycle by the HWM check inside the listen window
-                 * above), then the boundary-only round-trip: connect
-                 * logger, timestamp sync, settings fetch, disconnect,
-                 * TimeSync TX. */
-                (void)DEVICE_DISCOVERY_bBasicLogAndClear("boundary");
-
-                /* Reconnect for the timestamp/settings round trip - the flush
-                 * above disconnects when it is done. Logged rather than acted
-                 * on: the two requests below already degrade gracefully (the
-                 * timestamp returns 0, the settings keep their previous
-                 * values), and this line is what distinguishes "the fr9 never
-                 * answered" from "it answered something unparseable". */
-                if (!DEVICE_DISCOVERY_DRIVER_bConnectLogger())
-                {
-                    DBG_LOG("DeviceDiscovery: boundary reconnect FAILED (no RDY)\r\n");
-                }
-
-                uint64_t now = DEVICE_DISCOVERY_DRIVER_u64RequestTS();
-                if (now > 0)
-                    RTC_vSetUTC(now);
-                uint8_t u8WI = 0U;
-                bool    bBM  = false;
-                bool    bGE  = true;
-                if (DEVICE_DISCOVERY_DRIVER_bRequestSettings(&u8WI, &bBM, &bGE))
-                {
-                    if      (u8WI == 15)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_15_MIN);
-                    else if (u8WI == 30)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_30_MIN);
-                    else if (u8WI == 60)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_60_MIN);
-                    else if (u8WI == 120) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_120_MIN);
-                    else if (u8WI == 240) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_240_MIN);
-                    MESHNETWORK_vSetDiscoveryMode(bBM ? DISCOVERY_MODE_BASIC
-                                                     : DISCOVERY_MODE_ADVANCED);
-                    MESHNETWORK_vSetGpsEnabled(bGE);
-                    DBG_LOG("DeviceDiscovery: settings applied - interval=%u mode=%s gps=%u\r\n",
-                        (unsigned)u8WI, bBM ? "basic" : "advanced", (unsigned)bGE);
-                }
-
-                DEVICE_DISCOVERY_DRIVER_vDisconnectLogger();
-
-                /* TimeSync out over LoRa — carries the (possibly just-
-                 * updated) mode + gps flags so secondaries see any mode
-                 * flip-back next time they open their big-interval RX
-                 * window. */
-                DEVICE_DISCOVERY_vSendTS();
-            }
-            osDelay(2000);
-        }
-        else if (eDeviceRole == DEVICE_ROLE_PRIMARY)
-        {
             MeshDiscoveredNeighbor_t tNeighbors[MESH_MAX_NEIGHBORS];
             uint16_t u16NeighborCount = 0;
 
-            if (MESHNETWORK_bGetDiscoveredNeighbors(tNeighbors, MESH_MAX_NEIGHBORS,
-                                                    &u16NeighborCount))
+            if (!bUpload)
+            {
+                /* nothing to report */
+            }
+            else if (MESHNETWORK_bGetDiscoveredNeighbors(tNeighbors, MESH_MAX_NEIGHBORS,
+                                                         &u16NeighborCount))
             {
                 DBG_LOG("DeviceDiscovery %X: Final UNION: %u neighbors.\r\n",
                     LORARADIO_u32GetUniqueId(), u16NeighborCount);
@@ -942,7 +916,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                     DBG_LOG("DeviceDiscovery %X: Logger connect FAILED (no RDY) - upload skipped.\r\n",
                         LORARADIO_u32GetUniqueId());
                 }
-                else
+                else if (bUpload)
                 {
                     DBG_LOG("DeviceDiscovery %X: Logger connected (binary upload).\r\n",
                         LORARADIO_u32GetUniqueId());
@@ -950,8 +924,17 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                     bLogOk = DEVICE_DISCOVERY_bSendDiscoveryDataBin(tNeighbors, u16NeighborCount,
                         u32CampaignDurationS);
                 }
+                else
+                {
+                    DBG_LOG("DeviceDiscovery %X: Logger connected (LoRaWAN mode - no upload).\r\n",
+                        LORARADIO_u32GetUniqueId());
+                }
 
-                if (bLogOk)
+                if (!bUpload)
+                {
+                    /* no upload attempted */
+                }
+                else if (bLogOk)
                     DBG_LOG("DeviceDiscovery %X: Log SUCCESS.\r\n", LORARADIO_u32GetUniqueId());
                 else
                 {
@@ -973,10 +956,10 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                  * intervals in the small fixed set map to enum values; other
                  * values leave the interval untouched. */
                 uint8_t u8WakeInterval = 0U;
-                bool    bBasicMode    = false;
+                bool    bLoRaWanMode  = false;
                 bool    bGpsEnabled   = true;
                 if (DEVICE_DISCOVERY_DRIVER_bRequestSettings(&u8WakeInterval,
-                                                            &bBasicMode,
+                                                            &bLoRaWanMode,
                                                             &bGpsEnabled))
                 {
                     if      (u8WakeInterval == 15)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_15_MIN);
@@ -985,13 +968,13 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                     else if (u8WakeInterval == 120) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_120_MIN);
                     else if (u8WakeInterval == 240) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_240_MIN);
 
-                    MESHNETWORK_vSetDiscoveryMode(bBasicMode ? DISCOVERY_MODE_BASIC
-                                                            : DISCOVERY_MODE_ADVANCED);
+                    MESHNETWORK_vSetDiscoveryMode(bLoRaWanMode ? DISCOVERY_MODE_LORAWAN
+                                                              : DISCOVERY_MODE_ADVANCED);
                     MESHNETWORK_vSetGpsEnabled(bGpsEnabled);
 
                     DBG_LOG("DeviceDiscovery: settings applied - interval=%u min, mode=%s, gps=%u\r\n",
                             (unsigned)u8WakeInterval,
-                            bBasicMode ? "basic" : "advanced",
+                            bLoRaWanMode ? "lorawan" : "advanced",
                             (unsigned)bGpsEnabled);
                 }
                 else
@@ -1216,25 +1199,14 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
         uint64_t u64Utc       = RTC_u64GetUTC();
         uint32_t u32IntervalS = (uint32_t)MESHNETWORK_u8GetWakeupInterval() * 60U;
 
-        /* Effective wake cadence for the "slot fired" latch below:
-         *   PRIMARY in basic mode uses a fixed 15 min BASIC_LISTEN_PERIOD_S
-         *     (independent of WakeupInterval, per plan) so it can accumulate
-         *     basic beacons more often than the flush schedule.
-         *   Everyone else uses the full WakeupInterval (15/30/60/120 min).
-         * Secondary in basic mode still uses WakeupInterval for its big
-         * wake — the 10 s beacon TX is a separate schedule handled
-         * below via DISCOVERY_BASIC_BEACON_BIT. */
-        uint32_t u32EffectiveIntervalS = u32IntervalS;
-        if (eDeviceRole == DEVICE_ROLE_PRIMARY &&
-            MESHNETWORK_eGetDiscoveryMode() == DISCOVERY_MODE_BASIC)
-        {
-            u32EffectiveIntervalS = DEVICE_DISCOVERY_BASIC_LISTEN_PERIOD_S;
-        }
-        uint64_t u64Slot      = u64Utc / (uint64_t)u32EffectiveIntervalS;
+        /* Both roles wake on WakeupInterval in both modes. In LoRaWAN mode
+         * the reports run on their own 15 min schedule below, independent of
+         * this one. */
+        uint64_t u64Slot      = u64Utc / (uint64_t)u32IntervalS;
 
         /* ---- R&D radio link/range test: participate in nothing ----
          * Same shape as the ProductionSleep gate below: one continue skips
-         * the scheduled discovery wake, the basic-mode beacon window and the
+         * the scheduled discovery wake, the LoRaWAN report window and the
          * GPS pre-trigger. Unlike ProductionSleep this does not sleep — the
          * mode holds its own sleep lock — it simply stops the schedule from
          * starting campaigns underneath a test that owns the radio. */
@@ -1414,73 +1386,71 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             }
         }
 
-        /* --- Basic-mode jittered beacon TX window (SECONDARY only) ---
-         * When in DISCOVERY_MODE_BASIC, TX beacons ONLY during the window
-         * straddling the primary's 15 min listen: from TX_GUARD_S before
-         * the boundary through the 60 s listen + TX_GUARD_S after. Outside
-         * that window the radio stays asleep (the ~10x efficiency win over
-         * the old always-on 10 s cadence). Within it, beacons are jittered
-         * ~5..10 s apart so multiple secondaries don't collide and the
-         * primary gets several chances to hear each one.
+        /* --- LoRaWAN-mode reports (SECONDARY only) ---
+         * One report per LORAWAN_UPLINK_PERIOD_S, in the window that closes
+         * just before each 15 min UTC boundary B (LoRaWan.h has the timeline):
          *
-         * Phase is against BASIC_LISTEN_PERIOD_S (the primary's fixed
-         * listen cadence), NOT this secondary's WakeupInterval.
+         *   B - LORAWAN_GPS_LEAD_S              request a GPS fix
+         *   first second the GPS is idle again  start the report (fix or not)
+         *   B - LORAWAN_UPLINK_DEADLINE_LEAD_S  start it now regardless
          *
-         * Two guards, both required:
-         *  - !bFireDiscovery: don't also fire on the exact boundary
-         *    heartbeat, which is a big-interval RX wake (that path TXes
-         *    its own beacon at the start — see the AppTask secondary
-         *    branch — so the primary still hears us even when
-         *    WakeupInterval == the 15 min listen period).
-         *  - SYSTEM_bCheckSleepModeStatus(): only fire when otherwise
-         *    idle (no sleep lock held). Without this, a beacon fired while
-         *    a big wake / GPS / kernel session already holds the lock would
-         *    acquire a second lock that the one-shot AppTask handler never
-         *    balances -> gSleepLockCount leaks and the device never sleeps. */
-        static uint64_t u64NextBasicBeaconUtc = 0ULL;
+         * Wake boundaries are multiples of 15 min too, so the window always
+         * closes before any mesh wake can open. The mesh wake is untouched by
+         * this and still runs on WakeupInterval, for the TimeSync.
+         *
+         * A report is only started while the AppTask is idle - it is the task
+         * that will run it, and if it is still inside a wake or a kernel
+         * session that session may own the radio. It retries every second
+         * until the deadline, then gives the slot up. */
+        static uint64_t u64LastReportSlot = 0ULL;
+        static uint64_t u64LastGpsReqSlot = 0ULL;
         if (eDeviceRole == DEVICE_ROLE_SECONDARY &&
-            MESHNETWORK_eGetDiscoveryMode() == DISCOVERY_MODE_BASIC &&
-            !bFireDiscovery &&
-            SYSTEM_bCheckSleepModeStatus())
+            MESHNETWORK_eGetDiscoveryMode() == DISCOVERY_MODE_LORAWAN)
         {
-            uint32_t u32Phase = (uint32_t)(u64Utc % (uint64_t)DEVICE_DISCOVERY_BASIC_LISTEN_PERIOD_S);
-            bool bInTxWindow =
-                (u32Phase >= (DEVICE_DISCOVERY_BASIC_LISTEN_PERIOD_S - DEVICE_DISCOVERY_BASIC_TX_GUARD_S)) ||
-                (u32Phase <= (DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_S + DEVICE_DISCOVERY_BASIC_TX_GUARD_S));
+            uint64_t u64UpSlot = (u64Utc / (uint64_t)LORAWAN_UPLINK_PERIOD_S) + 1ULL;
+            uint64_t u64BoundaryUtc = u64UpSlot * (uint64_t)LORAWAN_UPLINK_PERIOD_S;
+            uint32_t u32ToBoundaryS = (uint32_t)(u64BoundaryUtc - u64Utc);   /* 1..period */
 
-            if (bInTxWindow)
+            bool bInWindow = (u32ToBoundaryS <= LORAWAN_GPS_LEAD_S) &&
+                             (u32ToBoundaryS >= LORAWAN_UPLINK_DEADLINE_LEAD_S);
+
+            if (bInWindow && u64UpSlot != u64LastReportSlot)
             {
-                if (u64NextBasicBeaconUtc == 0ULL || u64Utc >= u64NextBasicBeaconUtc)
+                if (u64UpSlot != u64LastGpsReqSlot)
                 {
-                    /* 2..8 s uniform (mean ~5 s, matching the halved
-                     * primary listen window). rand() is seeded per device
-                     * from its unique id (DEVICE_DISCOVERY_vInit), so two
-                     * secondaries pick different offsets. */
-                    uint32_t u32NextDelayS = 2U + (uint32_t)(rand() % 7);
-                    u64NextBasicBeaconUtc = u64Utc + (uint64_t)u32NextDelayS;
-
-                    if (POWER_tGetState() & (POWER_CLASS_NORMAL | POWER_CLASS_LOW))
+                    /* Window entry: ask for the fix. GPS_vRequestFix applies
+                     * the fr9 GPS-disable flag and the power class itself, and
+                     * owns its own sleep lock. Its TTFF timeout ends the
+                     * session by the deadline, which is what the "GPS idle"
+                     * trigger below keys on. */
+                    u64LastGpsReqSlot = u64UpSlot;
+                    if (MESHNETWORK_bGetGpsEnabled() && (POWER_tGetState() & POWER_CLASS_NORMAL))
                     {
+                        HAL_UART_vInit();
+                        DEBUG_vInit();
+                        DBG("DeviceDiscovery: LoRaWAN report GPS pre-trigger\r\n");
+                        GPS_vRequestFix(true, LORAWAN_GPS_TTFF_TIMEOUT_S, false);
+                    }
+                }
+                else if (!GPS_bIsActive() ||
+                         u32ToBoundaryS <= LORAWAN_UPLINK_DEADLINE_LEAD_S)
+                {
+                    if (!bAppTaskBusy && !RADIOTESTMODE_bActive() && !FRKERNEL_bIsConnected() &&
+                        (POWER_tGetState() & (POWER_CLASS_NORMAL | POWER_CLASS_LOW)))
+                    {
+                        u64LastReportSlot     = u64UpSlot;
+                        u32LoRaWanDeadlineUtc = (uint32_t)(u64BoundaryUtc - LORAWAN_UPLINK_DEADLINE_LEAD_S);
+                        /* Released by the AppTask once the session ends. */
                         SYSTEM_vSleepLockAcquire();
-                        LORARADIO_vWakeUp();
-                        osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_BASIC_BEACON_BIT);
+                        osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_LORAWAN_UPLINK_BIT);
+                    }
+                    else if (u32ToBoundaryS <= LORAWAN_UPLINK_DEADLINE_LEAD_S)
+                    {
+                        u64LastReportSlot = u64UpSlot;
+                        DBG_LOG("DeviceDiscovery: LoRaWAN report slot missed - device busy\r\n");
                     }
                 }
             }
-            else
-            {
-                /* Outside the TX window — arm so the first beacon of the
-                 * next window fires immediately on entry rather than
-                 * waiting out a stale (pre-window) target time. */
-                u64NextBasicBeaconUtc = 0ULL;
-            }
-        }
-        else if (eDeviceRole == DEVICE_ROLE_SECONDARY &&
-                 MESHNETWORK_eGetDiscoveryMode() != DISCOVERY_MODE_BASIC)
-        {
-            /* Reset on flip-back to advanced so a later flip to basic
-             * starts fresh rather than firing on a stale target. */
-            u64NextBasicBeaconUtc = 0ULL;
         }
 
         /* --- GPS pre-trigger (SECONDARY only) ---
@@ -1494,7 +1464,12 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
          * PRETRIGGER window of each interval; the slot being pre-triggered is
          * the UPCOMING one ((utc + lead) / interval). */
         bool bFireGps = false;
+        /* Not in LoRaWAN mode: its wakes carry no position (no beacons), and
+         * the reports trigger their own fix above. The latch is left alone
+         * while skipped; its forward-jump resync re-arms it on the way back
+         * to advanced mode. */
         if (eDeviceRole == DEVICE_ROLE_SECONDARY &&
+            MESHNETWORK_eGetDiscoveryMode() != DISCOVERY_MODE_LORAWAN &&
             u32IntervalS > DEVICE_DISCOVERY_GPS_PRETRIGGER_S)
         {
             uint32_t u32Phase   = (uint32_t)(u64Utc % (uint64_t)u32IntervalS);
@@ -1591,76 +1566,6 @@ static void DEVICE_DISCOVERY_vSendTS(void)
                                u32StagedVer,
                                MESHNETWORK_eGetDiscoveryMode(),
                                MESHNETWORK_bGetGpsEnabled());
-}
-
-/* --------------------------------------------------------------------------
- * DEVICE_DISCOVERY_bBasicLogAndClear
- *
- * Snapshot the basic-mode RAM store, connect to Farmranger, upload via
- * FARMRANGER_bBLogBasicData, clear the store, disconnect. Nothing else —
- * no timestamp sync, no AT+SETREQ, no TimeSync TX. Shared by both:
- *   - the mid-cycle HWM auto-flush (fires whenever the store hits
- *     DEVICE_DISCOVERY_BASIC_HWM inside a listen window), and
- *   - the WakeupInterval-boundary flush (which additionally does the
- *     timestamp+settings+TimeSync round trip around this call).
- * Returns true on log success; false on any failure (empty store,
- * getter failure, upload failure). pacReason feeds a header DBG_LOG
- * so an operator can tell the two callers apart in the log stream.
- * -------------------------------------------------------------------------- */
-static bool DEVICE_DISCOVERY_bBasicLogAndClear(const char *pacReason)
-{
-    MeshBasicNeighbor_t tBasic[MESH_MAX_BASIC_NEIGHBORS];
-    uint16_t u16Count = 0U;
-    if (!MESHNETWORK_bGetBasicNeighbors(tBasic, MESH_MAX_BASIC_NEIGHBORS, &u16Count) ||
-        u16Count == 0U)
-    {
-        DBG_LOG("DeviceDiscovery: basic-mode %s flush skipped - store empty\r\n",
-                pacReason);
-        return false;
-    }
-
-    DBG_LOG("DeviceDiscovery: basic-mode %s flush - uploading %u neighbors\r\n",
-            pacReason, (unsigned)u16Count);
-    for (uint16_t i = 0U; i < u16Count; i++)
-    {
-        DBG_LOG("  ID:%08X  MsgId:%08X  Bat:%u  Rssi:%d  Move:%u  FwPatch:%u  Lat:%ld  Lon:%ld  AgeS:%lu\r\n",
-            tBasic[i].u32DeviceId,
-            tBasic[i].u32BeaconMsgId,
-            tBasic[i].u16BatMv,
-            tBasic[i].i16Rssi,
-            tBasic[i].u8MoveState,
-            tBasic[i].u8FwPatch,
-            tBasic[i].bGpsValid ? (long)tBasic[i].i32LatUDeg : 0L,
-            tBasic[i].bGpsValid ? (long)tBasic[i].i32LonUDeg : 0L,
-            tBasic[i].bGpsValid ? (unsigned long)tBasic[i].u32GpsAgeS : 0UL);
-    }
-
-    bool bOk = false;
-
-    /* Connect result checked here too - see the note at the advanced-mode
-     * upload. Without "RDY" there is nothing on the other end to upload to,
-     * and the binary path needs the content of that line to know whether it
-     * can be used at all. */
-    if (!DEVICE_DISCOVERY_DRIVER_bConnectLogger())
-    {
-        DBG_LOG("DeviceDiscovery %X: basic-mode %s log skipped - no RDY.\r\n",
-                LORARADIO_u32GetUniqueId(), pacReason);
-    }
-    else
-    {
-        bOk = FARMRANGER_bBLogBasicData(tBasic, u16Count);
-    }
-
-    DBG_LOG("DeviceDiscovery %X: basic-mode %s log %s.\r\n",
-            LORARADIO_u32GetUniqueId(), pacReason, bOk ? "SUCCESS" : "FAILED");
-
-    /* Clear even on FAILED — leaving stale entries around would just
-     * pile them up under the HWM again on the next listen and hit the
-     * same failure. Whichever devices were dropped this cycle will
-     * re-appear on the very next beacon they send. */
-    MESHNETWORK_vClearBasicNeighbors();
-    DEVICE_DISCOVERY_DRIVER_vDisconnectLogger();
-    return bOk;
 }
 
 /* --------------------------------------------------------------------------

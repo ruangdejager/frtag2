@@ -32,15 +32,16 @@
 #include <time.h>
 
 /* ---- Ring buffer (power-of-two size for cheap masking) ----
- * The MicroSD backend needs ~2 KB more .bss for its 512-byte block staging
- * buffers, and this part's RAM is essentially full. Shrink the producer->
- * consumer ring on that backend (the consumer drains it to a 16 MB SD log, so
- * steady-state pressure is low); the flash backend keeps the larger ring. */
-#ifdef STORAGE_BACKEND_MICROSD
+ * 4096 -> 1024 on the flash backend too (v2.5.0), which the MicroSD backend
+ * has run all along. The ring only has to absorb what arrives while the
+ * consumer is stalled on a flash program/erase, and the log no longer carries
+ * per-packet mesh traffic - campaigns report diagnostic counter lines instead
+ * - so bursts are a few lines, not hundreds. 1024 holds ~4 max-length (255 B)
+ * messages or ~8-10 typical ones; 512 would hold two long lines. The 3 KB
+ * went to the LoRaWAN MAC. Drops are never silent: the consumer writes an
+ * "[N lines dropped]" marker, which is the thing to watch for if this ever
+ * turns out too small. */
 #define DBGLOG_RING_SIZE   1024U
-#else
-#define DBGLOG_RING_SIZE   4096U
-#endif
 #define DBGLOG_RING_MASK   (DBGLOG_RING_SIZE - 1U)
 #define DBGLOG_MSG_MAX     255U          /* length field is one byte */
 #define DBGLOG_WAKE_FLAG   0x0001U

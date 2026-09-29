@@ -26,6 +26,24 @@
 #define APP_SECONDARY_SILENCE_MS           (10 * 1000)   /* radio-silence end window    */
 #define APP_SECONDARY_POLL_MS              250U          /* secondary wait poll cadence */
 
+/* LoRaWAN mode, secondary: how long a wake waits for the primary's TimeSync.
+ * In LoRaWAN mode the primary runs no campaign - it goes straight to its fr9
+ * session (connect <= 3 s, AT+TSREQ <= 2 s, AT+SETREQ <= 10 s) and sends the
+ * TimeSync, second airing up to 2.6 s after the first. From the secondary's
+ * campaign start (both roles wait out APP_WAKEUP_BUFFER_MS first) that is
+ * ~4 s typically and ~18 s worst case; 30 s leaves room for a relayed copy
+ * to reach a tag or two hops behind it. Every LoRaWAN-mode wake that hears
+ * no primary at all - the tag has wandered out of mesh range, which LoRaWAN
+ * mode otherwise copes with fine - costs this much radio-on, so it is kept
+ * no longer than that.
+ *
+ * This replaces the silence rule, which cannot work here: with no DReq and
+ * no beacons there is no traffic to be "silent" relative to, so it ended the
+ * wake at campaign start + APP_SECONDARY_SILENCE_MS, before the TimeSync was
+ * even sent - basic mode's tags missed their TimeSync that way. A tag that
+ * hears a DReq (an advanced-mode primary nearby) keeps the advanced rules. */
+#define APP_LORAWAN_TIMESYNC_WAIT_MS       (30 * 1000)
+
 /* Ceiling on DReq waves per campaign. Each wave advances the discovery frontier
  * by one ring (only acked nodes relay, so wave N reaches depth N), which makes
  * this the maximum discoverable herd depth.
@@ -209,40 +227,6 @@ _Static_assert(MESH_WAVE_BUDGET_MS <= APP_PRIMARY_CAMPAIGN_MAX_MS,
  * timeout the GPS session runs with (observed TTFF here: 8-34 s). */
 #define DEVICE_DISCOVERY_GPS_PRETRIGGER_S   150U          /* 2.5 minutes            */
 
-/* Basic-mode primary passive-listen cadence + duration. Independent of
- * WakeupInterval: the primary opens a 60 s RX window every 15 min and
- * accumulates heard BasicBeacons into a RAM store; the accumulated
- * store is then flushed to fr9 at each WakeupInterval boundary and
- * cleared. If WakeupInterval == 15 min the two coincide on every wake;
- * for larger intervals (30/60/120) the primary listens 2/4/8 times
- * per flush. See the basic-mode branch of DEVICE_DISCOVERY_vAppTask. */
-#define DEVICE_DISCOVERY_BASIC_LISTEN_PERIOD_S    (15U * 60U)
-/* Primary listen window on the 15-min cadence. Halved (60 s -> 30 s)
- * alongside the secondary's 10 s -> 5 s TX cadence: with beacons coming
- * twice as fast, the primary still gets several per device inside a
- * shorter window, at half the radio-on time. */
-#define DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_S    30U
-#define DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_MS   (DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_S * 1000U)
-
-/* Basic-mode primary high-water mark: when the RAM store hits this many
- * unique devices, flush to fr9 mid-cycle (log-only — no timestamp sync,
- * no settings fetch, no TimeSync) so the table can keep accepting
- * beacons from further devices in the same 60 s listen. Set below
- * MESH_MAX_BASIC_NEIGHBORS (32) so a handful of extra beacons arriving
- * DURING the ~1 s flush still fit without being silently dropped. */
-#define DEVICE_DISCOVERY_BASIC_HWM                28U
-
-/* Secondary basic-mode TX efficiency: the secondary confines its jittered
- * beacon TX to a window straddling the primary's listen — starting
- * DEVICE_DISCOVERY_BASIC_TX_GUARD_S before the 15 min boundary and ending
- * the same guard after the (30 s) listen. The guard absorbs the primary's
- * ~5 s wake buffer plus RTC drift between nodes. Phase is measured against
- * BASIC_LISTEN_PERIOD_S (the primary's fixed listen cadence), NOT the
- * secondary's own WakeupInterval. Outside this window the radio stays
- * asleep. Guard halved (10 s -> 5 s) alongside the listen window and
- * the 5 s TX cadence to keep the ratio of on-to-off time consistent. */
-#define DEVICE_DISCOVERY_BASIC_TX_GUARD_S         5U
-
 /* Kernel wakeup (shake-sequence): how long to wait for the user to start a
  * FrKernel session (send any "tag ..." command) before giving up and letting
  * the device return to deep sleep. 3 min so an operator has time to type
@@ -300,13 +284,11 @@ _Static_assert(MESH_WAVE_BUDGET_MS <= APP_PRIMARY_CAMPAIGN_MAX_MS,
 /* osEventFlags bit — set by Movement to bypass deep sleep into FrKernel */
 #define DISCOVERY_KERNEL_BIT                (1UL << 1)
 
-/* osEventFlags bit — set by wakeup-schedule task in basic mode when the
- * ~10s jittered beacon-TX cadence fires. The AppTask handles this with a
- * short TX-only path (send one MeshPktType_BasicBeacon, radio back to
- * sleep, release lock) — no discovery campaign, no RX. See the basic-
- * mode branch in DEVICE_DISCOVERY_vAppTask and its scheduling in
- * DEVICE_DISCOVERY_vCheckWakeupScheduleTask. */
-#define DISCOVERY_BASIC_BEACON_BIT          (1UL << 2)
+/* osEventFlags bit — set by the wakeup-schedule task in LoRaWAN mode when a
+ * report is due (see the LoRaWAN block in DEVICE_DISCOVERY_vCheckWakeup
+ * ScheduleTask). The AppTask runs one LoRaWAN session (LORAWAN_bSendReport)
+ * and goes straight back to sleep - no mesh campaign, no RX window. */
+#define DISCOVERY_LORAWAN_UPLINK_BIT        (1UL << 2)
 
 /* Thread flag bit — set by MeshNetwork when a TimeSync packet is received */
 #define DEVICE_DISCOVERY_NOTIFY_TIMESYNC    (1UL << 0)
@@ -314,6 +296,9 @@ _Static_assert(MESH_WAVE_BUDGET_MS <= APP_PRIMARY_CAMPAIGN_MAX_MS,
 /* Thread flag bit — set by OtaUpdate when OTA session traffic needs the
  * AppTask (an OtaPrep announcement, or a chunk in the receive mailbox) */
 #define DEVICE_DISCOVERY_NOTIFY_OTA         (1UL << 1)
+
+/* Bit 3 of the AppTask's thread flags is LORAWAN_THREAD_FLAG (LoRaWan.h):
+ * the LoRaWAN session runs on this task. */
 
 /* ---- Logger driver macros ---- */
 #define DEVICE_DISCOVERY_DRIVER_bConnectLogger()             FARMRANGER_bDeviceOn()

@@ -199,6 +199,12 @@ bool GPS_bGetLastKnownFix(gnss_coord_deg_t *pLat,
 /* Age in seconds of the most recent fix; UINT32_MAX if none yet. */
 uint32_t GPS_u32GetLastFixAgeSeconds(void);
 
+/* True while the receiver is powered (a session acquiring, or a fix held on).
+ * An auto-shutdown session drops back to false the moment it ends, on a fix
+ * or on its TTFF timeout alike - which is how the LoRaWAN uplink knows the
+ * fix it asked for is as good as it is going to get. */
+bool GPS_bIsActive(void);
+
 /* Called from USART1 ISR via uart_callbacks.c — do not call directly. */
 void GPS_vNotifyOnRX(void);
 

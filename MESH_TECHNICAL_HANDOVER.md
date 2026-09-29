@@ -34,6 +34,7 @@
 - [Part 10 — Power and sleep](#part-10--power-and-sleep)
 - [Part 11 — Operating and diagnosing](#part-11--operating-and-diagnosing) — reading the logs, operator commands, troubleshooting
 - [Part 12 — Known limits, open questions, and history](#part-12--known-limits-open-questions-and-history)
+- [Part 13 — LoRaWAN mode](#part-13--lorawan-mode) — reports straight to TTN, radio sharing, DevNonce, TTN setup
 
 **Reference**
 - [Appendix A — Constants](#appendix-a--constants)
@@ -269,13 +270,15 @@ This is not a workaround, it is the design. Partial coverage per primary is fine
 > Combined -> 9                  ← merged across all reporting collars
 > ```
 
-## 2.4 Two modes: advanced and basic
+## 2.4 Two modes: advanced and LoRaWAN
 
 Everything described so far is **advanced mode** — the full mesh, with roll-calls, relaying and depth.
 
-There is a second, much simpler mode for small remote groups. In **basic mode** there is no roll-call and no relaying at all. Each tag simply broadcasts a short beacon every few seconds during a known window, and the collar listens passively for thirty seconds every fifteen minutes and writes down whatever it hears. No mesh, no depth, no acknowledgements.
+The second mode is **LoRaWAN mode** (v2.5.0). There is no roll-call and no relaying: every fifteen minutes each tag takes a GPS fix and sends its own position and battery report **straight to The Things Network (TTN)** over LoRaWAN, through whatever public gateways are in range. The collar is not involved in carrying the data at all.
 
-Basic mode trades range for simplicity and power. It only reaches tags within direct earshot of the collar, but it costs almost nothing and has no failure modes worth the name.
+The herd still wakes together on the normal schedule, but only so the collar can hand out the TimeSync — clock, interval, mode, GPS flag and firmware version — and distribute firmware. The collar uploads nothing to the fr9 in this mode.
+
+LoRaWAN mode replaced **basic mode** (tags beaconing into a passive listening window on the collar), which is retired. It took over basic mode's setting value, so nothing changed on the fr9 or the server side: fr9 codes 62/63, which used to mean "basic, with/without GPS", now mean "LoRaWAN, with/without GPS". Part 13 has the detail.
 
 The mode is a system-wide setting owned by the server, fetched by the primary, and pushed to every tag inside the TimeSync. A tag applies the new mode before its next wake. **Cold-boot default on every device is advanced mode**, because that is the safe fallback: full information, at a cost.
 
@@ -298,7 +301,7 @@ The message that ends the cycle is carrying more than the time:
 | UTC timestamp | Sets every tag's clock, which is what keeps the herd waking together |
 | Wake interval | Changes how often the herd wakes (15 / 30 / 60 / 120 / 240 minutes) |
 | Staged firmware version | Tells tags an update exists, so they arm themselves to receive it |
-| Mode + GPS flags | Switches the herd between advanced/basic and enables/disables GPS |
+| Mode + GPS flags | Switches the herd between advanced/LoRaWAN and enables/disables GPS |
 
 Because so much rides on this one message, it is the most protected packet in the protocol: sent twice by the primary, relayed twice by every tag, never subject to the back-pressure rules that suppress other relays, and explicitly rescued from the queue-flush that runs at the end of a cycle.
 
@@ -609,7 +612,7 @@ All multi-byte fields are **big-endian** on the wire.
 | 4 | `TimeSync` | Primary → all | 11 B | Yes, twice per node |
 | 5 | `FrKernel` | Operator commands | var | No |
 | 6–10 | `OtaPrep` … `OtaReport` | Firmware distribution | var | **Never** — direct only |
-| 11 | `BasicBeacon` | Secondary → primary | 13 / 25 B | No |
+| 11 | *(reserved)* | — | — | Was `BasicBeacon` (basic mode, retired in v2.5.0). Still dropped silently if a v2.4.x tag airs one |
 
 ## 4.3 Wire layouts
 
@@ -665,7 +668,7 @@ There is a `SenderId` field in the in-memory struct that is **not on the wire** 
 [1..4]   UtcTimestamp
 [5]      WakeupInterval    enum: 1=15min, 2=30, 3=60, 4=120, 5=240
 [6..9]   StagedFwVersion   MMmmpp, 0 if none
-[10]     flags             bit0 GPS_ENABLED, bit1 BASIC_MODE
+[10]     flags             bit0 GPS_ENABLED, bit1 LORAWAN_MODE (was BASIC_MODE before v2.5.0)
 ```
 
 Byte 10 is a later addition. An older peer that emits a 10-byte TimeSync decodes as advanced mode + GPS enabled, which is exactly how those nodes behaved before the flags existed — so the 10→11 byte change is compatible in both directions.
@@ -884,7 +887,7 @@ Drift tolerance is therefore *structural* rather than budgeted. Four things abso
 | 205 s secondary window against a 140 s primary deadline | 65 s of slack on the far end |
 | "A tag that heard a DReq never bails on silence" | A tag whose ring is reached late |
 
-The only place a guard band is named explicitly is basic mode, where the secondary's transmit window opens `DEVICE_DISCOVERY_BASIC_TX_GUARD_S` = 5 s before the primary's listen window and closes 5 s after it, described in the source as absorbing "the primary's ~5 s wake buffer plus RTC drift between nodes."
+The only place a guard band is named explicitly is LoRaWAN mode, where a tag's LoRaWAN session must start by `LORAWAN_UPLINK_DEADLINE_LEAD_S` = 20 s before a wake boundary and is capped at 12 s, so the radio is back with the mesh at least 8 s before the wake. (Basic mode, now retired, had a 5 s guard around the collar's listen window.)
 
 Field measurement, 2026-09-08: **clock skew primary → secondary measured at 0 seconds**, which is what made cross-log timestamp arithmetic valid in that review.
 
@@ -977,7 +980,7 @@ What exists is three system-wide fields riding inside the TimeSync that every ca
 | Field | Values | Effect |
 |---|---|---|
 | Wake interval | 15 / 30 / 60 / 120 / 240 minutes | How often the whole herd wakes |
-| Discovery mode | advanced / basic | Full mesh, or passive beacon collection |
+| Discovery mode | advanced / LoRaWAN | Full mesh, or each tag reports to TTN over LoRaWAN |
 | GPS enabled | on / off | Whether fix requests do anything |
 
 Provenance is one `AT+SETREQ` round trip from the primary to its logger, answered as `"<interval>,<mode>,<gps>"`. All three must parse or the whole response is rejected and the primary keeps its previous values — a partial apply is considered worse than no apply.
@@ -995,7 +998,7 @@ server → fr9 → (AT+SETREQ) → primary → (TimeSync, relayed twice per node
 - **No reboot required.**
 - **Not persisted.** The setters write plain RAM variables. Nothing goes to flash.
 
-That last point has a real operational consequence: **every power cycle reverts a tag to the cold-boot defaults — 15-minute interval, advanced mode, GPS on — until the next TimeSync reaches it.** For interval and GPS this is mostly harmless. For mode it means a herd configured for basic mode will have any rebooted tag running advanced mode for up to one wake interval.
+That last point has a real operational consequence: **every power cycle reverts a tag to the cold-boot defaults — 15-minute interval, advanced mode, GPS on — until the next TimeSync reaches it.** For interval and GPS this is mostly harmless. For mode it means a herd configured for LoRaWAN mode will have any rebooted tag running advanced mode — and sending no LoRaWAN reports — until the next TimeSync reaches it, up to one wake interval.
 
 The cold-boot defaults were chosen to be the safe fallback rather than the common case: advanced mode produces full mesh information at a cost, which is the right way to fail.
 
@@ -1396,7 +1399,7 @@ Until then, two verdicts sit in direct conflict and neither should be acted on a
 
 This constrains any future change and is easy to trip over.
 
-**The linked production image leaves 8 bytes free in the 64 KB RAM region.** That is not a figure of speech. As a result:
+**The linked production image left 8 bytes free in the 64 KB RAM region** at the time this part was written (v2.3.x). By v2.4.1 later savings had opened that to ~1.3 KB, and v2.5.0 — with the whole LoRaWAN MAC added — ends at ~2.2 KB free (`_ebss` 0x2000F150 + 0x600 heap/stack reserve). The LoRaWAN stack costs ~3.4 KB and was paid for by retiring basic mode (906 B), shrinking the debug-log ring 4096 → 1024 B (3072 B) and moving `settings_def` to flash (340 B); see Part 13. The margins below still apply:
 
 - `NeighborEntry_t` is pinned at 24 bytes by a compile-time assert, with field order chosen so that a late-added field lands inside existing tail padding. A second two-byte field, or widening the existing one, pushes the struct to 28 bytes and costs 480 bytes, which **will not link**.
 - `MeshDiscoveredNeighbor_t` is likewise pinned at 24 bytes, because the application stack-allocates a full table of them.
@@ -1429,6 +1432,158 @@ Never adjudicated at all, and substantive:
 ## 12.7 Version numbering caution
 
 **Version 2.3.6 was committed before 2.3.5.** Version 2.3.5 contains all of 2.3.3 + 2.3.4 + 2.3.6 plus three further changes. Nothing was reverted. Do not infer ordering from the version numbers in this range.
+
+---
+
+# Part 13 — LoRaWAN mode
+
+Added in v2.5.0, replacing basic mode. Source: `fr_app/Worker/LoRaWan/` (the glue and configuration), `Middlewares/Third_Party/LoRaWAN/` (ST's LoRaMac, STM32CubeWL v1.3.0, trimmed), and the LoRaWAN blocks in `DeviceDiscovery.c`.
+
+## 13.1 What a tag does
+
+Every 15 minutes, aligned to UTC, in the two minutes that end just before a wake boundary B:
+
+| Time | What happens |
+|---|---|
+| B − 120 s | GPS fix requested (`LORAWAN_GPS_LEAD_S`), TTFF timeout 100 s |
+| as soon as the GPS session ends | one LoRaWAN session: join if not joined, otherwise one report |
+| B − 20 s | latest a session may start (`LORAWAN_UPLINK_DEADLINE_LEAD_S`); started now even if the GPS is still searching |
+| B | the normal mesh wake, on `WakeupInterval` |
+
+Wake boundaries are multiples of 15 minutes, so the report window always closes before any wake can open. A session is capped at 12 s (`LORAWAN_SESSION_MAX_MS`), so the radio is back with the mesh at least 8 s before B.
+
+The mesh wake still happens on the configured interval, but there is no roll-call:
+
+- **Primary:** straight to the fr9 session — `AT+TSREQ`, `AT+SETREQ`, TimeSync, then firmware distribution and the fr9 firmware check, exactly as in advanced mode. No `AT+BLOG`: there is nothing to upload.
+- **Secondary:** waits up to 30 s (`APP_LORAWAN_TIMESYNC_WAIT_MS`) for the TimeSync, relays it twice as always, then sleeps. The advanced-mode silence rule is not used: with no DReq and no beacons there is no traffic to be silent relative to, and it ended the wake before the primary had even sent the TimeSync — that is how basic-mode tags missed theirs. A tag that does hear a DReq falls back to the advanced rules.
+
+A report is only started while the AppTask is idle (it is the task that runs it), no radio test is running and no FrKernel session is open. It retries each second until the deadline, then gives the slot up with `LoRaWAN report slot missed - device busy`.
+
+## 13.2 One radio, two drivers
+
+The mesh and LoRaWAN cannot share the chip at the same time: different bandwidth (250 vs 125 kHz), sync word (`0x1424` vs public `0x34`) and channels. They take turns:
+
+- **Mesh → LoRaWAN.** Between wakes the radio is in cold deep sleep. A session starts with `Radio.Init(NULL)`, which hands the chip's single DIO-IRQ callback slot to ST's `radio.c` (and so to LoRaMac) and reconfigures the chip from scratch. The `NULL` case — "re-attach, keep the events already registered" — is a two-line local change to `radio.c`. The public sync word is re-applied after every attach, because `Radio.Init` resets it.
+- **LoRaWAN → mesh.** `LoRaMacHalt()` stops every MAC timer and sleeps the radio, then `LORARADIO_vWakeUp()` gives the mesh driver its callback and configuration back, and `LORARADIO_vEnterDeepSleep()` returns the chip to the cold sleep a mesh wake expects to find.
+
+Where things run:
+
+| Work | Context |
+|---|---|
+| Radio IRQ | SUBGHZ ISR only latches it (`RADIO_IRQ_PROCESS` hook in `radio_conf.h`); `RadioIrqProcess()` runs in the session loop, in the AppTask. LoRaMac arms its RX-window timers from there, and those are FreeRTOS timers, which must not be started from an ISR |
+| MAC timers (RX windows) | FreeRTOS timer task, via `Core/Src/timer_if.c` |
+| `LoRaMacProcess()` | the session loop, woken by `LORAWAN_THREAD_FLAG` (AppTask thread-flag bit 3) |
+
+`timer_if.c` now counts time in FreeRTOS ticks, not `HAL_GetTick()`. The HAL tick runs from TIM16, which stops in STOP2, so across a 15-minute sleep it barely moved — and LoRaMac's duty-cycle bookkeeping would have kept refusing uplinks long after the band had recovered. The FreeRTOS tick is stepped across every STOP2 from the RTC, so it is both fine-grained and sleep-proof. Nothing else in the firmware used that timer layer (it was never initialised before).
+
+RX windows are opened with a ±30 ms allowance (`LORAWAN_MAX_RX_ERROR_MS`, ST's default is 20 ms) because the timer task that opens them runs at priority 2 and can be held off briefly.
+
+## 13.3 The report
+
+FPort 1, big endian, 8 bytes without a fix or 20 with one. Same fields the basic-mode beacon carried, minus its packet type and message id — LoRaWAN's FPort and frame counter do those jobs:
+
+```
+[0..3]   DeviceId   mesh device id (LORARADIO_u32GetUniqueId) - joins TTN data to the mesh tables
+[4..5]   BatMv
+[6]      flags      bit0 STILL (1 = still), bit1 GPS_VALID
+[7]      FwPatch    VERSION_SW_PATCH
+[8..11]  LatUDeg    int32 microdegrees      } only when GPS_VALID
+[12..15] LonUDeg    int32 microdegrees      }
+[16..19] GpsAgeS    age of that fix, seconds }
+```
+
+The fix is the last one the tag has, however old, with its age — the same policy as the basic-mode beacon. The server judges freshness. With the fr9 GPS flag off (code 63) the fix is never refreshed and the report goes out as soon as the window opens.
+
+TTN uplink payload formatter (JavaScript):
+
+```javascript
+function decodeUplink(input) {
+  var b = input.bytes;
+  if (input.fPort !== 1 || b.length < 8) return { errors: ["unknown report"] };
+  var u32 = function (i) { return ((b[i] << 24) | (b[i+1] << 16) | (b[i+2] << 8) | b[i+3]) >>> 0; };
+  var i32 = function (i) { return u32(i) | 0; };
+  var d = {
+    deviceId: u32(0).toString(16).toUpperCase(),
+    batMv:    (b[4] << 8) | b[5],
+    still:    (b[6] & 0x01) !== 0,
+    gpsValid: (b[6] & 0x02) !== 0,
+    fwPatch:  b[7]
+  };
+  if (d.gpsValid && b.length >= 20) {
+    d.lat = i32(8) / 1e6;
+    d.lon = i32(12) / 1e6;
+    d.gpsAgeS = u32(16);
+  }
+  return { data: d };
+}
+```
+
+## 13.4 Joining, and the one thing that survives a reboot
+
+- **OTAA, LoRaWAN 1.0.4, EU868, Class A, ADR on.** Joins at DR0 (SF12, longest reach — the farms are rural and the gateways are other people's); ADR then walks the data rate up once TTN has heard enough uplinks.
+- **DevEUI** is the STM32WL's factory UID64, printed at every boot on a secondary (`Device Role = SECONDARY, LoRaWAN DevEUI=...`) and again at the first LoRaWAN session.
+- **JoinEUI** all zeros. **AppKey** one shared key for the pilot fleet, in `fr_app/Worker/LoRaWan/lorawan_keys.h`, which is git-ignored (copy `lorawan_keys_template.h`). Anyone who reads the key out of one tag can impersonate every tag; move to per-device keys before the fleet grows.
+- **A join session sends no report.** EU868's 1% duty cycle would hold the data frame off for longer than a session may run, so the first report goes one period later.
+- **Join back-off** is LoRaMac's own, driven by the duty cycle: a tag with no coverage does not keep joining every 15 minutes forever.
+- **The session is RAM-only** (`CONTEXT_MANAGEMENT_ENABLED 0`): every reboot re-joins. The exception is the **DevNonce**, a counter the join server requires to keep increasing across those re-joins. It is persisted in the last sector of the external NOR (`LORAWAN_NVM_FLASH_ADDR` = 0x7F000, taken off the end of the text log): append-only 8-byte records, the last valid one wins, one sector erase per 512 joins. The nonce a JoinRequest will use is written *before* the request goes out, so a reset at any point cannot reuse one.
+- **`tag flash eraseall` wipes the DevNonce** (it is a chip erase). After one, TTN will refuse that tag's joins until its used DevNonces are reset in the TTN console. `tag flash clear` does not touch it.
+
+TTN registration, per tag:
+
+| Setting | Value |
+|---|---|
+| Frequency plan | Europe 863-870 MHz (SF9 for RX2 — recommended) |
+| LoRaWAN version | LoRaWAN Specification 1.0.4 |
+| Regional parameters | RP002 Regional Parameters 1.0.1 |
+| Activation | OTAA |
+| DevEUI | from the tag's boot log |
+| JoinEUI | 0000000000000000 |
+| AppKey | the shared pilot key |
+
+## 13.5 The mode setting, and mixed fleets
+
+Nothing changed on the wire or on the fr9: LoRaWAN mode sits at basic mode's old value everywhere.
+
+| Layer | Value |
+|---|---|
+| fr9 setting (`movementAlarm.morningZoneLevels.minWindow`) | 62 = LoRaWAN + GPS, 63 = LoRaWAN, no GPS (60/61 = advanced ± GPS, unchanged) |
+| `AT+SETREQ` reply, mode field | 1 |
+| TimeSync flags, bit1 | 1 |
+
+A v2.4.x tag given this setting runs the old basic mode — its beacons go to a collar that no longer collects them. Harmless, but it sends no LoRaWAN reports: the herd has to be on v2.5.0 for the mode to do anything. Record type 1 of `AT+BLOG` (basic-mode records) is no longer sent by any v2.5.0 primary.
+
+## 13.6 What it cost, and where it came from
+
+Measured by linking this branch and `develop` with identical flags:
+
+| | `develop` (v2.4.1) | v2.5.0 |
+|---|---|---|
+| flash (text) | 118.6 KB | 150.6 KB (+32 KB, of a 236 KB app region; OTA transfers ~27% longer) |
+| `.data` | 584 B | 256 B |
+| `_ebss` | 0x2000F4C4 | 0x2000F150 |
+| RAM free after the 0x600 heap/stack reserve | ~1.3 KB | ~2.2 KB |
+
+The LoRaWAN MAC costs ~3.4 KB of RAM after trimming (ST's stock configuration is 5.5 KB): EU868 only, with its NVM channel table cut from 72 to 16 entries (a guarded local change in `RegionNvm.h`), no Class B, no context backup copy, no `LmHandler` layer. It was paid for by retiring basic mode (906 B), shrinking the debug-log ring 4096 → 1024 B (3072 B) and moving `settings_def` to flash (340 B). No task stack or heap was touched.
+
+## 13.7 Known limits
+
+- **TTN fair use.** TTN's community network allows 30 s of uplink airtime per device per day. 96 reports a day at SF12 is ~125 s. A tag near a gateway will be moved to a fast data rate by ADR and fits; a tag at the edge of coverage, stuck at SF12, does not.
+- **Downlinks are received but not used.** They are logged (`lorawan: downlink port=...`) and handed to the weak hook `LORAWAN_vOnDownlink()`, which does nothing yet.
+- **Out of mesh range, still paying for the wake.** A tag that has wandered away from the collar but is still in LoRaWAN coverage keeps reporting, and keeps waking every interval to listen 30 s for a TimeSync it will not hear. Its RTC is corrected by GPS only.
+- **A capped session.** If a session ever hits its 12 s cap mid-exchange, the MAC is halted and the radio handed back regardless; a late event from that session is swallowed at the start of the next one. Not seen in testing, because there has been none — see below.
+- **Not yet verified on hardware or against TTN.** Everything in this part is as built and link-checked, not field-tested.
+
+## 13.8 Log lines
+
+| Line | Meaning |
+|---|---|
+| `lorawan: DevEUI=... devNonce=N` | first session after boot: MAC up, DevNonce restored from flash |
+| `lorawan: JoinRequest devNonce=N dr=0` | join sent |
+| `lorawan: JOINED devaddr=...` / `join failed status=N` | JoinAccept received / not |
+| `lorawan: join not sent status=N wait=Nms` | refused by the MAC, usually duty-cycle back-off (status 11) |
+| `lorawan: report queued len=N gps=G` → `uplink fcnt=N status=S dr=D ...` | report sent; status 0 = done, RX windows closed |
+| `lorawan: session end ok=O joined=J N ms` | every session |
+| `DeviceDiscovery: LoRaWAN report dropped/skipped/slot missed` | the schedule could not run a report this period |
 
 ---
 
@@ -1515,8 +1670,7 @@ Worst-case quiet-campaign cost, asserted at build time against the 140 s budget:
 | Constant | Value | Note |
 |---|---|---|
 | `MESH_MAX_NEIGHBORS` | 120, or **64** | 64 when `MESH_DIAG_COUNTERS` is enabled — **as it is in the current build** |
-| `MESH_MAX_BASIC_NEIGHBORS` | 32 | Basic-mode RAM store |
-| `DEVICE_DISCOVERY_BASIC_HWM` | 28 | Mid-cycle flush threshold |
+| `DBGLOG_RING_SIZE` | 1024 B | Debug-log producer→consumer ring (4096 before v2.5.0) |
 | `sizeof(NeighborEntry_t)` | 24 B | Compile-time asserted |
 
 ## A.7 GPS and time
@@ -1572,7 +1726,7 @@ Worst-case quiet-campaign cost, asserted at build time against the 140 s budget:
 | **Ack / D-Ack** | Acknowledgement. Primary → herd, listing up to 12 tag ids that may stop beaconing |
 | **Advanced mode** | Full mesh discovery with waves and relaying |
 | **Barren wave** | A wave that added no tag the table did not already have |
-| **Basic mode** | No mesh; tags beacon into a periodic listening window |
+| **LoRaWAN mode** | No mesh campaign; each tag reports to TTN over LoRaWAN every 15 min, the mesh wake only carries the TimeSync. Replaced **basic mode** (tags beaconing into a periodic listening window) in v2.5.0 |
 | **Beacon / DBeacon** | A tag's answer to a roll-call: id, battery, position, move state, firmware patch |
 | **CAD** | Channel Activity Detection — the pre-transmit channel check. The chip cannot receive during it |
 | **Campaign** | One complete roll-call, from first DReq to TimeSync. Up to 6 waves |

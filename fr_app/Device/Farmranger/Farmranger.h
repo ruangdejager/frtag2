@@ -35,13 +35,13 @@ bool     FARMRANGER_bDeviceOn(void);
 void     FARMRANGER_vDeviceOff(void);
 uint64_t FARMRANGER_u64RequestTimestamp(void);
 /* Fetch the primary's per-system settings from the logger in one AT round
- * trip: wake interval (min), discovery mode (false=advanced, true=basic),
+ * trip: wake interval (min), discovery mode (false=advanced, true=LoRaWAN),
  * GPS enable (false=disabled/battery-save, true=normal). Returns true on
  * a fully-parsed response; on false the caller keeps its previous
  * defaults. Wire format is documented in FARMRANGER_bRequestSettings's
  * definition and the fr9-side FRTAG_vSetReqHandler. */
 bool     FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
-                                     bool    *pbBasicMode,
+                                     bool    *pbLoRaWanMode,
                                      bool    *pbGpsEnabled);
 /* AT+LOG (CSV) upload removed — primary speaks AT+BLOG only now. */
 
@@ -66,17 +66,12 @@ bool     FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
  * Payload header, FR_BLOG_HDR_BYTES bytes, little-endian, then <count> records:
  *
  *     u8   format version    (FR_BLOG_FORMAT_VER)
- *     u8   record type       (FR_BLOG_TYPE_ADVANCED | FR_BLOG_TYPE_BASIC)
+ *     u8   record type       (FR_BLOG_TYPE_ADVANCED; 1 was basic, retired)
  *     u16  record count
  *     u32  this primary's own device id (LORARADIO_u32GetUniqueId())
  *     u32  discovery duration, seconds — wall time from this wake's first
  *          DBG_LOG to "Discovery complete" (see DeviceDiscovery.c's
- *          u32CampaignStartMs). 0 on the basic-mode upload: a boundary flush
- *          can carry several listen windows' worth of accumulated neighbours
- *          from wakes long since finished, so there is no one campaign left
- *          to time by the point it is sent — 0 means "not measured", the same
- *          convention primaryVersion==0 and rssiSrc==0 already use elsewhere
- *          on this wire.
+ *          u32CampaignStartMs).
  *
  * v1 (FR_BLOG_FORMAT_VER before this change) had no duration field and a
  * 8-byte header; v2 appends it rather than inserting it, so v1's first 8
@@ -86,18 +81,19 @@ bool     FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
  * TAGDISC_bAcceptPayload), same as it always has. The two sides are paired
  * hardware and must be flashed together regardless.
  *
- * Both record variants are FR_BLOG_RECORD_BYTES; the type selects the decode.
- * Fields are written one at a time, little-endian, and NOT memcpy'd out of
- * MeshDiscoveredNeighbor_t / MeshBasicNeighbor_t. Those layouts are
- * hand-packed RAM optimisations with a _Static_assert on their size (see
- * MeshNetwork.h); they must not quietly become a wire format that the next
+ * Records are FR_BLOG_RECORD_BYTES; the type selects the decode. Type 1
+ * (basic mode) is retired with basic mode itself: LoRaWAN mode, which took
+ * over its setting value, uploads nothing through the primary, so no v2.5+
+ * primary sends it. Fields are written one at a time, little-endian, and NOT
+ * memcpy'd out of MeshDiscoveredNeighbor_t. That layout is a hand-packed RAM
+ * optimisation with a _Static_assert on its size (see
+ * MeshNetwork.h); it must not quietly become a wire format that the next
  * change to the RAM budget then breaks on both boards at once.
  *
  * Flags byte: bit0 = MoveState, bit1 = GpsValid.
  * ------------------------------------------------------------------------- */
 #define FR_BLOG_FORMAT_VER      2U
 #define FR_BLOG_TYPE_ADVANCED   0U
-#define FR_BLOG_TYPE_BASIC      1U
 #define FR_BLOG_HDR_BYTES       12U
 #define FR_BLOG_RECORD_BYTES    22U
 
@@ -111,12 +107,9 @@ bool     FARMRANGER_bLoggerSupportsBinary(void);
  * failed — there is no CSV fallback, so that campaign is lost.
  *
  * u32DurationS: whole-discovery wall time in seconds, the caller's own
- * measurement (Farmranger.c has no notion of when a campaign started). The
- * basic variant carries no such parameter — see the FR_BLOG_HDR_BYTES note
- * above for why it always sends 0. */
+ * measurement (Farmranger.c has no notion of when a campaign started). */
 bool     FARMRANGER_bBLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count,
                               uint32_t u32DurationS);
-bool     FARMRANGER_bBLogBasicData(MeshBasicNeighbor_t *neighbors, uint16_t count);
 
 /* ---- Firmware-file pull (OTA acquire, see Worker/OtaUpdate) ----
  * Protocol (tag is master): AT+FWREQ queries what the logger holds, answered
