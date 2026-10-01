@@ -22,8 +22,16 @@
 
 /* Secondary campaign-end (R3): once the mesh has been silent (no discovery
  * packet from any primary) for this long AND the node is not beaconing, end the
- * campaign instead of waiting out the 205 s hard cap. Polled at this cadence. */
-#define APP_SECONDARY_SILENCE_MS           (10 * 1000)   /* radio-silence end window    */
+ * campaign instead of waiting out the 205 s hard cap. Polled at this cadence.
+ *
+ * This window is also how early a secondary can wake and still hear wave 1:
+ * both roles wait APP_WAKEUP_BUFFER_MS before starting, so a node whose clock
+ * runs ahead of the primary's by more than this has given up before the first
+ * DReq goes out. Later waves only help nodes that wake late. 10 -> 20 s after
+ * a 14 s fr9/GPS clock split (bench, 2026-09-30) took two tags out of every
+ * campaign. The cost falls on out-of-range nodes, which now stay awake 10 s
+ * longer on every wake. */
+#define APP_SECONDARY_SILENCE_MS           (20 * 1000)   /* radio-silence end window    */
 #define APP_SECONDARY_POLL_MS              250U          /* secondary wait poll cadence */
 
 /* Ceiling on DReq waves per campaign. Each wave advances the discovery frontier
