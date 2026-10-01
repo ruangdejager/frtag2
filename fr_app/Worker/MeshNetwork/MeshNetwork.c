@@ -418,6 +418,14 @@ static uint32_t u32LastDiscoveryPktTick = 0;
  * and a one-pass-late read only costs one more 250 ms poll. */
 static volatile bool bCampaignHeard = false;
 
+/* Open from the start of this node's wake to the end of its campaign - see
+ * MESHNETWORK_vSetCampaignOpen(). Same single-writer/atomic-bool reasoning as
+ * bCampaignHeard. u32CampaignClosedTick and bLateDreqLogged only exist for
+ * the one log line a DReq arriving after close earns. */
+static volatile bool bCampaignOpen         = false;
+static uint32_t      u32CampaignClosedTick = 0U;
+static bool          bLateDreqLogged       = false;
+
 /* The primary ends a wave after MESH_DISCOVERY_IDLE_MS of beacon silence, and
  * every beacon is queued with up to MESH_TX_JITTER_MAX_MS of TX jitter. If the
  * idle ever drops to or below the jitter, a lone node in a sparse outer ring
@@ -478,13 +486,14 @@ static volatile bool bCampaignHeard = false;
 #endif
 /* The compat keep-alive rides the primary ack tick, so the WORST gap it can
  * leave is one quiet threshold plus one whole tick - and that sum is what has
- * to stay under the silence window a 2.1.3 secondary ends its wake on. The
- * constant compared against is this release's own APP_SECONDARY_SILENCE_MS,
- * which is unchanged from 2.1.3 (10 s) and is the only version of it available
- * at compile time; if it is ever retuned, re-derive the keep-alive against the
- * FIELD units' value, not ours. See MESH_KEEPALIVE_QUIET_MS. */
-#if ((MESH_KEEPALIVE_QUIET_MS + MESH_PRIMARY_ACK_INTERVAL_MS) >= APP_SECONDARY_SILENCE_MS)
-#  error "Keep-alive quiet + one ack tick must stay under APP_SECONDARY_SILENCE_MS"
+ * to stay under the silence window a 2.1.3 secondary ends its wake on. That
+ * window is the FIELD units' 10 s, pinned here as MESH_LEGACY_SECONDARY_
+ * SILENCE_MS. It used to be checked against this release's own
+ * APP_SECONDARY_SILENCE_MS, which was also 10 s until it went to 20 s; the
+ * 2.1.3 units in the field still end on 10 s. See MESH_KEEPALIVE_QUIET_MS. */
+#define MESH_LEGACY_SECONDARY_SILENCE_MS   (10U * 1000U)
+#if ((MESH_KEEPALIVE_QUIET_MS + MESH_PRIMARY_ACK_INTERVAL_MS) >= MESH_LEGACY_SECONDARY_SILENCE_MS)
+#  error "Keep-alive quiet + one ack tick must stay under a 2.1.3 secondary's 10 s silence window"
 #endif
 
 /* ---- Forward declarations ---- */
@@ -1390,6 +1399,25 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
      * below) but take no action on them. */
     if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_PRIMARY)
     {
+        /* This node's campaign is already over: take no part. A DReq that
+         * lands here (between campaign end and the radio going to deep
+         * sleep) used to start a beacon episode that outlived the wake - one
+         * bench unit kept beaconing for 27 min into its sleep, every attempt
+         * ending in a carrier-sense timeout. Usually a DReq here means this
+         * node woke earlier than the primary did, so the delay since close is
+         * logged once per wake: it is a direct measure of the clock offset. */
+        if (!bCampaignOpen)
+        {
+            if (!bLateDreqLogged)
+            {
+                bLateDreqLogged = true;
+                DBG_LOG("MeshNetwork: DReq %08X heard %lu ms after campaign end - ignored\r\n",
+                        u32DreqId,
+                        (unsigned long)(osKernelGetTickCount() - u32CampaignClosedTick));
+            }
+            return;
+        }
+
         NodeRole_e eRole = MESHNETWORK_eGetRole();
 
         /* Heard a campaign, whoever relayed it and whatever wave. Keeps the
@@ -2892,6 +2920,19 @@ void MESHNETWORK_vResetNodeRole(void)
 bool MESHNETWORK_bCampaignHeard(void)
 {
     return bCampaignHeard;
+}
+
+void MESHNETWORK_vSetCampaignOpen(bool bOpen)
+{
+    if (bOpen)
+    {
+        bLateDreqLogged = false;
+    }
+    else
+    {
+        u32CampaignClosedTick = osKernelGetTickCount();
+    }
+    bCampaignOpen = bOpen;
 }
 
 /* Radio-test support. The worker exists in every build that calls

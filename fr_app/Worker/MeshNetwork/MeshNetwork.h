@@ -489,7 +489,7 @@
  * keep-alive. TEMPORARY - see the removal note at the end.
  *
  * Why it is needed. A 2.1.3 secondary ends its wake on 10 s of radio silence
- * whenever it is not beaconing (APP_SECONDARY_SILENCE_MS, applied without the
+ * whenever it is not beaconing (its APP_SECONDARY_SILENCE_MS, applied without the
  * MESHNETWORK_bCampaignHeard() hold that only exists from 2.3.x). Nothing in
  * 2.1.3 covers a wave-listen floor, because 2.1.3 had no floor: it ended a
  * wave on a 7 s idle window and never sat quiet for longer than that. Under
@@ -524,7 +524,7 @@
  * tick re-qualifies). Both are under 2.1.3's 10 s with margin for the radio
  * layer's carrier sense, which only backs off on a busy channel - and a busy
  * channel is one the secondary is hearing anyway. The invariant is asserted in
- * MeshNetwork.c against APP_SECONDARY_SILENCE_MS.
+ * MeshNetwork.c against MESH_LEGACY_SECONDARY_SILENCE_MS.
  *
  * REMOVE THIS, its assert, MESHNETWORK_vQueueKeepAlive and the else branch in
  * MESHNETWORK_vBuildAndQueueAck once no 2.1.3 unit is left in the field. It
@@ -801,6 +801,15 @@ bool MESHNETWORK_bIsBeaconing(void);     /* true while this node is beaconing */
  * exactly, so out-of-range units cost no extra power. Cleared by
  * MESHNETWORK_vResetNodeRole() at campaign end. */
 bool MESHNETWORK_bCampaignHeard(void);
+
+/* Bracket this node's own campaign: true at wake (before the wake buffer, so
+ * a DReq from a primary that woke first still counts), false when the
+ * campaign ends. While closed a secondary ignores DReqs completely - no
+ * beacon, no relay - so nothing it hears on the way to sleep can start a
+ * beacon episode that runs on past the wake. TimeSync handling is not
+ * affected. Starts closed at boot. */
+void MESHNETWORK_vSetCampaignOpen(bool bOpen);
+
 /* Drop pending TX. Called on campaign wake and again at campaign end.
  * bKeepTimeSync re-queues a pending TimeSync instead of dropping it: pass true
  * at campaign end (a secondary's campaign ENDS on the TimeSync it must still

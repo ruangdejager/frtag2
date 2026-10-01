@@ -199,6 +199,9 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         /* ---- Prepare for new campaign ---- */
         MESHNETWORK_vClearDiscoveredNeighbors();
         MESHNETWORK_vResetDreqWaveCnt();
+        /* Opened before the wake buffer below, so a DReq from a primary that
+         * woke a little ahead of us is still answered. */
+        MESHNETWORK_vSetCampaignOpen(true);
         /* R6: drop any TX left over from the previous campaign (e.g. a
          * late-jittered forward) so it can't fire at the start of this one. */
         MESHNETWORK_vFlushTxQueue(false);
@@ -626,8 +629,9 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
             /* R3: end the campaign on the FIRST of:
              *   - TimeSync received (clean end),
-             *   - 10 s of mesh radio silence while NOT beaconing (UNKNOWN that
-             *     heard nothing, or FORWARDER once the mesh goes quiet),
+             *   - APP_SECONDARY_SILENCE_MS of mesh radio silence while NOT
+             *     beaconing (UNKNOWN that heard nothing, or FORWARDER once the
+             *     mesh goes quiet),
              *   - the 205 s hard cap.
              * While beaconing the silence rule is suppressed, and since the
              * beacon count cap was removed a node that is never acked keeps
@@ -743,6 +747,11 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             else
                 DBG_LOG("DeviceDiscovery: Secondary %04X: campaign end (silence/cap)\r\n",
                     LORARADIO_u32GetUniqueId());
+
+            /* Closed BEFORE the stop below, so a DReq that arrives in between
+             * cannot start a fresh episode behind it. From here until the next
+             * wake a DReq is ignored (see MESHNETWORK_vSetCampaignOpen). */
+            MESHNETWORK_vSetCampaignOpen(false);
 
             /* B4: stop OUR beacon dreq. The global u32DreqId is only ever
              * written on the primary — on a secondary it is stale/zero, so the
