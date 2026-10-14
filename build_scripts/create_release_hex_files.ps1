@@ -18,7 +18,7 @@
 #   folder only ever holds the versioned deliverables.
 #
 #   In each repo listed in $publish_dirs below (the public OTA host repo,
-#   plus the in-house mirror) — exactly two files per repo:
+#   plus the in-house and dev mirrors) — exactly two files per repo:
 #
 #     frtag2_<M>_<m>_<p>.bin           the versioned app image (raw binary)
 #                                      the OTA flow fetches over HTTP
@@ -28,24 +28,27 @@
 #   The host repos are:
 #
 #     C:\Code\farmranger-firmware\frtag2-firmware\      field units
-#     C:\Code\frtag-firmware-inhouse\frtag2-firmware\   in-house bench units
+#     C:\Code\frtag-firmware-inhouse\frtag2-firmware\   older in-house bench units
+#     C:\Code\frtag-firmware-dev\frtag2-firmware\       in-house bench units
 #
-#   Both get byte-identical artefacts. Which host a unit actually fetches
-#   from is decided at fr9 build time by SWITCH_TAGFOTA_INHOUSE_HOST
-#   (fr9_application, fr_app/inc/tag_fota.h). Publishing here is only a copy
+#   All get byte-identical artefacts. Which host a unit actually fetches
+#   from is decided at fr9 build time by SWITCH_FRTAGFOTA_INHOUSE_HOST
+#   (fr9_application, fr_app/inc/frtag_fota.h): set, it fetches from
+#   frtag-firmware-dev (fr9 builds before that change still use
+#   frtag-firmware-inhouse). Publishing here is only a copy
 #   into a local working tree - nothing reaches a device until that repo is
 #   committed and pushed, so the field host stays under exactly the manual
 #   control it always had.
 #
 #   NO latest*.bin/hex, NO _ota.* variants, NO combined _bl_* copies of the
-#   BIN in either publish repo — the OTA path only ever fetches the app-only
+#   BIN in any publish repo — the OTA path only ever fetches the app-only
 #   BIN, and its filename comes from version.json's "file" field (fr9's
 #   TAGFOTA_pacManifestFile returns whatever the manifest names).
 #
 #   This script only ever writes files into those repos' working trees. It
 #   never runs git add/commit/push there, and never will — committing and
-#   pushing C:\Code\farmranger-firmware and C:\Code\frtag-firmware-inhouse
-#   is a manual, deliberate step for a human, not something a build step
+#   pushing C:\Code\farmranger-firmware, C:\Code\frtag-firmware-inhouse and
+#   C:\Code\frtag-firmware-dev is a manual, deliberate step for a human, not something a build step
 #   does on every compile.
 #
 # For a first-time programming of a fresh MCU: flash frtag2_<M>_<m>_<p>_bl_<b>.hex
@@ -100,12 +103,13 @@ $version_str = "${Major}.${Minor}.${Patch}"
 Write-Host "frtag2 release: v${version_str} + bootloader v${bl_version} (mode=$mode)"
 
 # Destinations: every repo that mirrors the app-only .bin + version.json.
-# Both are separate local git repos this script only ever writes files
+# All are separate local git repos this script only ever writes files
 # into - see the file-header note on why nothing here ever commits or
 # pushes them.
 $publish_dirs = @(
     "C:\Code\farmranger-firmware\frtag2-firmware",
-    "C:\Code\frtag-firmware-inhouse\frtag2-firmware"
+    "C:\Code\frtag-firmware-inhouse\frtag2-firmware",
+    "C:\Code\frtag-firmware-dev\frtag2-firmware"
 )
 foreach ($publish_dir in $publish_dirs) {
     if (-Not (Test-Path $publish_dir)) {
@@ -210,7 +214,7 @@ $manifest_json = ($manifest | ConvertTo-Json)
 # ONE file each: the versioned app-only .bin the OTA flow actually fetches,
 # plus the version.json naming it. version.json's "file" field is what fr9's
 # manifest parser (TAGFOTA_pacManifestFile) goes by — no "latest.bin"
-# fallback, and both repos get byte-identical bin + manifest.
+# fallback, and every repo gets byte-identical bin + manifest.
 # ---- Collision warning against the manifest currently live -----------------
 # fr9's "is this already on my filesystem?" check is (size, xor8). Two releases
 # that agree on both are indistinguishable to it, and the older bytes get
@@ -274,5 +278,5 @@ foreach ($publish_dir in $publish_dirs) {
     Write-Host "  $publish_dir\frtag2_${Major}_${Minor}_${Patch}.bin"
     Write-Host "  $publish_dir\version.json (v${version_str})"
 }
-Write-Host "Neither host repo is committed or pushed by this script - do that by hand."
+Write-Host "No host repo is committed or pushed by this script - do that by hand."
 Write-Host "OK"
