@@ -245,6 +245,33 @@ static const uint8_t aUbxCfgPmNav[] = {
 };
 
 /* --------------------------------------------------------------------------
+ * UBX-RXM-PMREQ — enter software standby before the supply is cut.
+ *
+ * VCC and V_IO are tied to the same switched rail, with V_BCKP held up
+ * separately. For that wiring the MIA-M10Q integration manual (UBX-21028173,
+ * section 4.1.4, Table 40, options 1-2) requires the receiver to be put into
+ * software standby with UBX-RXM-PMREQ *before* V_IO and VCC are switched off;
+ * only then does it hand the backup domain (BBR + RTC) over to V_BCKP cleanly
+ * and enter hardware backup mode. Cutting the rail on a running receiver does
+ * not do this, which defeats the hot start on the next power-up.
+ *
+ * Payload (16-byte version): duration=0 (indefinite), flags=BACKUP|FORCE
+ * (FORCE is mandatory to enter standby), wakeupSources=UARTRX so the receiver
+ * is never stranded in standby if the rail somehow stays up.
+ * -------------------------------------------------------------------------- */
+static const uint8_t aUbxRxmPmreqBackup[] = {
+    0xB5, 0x62, 0x02, 0x41, 0x10, 0x00,            /* hdr: RXM-PMREQ, len=16 */
+    0x00, 0x00, 0x00, 0x00,                        /* version=0, reserved */
+    0x00, 0x00, 0x00, 0x00,                        /* duration (ms) = 0 -> indefinite */
+    0x06, 0x00, 0x00, 0x00,                        /* flags = BACKUP (bit1) | FORCE (bit2) */
+    0x08, 0x00, 0x00, 0x00,                        /* wakeupSources = UARTRX (bit3) */
+    0x00, 0x00,                                    /* checksum placeholder */
+};
+
+#define GPS_PMREQ_TX_TIMEOUT_MS     100U  /* 24 B frame; ~25 ms even at 9600 baud */
+#define GPS_PMREQ_SETTLE_MS         50U   /* let the receiver act on PMREQ before rail drop */
+
+/* --------------------------------------------------------------------------
  * GPS_vSendUbxValset — finalize checksum and transmit one UBX-CFG-VALSET frame.
  * Copies the const template to a scratch buffer (bAddUbxChecksum writes the
  * last two bytes in place) and pushes it out via the TX ring buffer.
@@ -273,6 +300,33 @@ static void GPS_vConfigureModule(void)
     GPS_vSendUbxValset(aUbxCfgPmNav,         sizeof(aUbxCfgPmNav));
 
     DBG_LOG("gps: ubx config sent (1Hz, GPS-only, full power, pedestrian)\r\n");
+}
+
+/* --------------------------------------------------------------------------
+ * GPS_vEnterBackup — send UBX-RXM-PMREQ and wait for it to leave the wire.
+ * Must be called while the GPS rail and UART are still up, immediately
+ * before GPS_DRIVER_vPowerEnLow(). PMREQ is not ACKed, so after the TX line
+ * drains we just give the receiver a short settle time before the rail drops.
+ * -------------------------------------------------------------------------- */
+static void GPS_vEnterBackup(void)
+{
+    uint8_t acFrame[sizeof(aUbxRxmPmreqBackup)];
+
+    memcpy(acFrame, aUbxRxmPmreqBackup, sizeof(acFrame));
+    bAddUbxChecksum(acFrame, sizeof(acFrame));
+    HAL_UART_vTxPutBuffer(&gps.UartHandle, acFrame, sizeof(acFrame));
+
+    uint32_t u32TxStart = osKernelGetTickCount();
+    while (!HAL_UART_bTxIdle(&gps.UartHandle))
+    {
+        if ((osKernelGetTickCount() - u32TxStart) >= GPS_PMREQ_TX_TIMEOUT_MS)
+        {
+            DBG_LOG("gps: pmreq tx timeout\r\n");
+            break;
+        }
+        osDelay(1);
+    }
+    osDelay(GPS_PMREQ_SETTLE_MS);
 }
 
 /* --------------------------------------------------------------------------
@@ -368,6 +422,7 @@ static void GPS_vPowerOff(void)
 {
     bSessionActive = false;
     bGpsPowered    = false;
+    GPS_vEnterBackup();                /* PMREQ first: hand BBR/RTC to V_BCKP */
     GPS_DRIVER_vPowerEnLow();
     GPS_DRIVER_vDisableUart(&gps.UartHandle);
     eState = GPS_STATE_IDLE;
@@ -629,6 +684,7 @@ bool GPS_bSelfTest(uint32_t u32TimeoutMs)
 
     /* Power-down: same order as GPS_vPowerOff minus the sleep-lock release
      * (self-test never took one). */
+    GPS_vEnterBackup();
     GPS_DRIVER_vPowerEnLow();
     GPS_DRIVER_vDisableUart(&gps.UartHandle);
     bGpsPowered = false;
