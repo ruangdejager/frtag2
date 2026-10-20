@@ -103,7 +103,7 @@ bool     FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
 
 /* True when the fr9's ready line advertised binary-upload support ("RDY,B").
  * Meaningful only after a successful FARMRANGER_bDeviceOn(); false before
- * that, and false against any fr9 on firmware older than 9.13.0. */
+ * that, and false against any fr9 on firmware older than 9.12.13. */
 bool     FARMRANGER_bLoggerSupportsBinary(void);
 
 /* Sole discovery upload path. Same retry policy, same pacing, same verdict

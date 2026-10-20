@@ -1250,8 +1250,8 @@ static bool FARMRANGER_bParseLogVerdict(const char *line, void *ctx)
     return false;
 }
 
-/* The fr9 sends "RDY\r\n" on firmware before 9.13.0 and "RDY,B\r\n" from
- * 9.13.0, where ",B" means "I accept AT+BLOG". Matching on "RDY" alone, as
+/* The fr9 sends "RDY\r\n" on firmware before 9.12.13 and "RDY,B\r\n" from
+ * 9.12.13, where ",B" means "I accept AT+BLOG". Matching on "RDY" alone, as
  * this always has, is what makes the suffix safe to add; the suffix is then
  * read separately so the caller can pick the binary path without having to
  * probe for it and eat three timeouts against an older board. */
