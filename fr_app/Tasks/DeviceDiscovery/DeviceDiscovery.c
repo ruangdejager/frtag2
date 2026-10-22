@@ -1027,7 +1027,22 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                  * through that window for nothing. */
                 if (FOTA_bDistributePending())
                 {
+                    /* Release the fr9 for the distribute - it runs up to
+                     * OTA_LORA_SESSION_MAX_MS, past the fr9's own 10 min
+                     * session cap, and nothing on the link is needed until
+                     * the FW check below. Reconnect after: FWCHECK is
+                     * answered from the fr9's cached manifest, so the second
+                     * session costs no modem power-up. The low hold gives the
+                     * fr9 time to see the line drop and end its session
+                     * before the next rising edge; distribute can return in
+                     * milliseconds (deferral, nothing staged). */
+                    DEVICE_DISCOVERY_DRIVER_vDisconnectLogger();
                     FOTA_vDistribute();
+                    osDelay(DEVICE_DISCOVERY_LOGGER_RELINK_GAP_MS);
+                    if (!DEVICE_DISCOVERY_DRIVER_bConnectLogger())
+                    {
+                        DBG_LOG("DeviceDiscovery: post-distribute reconnect FAILED (no RDY)\r\n");
+                    }
                 }
                 else
                 {

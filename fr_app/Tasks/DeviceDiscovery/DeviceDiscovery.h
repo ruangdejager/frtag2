@@ -260,6 +260,13 @@ _Static_assert(MESH_WAVE_BUDGET_MS <= APP_PRIMARY_CAMPAIGN_MAX_MS,
  * "close this session" gate. */
 #define DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS  (180 * 1000)  /* 3 min */
 
+/* Minimum time the fr9 attention line stays low when the primary drops the
+ * logger session and reopens it (around the LoRa firmware distribute). The
+ * fr9 polls the line from its main loop and debounces edges by 20 ms; a
+ * shorter low could be missed and the reconnect would wait out a RDY that
+ * never comes. */
+#define DEVICE_DISCOVERY_LOGGER_RELINK_GAP_MS     1000U
+
 #define LOST_PRIMARY_TIMEOUT_MIN            480           /* ~8 hours before recovery    */
 
 /* ---- Tiered recovery configuration ----
